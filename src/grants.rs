@@ -172,6 +172,10 @@ impl GrantHandler for AuthorizationCodeGrant {
         .await;
         let refresh_token =
             maybe_issue_refresh(p, &client.client_id, &code.account_id, &code.scope).await;
+        // 再利用時に失効させるため、発行トークンをコードに紐付ける。
+        p.store
+            .link_issued_tokens(code_val, &access_token, refresh_token.as_deref())
+            .await;
 
         Ok(TokenResponse {
             access_token,

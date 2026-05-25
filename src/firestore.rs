@@ -282,6 +282,32 @@ impl Firestore {
             Err(format!("delete {}", r.status()))
         }
     }
+
+    /// 指定フィールドのみを部分更新（updateMask 付き PATCH）。他フィールドは保持される。
+    /// set_doc は updateMask 無しで全体置換になるため、既存ドキュメントへの追記はこちらを使う。
+    pub async fn merge_doc(&self, col: &str, id: &str, fields: Value) -> Result<(), String> {
+        let tok = self.token().await?;
+        let keys: Vec<String> = fields
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        let query: Vec<(&str, &str)> =
+            keys.iter().map(|k| ("updateMask.fieldPaths", k.as_str())).collect();
+        let r = self
+            .http
+            .patch(self.doc_url(col, id))
+            .query(&query)
+            .bearer_auth(tok)
+            .json(&json!({ "fields": fields }))
+            .send()
+            .await
+            .map_err(|e| format!("merge: {e}"))?;
+        if r.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("merge {} {}", r.status(), r.text().await.unwrap_or_default()))
+        }
+    }
 }
 
 /// fields から文字列値を取り出す。

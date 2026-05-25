@@ -96,6 +96,8 @@ impl Store for FirestoreStore {
             "scope": fs_h::s(&c.scope),
             "authTime": fs_h::int(c.auth_time),
             "expiresAt": fs_h::ts(&fs_h::rfc3339(c.expires_at)),
+            // 再利用検出用。消費後も削除せず used=true にし、発行トークンを紐付ける。
+            "used": fs_h::b(false),
         });
         if let Some(v) = &c.nonce {
             f["nonce"] = fs_h::s(v);
@@ -114,7 +116,23 @@ impl Store for FirestoreStore {
 
     async fn take_code(&self, code: &str) -> Option<AuthorizationCode> {
         let f = self.fs.get_doc("authCodes", code).await.ok()??;
-        let _ = self.fs.delete_doc("authCodes", code).await;
+        let used = f
+            .get("used")
+            .and_then(|v| v.get("booleanValue"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if used {
+            // 再利用: このコードで発行したトークンを失効させ拒否する（RFC 6749 §4.1.2）。
+            if let Some(at) = fs_h::field_str(&f, "issuedAccessToken") {
+                let _ = self.fs.delete_doc("accessTokens", at).await;
+            }
+            if let Some(rt) = fs_h::field_str(&f, "issuedRefreshToken") {
+                let _ = self.fs.delete_doc("refreshTokens", rt).await;
+            }
+            return None;
+        }
+        // 初回消費: 削除せず used=true をマーク（後続の link_issued_tokens で発行トークンを記録）。
+        let _ = self.fs.merge_doc("authCodes", code, json!({ "used": fs_h::b(true) })).await;
         // 期限チェックは grant 側（code.expires_at）。ここでは復元のみ。
         Some(AuthorizationCode {
             code: code.to_string(),
@@ -129,6 +147,14 @@ impl Store for FirestoreStore {
             acr: fs_h::field_str(&f, "acr").map(str::to_string),
             expires_at: fs_h::field_ts_secs(&f, "expiresAt").unwrap_or(0),
         })
+    }
+
+    async fn link_issued_tokens(&self, code: &str, access_token: &str, refresh_token: Option<&str>) {
+        let mut f = json!({ "issuedAccessToken": fs_h::s(access_token) });
+        if let Some(rt) = refresh_token {
+            f["issuedRefreshToken"] = fs_h::s(rt);
+        }
+        let _ = self.fs.merge_doc("authCodes", code, f).await;
     }
 
     async fn save_access_token(&self, t: AccessToken) {
