@@ -36,6 +36,12 @@ pub fn ath(access_token: &str) -> String {
     es256::b64url_encode(Sha256::digest(access_token.as_bytes()))
 }
 
+/// htu 正規化: query(?) と fragment(#) を除去（RFC 9449 §4.3）。
+fn strip_query_fragment(u: &str) -> &str {
+    let end = u.find(['?', '#']).unwrap_or(u.len());
+    &u[..end]
+}
+
 pub struct Es256Dpop {
     seen_jti: Mutex<HashMap<String, Instant>>,
 }
@@ -92,11 +98,10 @@ impl DpopVerifier for Es256Dpop {
         if payload.get("htm").and_then(|v| v.as_str()) != Some(htm) {
             return Err("htm mismatch".into());
         }
-        if payload.get("htu").and_then(|v| v.as_str()) != Some(htu) {
-            return Err(format!(
-                "htu mismatch (got {:?}, want {htu})",
-                payload.get("htu")
-            ));
+        // RFC 9449 §4.3: htu 比較では query と fragment を無視する。
+        let proof_htu = payload.get("htu").and_then(|v| v.as_str()).unwrap_or("");
+        if strip_query_fragment(proof_htu) != strip_query_fragment(htu) {
+            return Err(format!("htu mismatch (got {proof_htu:?}, want {htu})"));
         }
         let iat = payload.get("iat").and_then(|v| v.as_i64()).ok_or("iat missing")?;
         if (now_secs() - iat).abs() > IAT_SKEW_SECS {
