@@ -162,6 +162,7 @@ async fn authorize(
         .unwrap_or(false);
     // PAR: urn 形式の request_uri があれば保存済みパラメータを復元する。
     let mut par_used = false;
+    let mut par_creator: Option<String> = None;
     let raw = match q0.get("request_uri") {
         Some(request_uri) if request_uri.starts_with(crate::par::URN_PREFIX) => {
             let fs = match &p.firestore {
@@ -169,8 +170,9 @@ async fn authorize(
                 None => return plain_error("PAR unavailable (no Firestore)"),
             };
             match crate::par::consume(fs, request_uri).await {
-                Ok(Some((_cid, params))) => {
+                Ok(Some((cid, params))) => {
                     par_used = true;
+                    par_creator = Some(cid);
                     params
                 }
                 _ => return plain_error("invalid or expired request_uri"),
@@ -178,6 +180,13 @@ async fn authorize(
         }
         _ => raw,
     };
+    // RFC 9126: request_uri は発行先クライアントに束縛される。authorize の client_id が
+    // PAR 作成クライアントと異なる場合は拒否する（別クライアントによる request_uri 流用防止）。
+    if let (Some(creator), Some(req_cid)) = (&par_creator, q0.get("client_id")) {
+        if req_cid != creator {
+            return plain_error("request_uri was issued to a different client");
+        }
+    }
     let params: AuthParams = match serde_urlencoded::from_str(&raw) {
         Ok(p) => p,
         Err(e) => return plain_error(&format!("invalid query: {e}")),
@@ -1079,6 +1088,11 @@ async fn par(State(p): State<Arc<Provider>>, headers: HeaderMap, body: String) -
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
     let form: HashMap<String, String> = serde_urlencoded::from_str(&body).unwrap_or_default();
+    // RFC 9126 §2.1: PAR リクエスト自体に request_uri を含めてはならない。
+    if form.contains_key("request_uri") {
+        return OAuthError::InvalidRequest("request_uri must not be used in a PAR request".into())
+            .into_response();
+    }
     let client = match authenticate_client(&p, &headers, &form).await {
         Ok(c) => c,
         Err(r) => return r,
