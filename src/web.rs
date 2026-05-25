@@ -163,16 +163,19 @@ async fn authorize(
     // PAR: urn 形式の request_uri があれば保存済みパラメータを復元する。
     let mut par_used = false;
     let mut par_creator: Option<String> = None;
+    let mut par_request_uri: Option<String> = None;
     let raw = match q0.get("request_uri") {
         Some(request_uri) if request_uri.starts_with(crate::par::URN_PREFIX) => {
             let fs = match &p.firestore {
                 Some(fs) => fs,
                 None => return plain_error("PAR unavailable (no Firestore)"),
             };
-            match crate::par::consume(fs, request_uri).await {
+            // peek: 削除しない。認可完了前は再利用可。コード発行時に delete で単回化する。
+            match crate::par::peek(fs, request_uri).await {
                 Ok(Some((cid, params))) => {
                     par_used = true;
                     par_creator = Some(cid);
+                    par_request_uri = Some(request_uri.clone());
                     params
                 }
                 _ => return plain_error("invalid or expired request_uri"),
@@ -192,6 +195,7 @@ async fn authorize(
         Err(e) => return plain_error(&format!("invalid query: {e}")),
     };
     let mut ctx = AuthContext::new(params);
+    ctx.request_uri = par_request_uri.clone();
 
     if let Err(e) = run_checks(&p, &mut ctx).await {
         return authorize_error(&p, &ctx, e);
@@ -245,6 +249,7 @@ async fn authorize(
             raw_query: raw,
             account_id: None,
             auth_time: None,
+            request_uri: par_request_uri,
         })
         .await;
     Redirect::to(&p.path(&format!("/interaction/{uid}"))).into_response()
@@ -272,6 +277,7 @@ async fn authorize_resume(
         Err(e) => return plain_error(&format!("invalid stored query: {e}")),
     };
     let mut ctx = AuthContext::new(params);
+    ctx.request_uri = interaction.request_uri.clone();
     if let Err(e) = run_checks(&p, &mut ctx).await {
         return authorize_error(&p, &ctx, e);
     }
@@ -314,6 +320,11 @@ async fn issue_code(p: &Provider, ctx: &AuthContext) -> Response {
             expires_at: now() + 60,
         })
         .await;
+
+    // 認可完了: PAR の request_uri を削除して以後の再利用を不可にする（RFC 9126）。
+    if let (Some(ru), Some(fs)) = (&ctx.request_uri, &p.firestore) {
+        crate::par::delete(fs, ru).await;
+    }
 
     let mut out = vec![("code".to_string(), code)];
     if let Some(state) = &ctx.params.state {

@@ -38,8 +38,10 @@ pub async fn create(fs: &Firestore, client_id: &str, params: &str) -> Result<Req
     Ok(RequestUri(format!("{URN_PREFIX}{id}")))
 }
 
-/// request_uri を単回消費し (client_id, params) を返す。期限切れ・不正は None。
-pub async fn consume(fs: &Firestore, request_uri: &str) -> Result<Option<(String, String)>, String> {
+/// request_uri を読むが削除しない (client_id, params)。期限切れ・不正は None。
+/// 認可完了前は再利用可能とするため /authorize ではこちらを使い、
+/// コード発行時に delete で単回化する（RFC 9126: 完了後の再利用は不可）。
+pub async fn peek(fs: &Firestore, request_uri: &str) -> Result<Option<(String, String)>, String> {
     let id = match request_uri.strip_prefix(URN_PREFIX) {
         Some(id) if (20..=100).contains(&id.len()) => id,
         _ => return Ok(None),
@@ -48,7 +50,6 @@ pub async fn consume(fs: &Firestore, request_uri: &str) -> Result<Option<(String
         Some(f) => f,
         None => return Ok(None),
     };
-    fs.delete_doc(COL, id).await.ok();
     let expires = fields
         .get("expiresAt")
         .and_then(|v| v.get("timestampValue"))
@@ -61,4 +62,11 @@ pub async fn consume(fs: &Firestore, request_uri: &str) -> Result<Option<(String
     let client_id = firestore::field_str(&fields, "clientId").unwrap_or("").to_string();
     let params = firestore::field_str(&fields, "params").unwrap_or("").to_string();
     Ok(Some((client_id, params)))
+}
+
+/// request_uri を削除する（コード発行時に呼び、以後の再利用を不可にする）。
+pub async fn delete(fs: &Firestore, request_uri: &str) {
+    if let Some(id) = request_uri.strip_prefix(URN_PREFIX) {
+        fs.delete_doc(COL, id).await.ok();
+    }
 }

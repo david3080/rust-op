@@ -70,6 +70,8 @@ pub struct Interaction {
     pub account_id: Option<String>,
     /// ログイン完了時刻（epoch 秒）。id_token の auth_time に使う。
     pub auth_time: Option<u64>,
+    /// PAR 由来なら元の request_uri。resume → コード発行時に削除して単回化する。
+    pub request_uri: Option<String>,
 }
 
 /// SSO 用セッション（cookie sid → account）。

@@ -47,6 +47,9 @@ impl Store for FirestoreStore {
         if let Some(t) = i.auth_time {
             f["authTime"] = fs_h::int(t);
         }
+        if let Some(ru) = &i.request_uri {
+            f["requestUri"] = fs_h::s(ru);
+        }
         let _ = self.fs.set_doc("interactions", &i.uid, f).await;
     }
 
@@ -60,6 +63,7 @@ impl Store for FirestoreStore {
             raw_query: fs_h::field_str(&f, "rawQuery").unwrap_or("").to_string(),
             account_id: fs_h::field_str(&f, "accountId").map(str::to_string),
             auth_time: fs_h::field_u64(&f, "authTime"),
+            request_uri: fs_h::field_str(&f, "requestUri").map(str::to_string),
         })
     }
 

@@ -14,6 +14,8 @@ pub struct AuthContext {
     pub account_id: Option<String>,
     /// ログイン時刻（epoch 秒）。
     pub auth_time: Option<u64>,
+    /// PAR 由来なら元の request_uri。コード発行時に削除して単回化する。
+    pub request_uri: Option<String>,
 }
 
 impl AuthContext {
@@ -24,6 +26,7 @@ impl AuthContext {
             redirect_uri: None,
             account_id: None,
             auth_time: None,
+            request_uri: None,
         }
     }
 
