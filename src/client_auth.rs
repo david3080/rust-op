@@ -164,17 +164,15 @@ impl ClientAuthMethod for PrivateKeyJwt {
         vk.verify(signing_input.as_bytes(), &sig)
             .map_err(|_| bad("assertion signature invalid"))?;
 
-        // aud は issuer または token endpoint URL を含むこと。
-        let token_ep = format!("{}/token", p.issuer);
-        let aud_ok = match payload.get("aud") {
-            Some(serde_json::Value::String(s)) => s == &p.issuer || s == &token_ep,
-            Some(serde_json::Value::Array(a)) => a.iter().any(|v| {
-                v.as_str().map(|s| s == p.issuer || s == token_ep).unwrap_or(false)
-            }),
-            _ => false,
-        };
+        // FAPI2: aud は issuer (OP 識別子) の単一文字列でなければならない。
+        // token endpoint URL や配列は拒否する（OIDF array-as-audience /
+        // token-endpoint-url-as-audience の負例対応）。
+        let aud_ok = matches!(
+            payload.get("aud"),
+            Some(serde_json::Value::String(s)) if s == &p.issuer
+        );
         if !aud_ok {
-            return Err(bad("assertion aud mismatch"));
+            return Err(bad("assertion aud must be the issuer identifier"));
         }
 
         // exp 検証。
