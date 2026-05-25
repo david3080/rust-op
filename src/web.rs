@@ -131,6 +131,12 @@ async fn discovery(State(p): State<Arc<Provider>>) -> Json<serde_json::Value> {
         "code_challenge_methods_supported": ["S256"],
         "dpop_signing_alg_values_supported": ["ES256"],
         "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+        // JAR (RFC 9101): signed request object 対応。request_uri は PAR 経由のみ（SSRF 回避で false）。
+        "request_parameter_supported": true,
+        "request_uri_parameter_supported": false,
+        "require_request_uri_registration": false,
+        "request_object_signing_alg_values_supported": ["ES256"],
+        "backchannel_authentication_request_signing_alg_values_supported": ["ES256"],
         "pushed_authorization_request_endpoint": format!("{i}/par"),
         "end_session_endpoint": format!("{i}/end-session"),
         "authorization_response_iss_parameter_supported": true,
@@ -153,10 +159,8 @@ async fn authorize(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let raw = raw.unwrap_or_default();
-    // JAR は非対応。inline `request` と非 PAR の `request_uri` は run_checks 後に拒否する
-    // (client/redirect_uri を解決してから redirect エラーで返すため)。
+    // 非 PAR の素の request_uri は run_checks 後に拒否する（SSRF 回避、PAR-only 維持）。
     let q0: HashMap<String, String> = serde_urlencoded::from_str(&raw).unwrap_or_default();
-    let has_request_param = q0.contains_key("request");
     let has_nonpar_request_uri = q0
         .get("request_uri")
         .map(|u| !u.starts_with(crate::par::URN_PREFIX))
@@ -165,24 +169,37 @@ async fn authorize(
     let mut par_used = false;
     let mut par_creator: Option<String> = None;
     let mut par_request_uri: Option<String> = None;
-    let raw = match q0.get("request_uri") {
-        Some(request_uri) if request_uri.starts_with(crate::par::URN_PREFIX) => {
-            let fs = match &p.firestore {
-                Some(fs) => fs,
-                None => return plain_error("PAR unavailable (no Firestore)"),
-            };
-            // peek: 削除しない。認可完了前は再利用可。コード発行時に delete で単回化する。
-            match crate::par::peek(fs, request_uri).await {
-                Ok(Some((cid, params))) => {
-                    par_used = true;
-                    par_creator = Some(cid);
-                    par_request_uri = Some(request_uri.clone());
-                    params
-                }
-                _ => return plain_error("invalid or expired request_uri"),
-            }
+    let raw = if let Some(req) = q0.get("request") {
+        // JAR (RFC 9101): 直接の request object。client_id で client を引き署名検証する。
+        let cid = q0.get("client_id").map(|s| s.as_str()).unwrap_or("");
+        let client = match p.clients.get(cid) {
+            Some(c) => c,
+            None => return plain_error("unknown client for request object"),
+        };
+        match crate::request_object::verify(client, req, &p.issuer) {
+            Ok(params) => serde_urlencoded::to_string(&params).unwrap_or_default(),
+            Err(e) => return plain_error(&format!("invalid request object: {}", e.description())),
         }
-        _ => raw,
+    } else {
+        match q0.get("request_uri") {
+            Some(request_uri) if request_uri.starts_with(crate::par::URN_PREFIX) => {
+                let fs = match &p.firestore {
+                    Some(fs) => fs,
+                    None => return plain_error("PAR unavailable (no Firestore)"),
+                };
+                // peek: 削除しない。認可完了前は再利用可。コード発行時に delete で単回化する。
+                match crate::par::peek(fs, request_uri).await {
+                    Ok(Some((cid, params))) => {
+                        par_used = true;
+                        par_creator = Some(cid);
+                        par_request_uri = Some(request_uri.clone());
+                        params
+                    }
+                    _ => return plain_error("invalid or expired request_uri"),
+                }
+            }
+            _ => raw,
+        }
     };
     // RFC 9126: request_uri は発行先クライアントに束縛される。authorize の client_id が
     // PAR 作成クライアントと異なる場合は拒否する（別クライアントによる request_uri 流用防止）。
@@ -200,14 +217,6 @@ async fn authorize(
 
     if let Err(e) = run_checks(&p, &mut ctx).await {
         return authorize_error(&p, &ctx, e);
-    }
-    // JAR は非対応（discovery で request_parameter_supported を公告していない）。
-    if has_request_param {
-        return authorize_error(
-            &p,
-            &ctx,
-            OAuthError::RequestNotSupported("request object (JAR) is not supported".into()),
-        );
     }
     if has_nonpar_request_uri {
         return authorize_error(
@@ -1114,6 +1123,17 @@ async fn par(State(p): State<Arc<Provider>>, headers: HeaderMap, body: String) -
         Ok(c) => c,
         Err(r) => return r,
     };
+    // JAR (RFC 9101): request object があれば検証し、保存パラメータをその claims で
+    // 置き換える（以後の処理・/authorize は検証済みパラメータを使う）。
+    let body = if let Some(req) = form.get("request") {
+        match crate::request_object::verify(&client, req, &p.issuer) {
+            Ok(params) => serde_urlencoded::to_string(&params).unwrap_or_default(),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        body
+    };
+    let form: HashMap<String, String> = serde_urlencoded::from_str(&body).unwrap_or_default();
     // PAR 本体の client_id は認証済みクライアントと一致すること。
     if let Some(cid) = form.get("client_id") {
         if cid != &client.client_id {
@@ -1285,6 +1305,14 @@ async fn backchannel_auth(
     if !client.allows_grant(CIBA_GRANT) {
         return OAuthError::UnauthorizedClient("ciba grant not allowed".into()).into_response();
     }
+    // JAR (FAPI-CIBA): signed request object があれば検証し、以後のパラメータはその claims から取る。
+    let form = match form.get("request").cloned() {
+        Some(req) => match crate::request_object::verify(&client, &req, &p.issuer) {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        },
+        None => form,
+    };
     let login_hint = match form.get("login_hint") {
         Some(s) => s.trim().to_lowercase(),
         None => return OAuthError::InvalidRequest("login_hint required".into()).into_response(),

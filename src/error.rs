@@ -25,6 +25,7 @@ pub enum OAuthError {
     AccessDenied(String),
     #[error("login_required: {0}")]
     LoginRequired(String),
+    #[allow(dead_code)] // JAR 対応で未使用化。エラー taxonomy として残す。
     #[error("request_not_supported: {0}")]
     RequestNotSupported(String),
     #[error("request_uri_not_supported: {0}")]

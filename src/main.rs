@@ -18,6 +18,7 @@ mod model;
 mod par;
 mod provider;
 mod registration;
+mod request_object;
 mod response_mode;
 mod sig;
 mod store;
