@@ -1104,6 +1104,28 @@ async fn par(State(p): State<Arc<Provider>>, headers: HeaderMap, body: String) -
             return OAuthError::InvalidRequest("client_id mismatch".into()).into_response();
         }
     }
+    // DPoP at PAR (RFC 9449 §10): PAR が DPoP 署名されていれば、その proof の jkt に
+    // 認可を束縛する。dpop_jkt パラメータがあれば proof と一致必須。proof のみなら
+    // jkt を dpop_jkt として注入し、token endpoint で束縛を強制する。
+    let body = if let Some(proof) = dpop_header(&headers) {
+        let htu = format!("{}/par", p.issuer);
+        let jkt = match p.dpop.verify(&proof, "POST", &htu, None) {
+            Ok(j) => j,
+            Err(e) => return OAuthError::InvalidDpopProof(e).into_response(),
+        };
+        match form.get("dpop_jkt") {
+            Some(req) if req != &jkt => {
+                return OAuthError::InvalidDpopProof(
+                    "dpop_jkt does not match the DPoP proof presented to the PAR endpoint".into(),
+                )
+                .into_response()
+            }
+            Some(_) => body,                       // 一致: そのまま
+            None => format!("{body}&dpop_jkt={jkt}"), // proof の jkt を束縛として注入
+        }
+    } else {
+        body
+    };
     match crate::par::create(fs, &client.client_id, &body).await {
         Ok(ru) => (
             StatusCode::CREATED,
