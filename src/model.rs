@@ -56,6 +56,8 @@ pub struct AuthParams {
     pub response_mode: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
+    /// DPoP key binding (RFC 9449 §10): 認可コード/トークンを特定 jkt に束縛する要求。
+    pub dpop_jkt: Option<String>,
 }
 
 /// ログイン待ちの認可リクエスト。node-oidc-provider の Interaction 相当。
@@ -91,6 +93,8 @@ pub struct AuthorizationCode {
     pub code_challenge_method: Option<String>,
     pub auth_time: u64,
     pub acr: Option<String>,
+    /// DPoP key binding: PAR/authorize で dpop_jkt 指定時、token の proof jkt と一致必須。
+    pub dpop_jkt: Option<String>,
     /// FAPI: 認可コードは短命。epoch 秒。
     pub expires_at: u64,
 }

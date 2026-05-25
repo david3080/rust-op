@@ -158,6 +158,19 @@ impl GrantHandler for AuthorizationCodeGrant {
             }
         }
 
+        // DPoP key binding (RFC 9449 §10): PAR/authorize で dpop_jkt 指定時は
+        // token の DPoP proof の jkt と一致必須。不一致は invalid_dpop_proof。
+        if let Some(want_jkt) = &code.dpop_jkt {
+            match &dpop_jkt {
+                Some(got) if got == want_jkt => {}
+                _ => {
+                    return Err(OAuthError::InvalidDpopProof(
+                        "DPoP proof jkt does not match dpop_jkt bound at authorization".into(),
+                    ))
+                }
+            }
+        }
+
         let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
         let (access_token, id_token) = issue_access_and_id(
             p,

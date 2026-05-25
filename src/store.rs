@@ -136,6 +136,7 @@ mod tests {
             code_challenge_method: None,
             auth_time: 0,
             acr: None,
+            dpop_jkt: None,
             expires_at: u64::MAX,
         }
     }

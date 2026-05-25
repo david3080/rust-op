@@ -310,6 +310,7 @@ async fn issue_code(p: &Provider, ctx: &AuthContext) -> Response {
                 .as_deref()
                 .and_then(|s| s.split_whitespace().next())
                 .map(|s| s.to_string()),
+            dpop_jkt: ctx.params.dpop_jkt.clone(),
             expires_at: now() + 60,
         })
         .await;
@@ -1872,11 +1873,13 @@ async function doRefresh(){
 /// Authorization ヘッダから (scheme, token) を取り出す（Bearer / DPoP）。
 fn auth_scheme_token(headers: &HeaderMap) -> Option<(String, String)> {
     let h = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    if let Some(t) = h.strip_prefix("Bearer ") {
-        return Some(("Bearer".into(), t.to_string()));
+    // RFC 7235: 認証スキーム名は case-insensitive。スキーム正規化して返す。
+    let (scheme, rest) = h.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        return Some(("Bearer".into(), rest.trim().to_string()));
     }
-    if let Some(t) = h.strip_prefix("DPoP ") {
-        return Some(("DPoP".into(), t.to_string()));
+    if scheme.eq_ignore_ascii_case("dpop") {
+        return Some(("DPoP".into(), rest.trim().to_string()));
     }
     None
 }

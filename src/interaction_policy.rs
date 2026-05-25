@@ -106,6 +106,7 @@ mod tests {
             response_mode: None,
             code_challenge: None,
             code_challenge_method: None,
+            dpop_jkt: None,
         }
     }
 

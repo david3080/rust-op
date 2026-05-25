@@ -111,6 +111,9 @@ impl Store for FirestoreStore {
         if let Some(v) = &c.acr {
             f["acr"] = fs_h::s(v);
         }
+        if let Some(v) = &c.dpop_jkt {
+            f["dpopJkt"] = fs_h::s(v);
+        }
         let _ = self.fs.set_doc("authCodes", &c.code, f).await;
     }
 
@@ -145,6 +148,7 @@ impl Store for FirestoreStore {
             code_challenge_method: fs_h::field_str(&f, "codeChallengeMethod").map(str::to_string),
             auth_time: fs_h::field_u64(&f, "authTime").unwrap_or(0),
             acr: fs_h::field_str(&f, "acr").map(str::to_string),
+            dpop_jkt: fs_h::field_str(&f, "dpopJkt").map(str::to_string),
             expires_at: fs_h::field_ts_secs(&f, "expiresAt").unwrap_or(0),
         })
     }
