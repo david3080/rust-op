@@ -670,10 +670,14 @@ async fn token(
 }
 
 fn dpop_header(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("dpop")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
+    // RFC 9449 §4.3: DPoP ヘッダは 1 リクエストに高々 1 つ。複数あれば不正なので
+    // 「使用可能な proof 無し」として None を返し、各 endpoint で拒否させる。
+    let mut it = headers.get_all("dpop").iter();
+    let first = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    first.to_str().ok().map(|s| s.to_string())
 }
 
 fn parse_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
