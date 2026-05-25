@@ -131,6 +131,29 @@ async fn main() {
         id_token_signed_response_alg: None,
     };
 
+    // FAPI-CIBA 用クライアント（private_key_jwt + signed backchannel request, poll）。
+    // DPoP/PAR は使わない（FAPI1-CIBA プロファイル）。鍵は fapi-1 を再利用。
+    let fapi_ciba = Client {
+        client_id: "fapi-ciba".into(),
+        redirect_uris: vec![],
+        post_logout_redirect_uris: vec![],
+        token_endpoint_auth_method: "private_key_jwt".into(),
+        client_secret: None,
+        grant_types: vec![
+            "urn:openid:params:grant-type:ciba".into(),
+            "refresh_token".into(),
+        ],
+        dpop_bound: false,
+        jwks: vec![model::JwkPub {
+            kid: std::env::var("FAPI1_KID").as_deref().unwrap_or("fapi-1-key").into(),
+            x: std::env::var("FAPI1_X").unwrap_or_default(),
+            y: std::env::var("FAPI1_Y").unwrap_or_default(),
+        }],
+        require_par: false,
+        require_pkce: false,
+        id_token_signed_response_alg: None,
+    };
+
     let mut provider = Provider::new(issuer.clone())
         .with_base_path(base_path.clone())
         .with_client(demo_rp)
@@ -149,7 +172,8 @@ async fn main() {
             std::env::var("FAPI2_KID").as_deref().unwrap_or("fapi-2-key"),
             &std::env::var("FAPI2_X").unwrap_or_default(),
             &std::env::var("FAPI2_Y").unwrap_or_default(),
-        ));
+        ))
+        .with_client(fapi_ciba);
 
     // Cloud Run 上 (K_SERVICE あり) では Firestore + Resend を有効化。
     // ローカルは metadata 不達なので無効（LogMailer のまま）。

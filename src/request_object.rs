@@ -63,16 +63,33 @@ pub fn verify(client: &Client, jwt: &str, issuer: &str) -> Result<HashMap<String
     if !aud_ok {
         return Err(bad("request object aud must be the issuer"));
     }
-    // exp 必須・未来。
-    match payload.get("exp").and_then(|v| v.as_i64()) {
-        Some(exp) if exp > now() => {}
-        _ => return Err(bad("request object expired or missing exp")),
+    // FAPI: exp / nbf / iat / jti 必須。exp は 60 分以内、nbf は ±許容内。
+    let now = now();
+    let exp = payload
+        .get("exp")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| bad("request object missing exp"))?;
+    if exp <= now {
+        return Err(bad("request object expired"));
     }
-    // nbf があれば大きく未来は拒否。
-    if let Some(nbf) = payload.get("nbf").and_then(|v| v.as_i64()) {
-        if nbf > now() + 60 {
-            return Err(bad("request object nbf too far in the future"));
-        }
+    if exp > now + 3600 {
+        return Err(bad("request object exp is more than 60 minutes in the future"));
+    }
+    let nbf = payload
+        .get("nbf")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| bad("request object missing nbf"))?;
+    if nbf > now + 60 {
+        return Err(bad("request object nbf is in the future"));
+    }
+    if nbf < now - 3600 {
+        return Err(bad("request object nbf is more than 60 minutes in the past"));
+    }
+    if payload.get("iat").and_then(|v| v.as_i64()).is_none() {
+        return Err(bad("request object missing iat"));
+    }
+    if payload.get("jti").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
+        return Err(bad("request object missing jti"));
     }
 
     // 文字列クレームを認可パラメータとして取り出す（envelope は除く）。
@@ -136,7 +153,8 @@ mod tests {
 
     fn good_payload() -> Value {
         json!({
-            "iss": "cli-1", "aud": ISS, "exp": now() + 300,
+            "iss": "cli-1", "aud": ISS, "exp": now() + 300, "nbf": now() - 5,
+            "iat": now() - 5, "jti": "jti-1",
             "response_type": "code", "client_id": "cli-1",
             "redirect_uri": "https://rp/cb", "scope": "openid", "state": "s1"
         })

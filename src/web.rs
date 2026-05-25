@@ -1305,14 +1305,34 @@ async fn backchannel_auth(
     if !client.allows_grant(CIBA_GRANT) {
         return OAuthError::UnauthorizedClient("ciba grant not allowed".into()).into_response();
     }
-    // JAR (FAPI-CIBA): signed request object があれば検証し、以後のパラメータはその claims から取る。
+    // JAR (FAPI-CIBA): signed request object を検証し以後のパラメータをその claims から取る。
+    // private_key_jwt クライアントは signed request 必須（FAPI-CIBA）。
     let form = match form.get("request").cloned() {
         Some(req) => match crate::request_object::verify(&client, &req, &p.issuer) {
             Ok(m) => m,
             Err(e) => return e.into_response(),
         },
-        None => form,
+        None => {
+            if client.token_endpoint_auth_method == "private_key_jwt" {
+                return OAuthError::InvalidRequest(
+                    "signed request object required for this client".into(),
+                )
+                .into_response();
+            }
+            form
+        }
     };
+    // FAPI-CIBA: hint は login_hint / id_token_hint / login_hint_token のうち厳密に 1 つ。
+    let hint_count = ["login_hint", "id_token_hint", "login_hint_token"]
+        .iter()
+        .filter(|k| form.contains_key(**k))
+        .count();
+    if hint_count != 1 {
+        return OAuthError::InvalidRequest(
+            "exactly one of login_hint/id_token_hint/login_hint_token is required".into(),
+        )
+        .into_response();
+    }
     let login_hint = match form.get("login_hint") {
         Some(s) => s.trim().to_lowercase(),
         None => return OAuthError::InvalidRequest("login_hint required".into()).into_response(),
