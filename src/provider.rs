@@ -23,7 +23,10 @@ pub struct Provider {
     pub demo_user: String,
     pub demo_pass: String,
     pub store: Arc<dyn Store>,
+    /// 既定の署名鍵（ES256）。client が alg を指定しない場合に使う。
     pub signer: Arc<dyn JwsSigner>,
+    /// 追加の署名鍵（RS256 等）。jwks 公開と alg 選択に使う。
+    pub extra_signers: Vec<Arc<dyn JwsSigner>>,
     /// メール確認登録用（Cloud Run 上でのみ Some）。
     pub firestore: Option<Arc<Firestore>>,
     pub mailer: Arc<dyn Mailer>,
@@ -68,6 +71,7 @@ impl Provider {
             demo_pass: "a".into(),
             store: Arc::new(MemoryStore::default()),
             signer: Arc::new(Es256Signer::generate()),
+            extra_signers: Vec::new(),
             firestore: None,
             mailer: Arc::new(LogMailer),
             dpop: Arc::new(Es256Dpop::default()),
@@ -97,6 +101,29 @@ impl Provider {
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = store;
         self
+    }
+
+    /// 追加の署名鍵（RS256 等）を登録する。
+    pub fn add_signer(mut self, signer: Arc<dyn JwsSigner>) -> Self {
+        self.extra_signers.push(signer);
+        self
+    }
+
+    /// alg に対応する署名鍵を返す。未指定・未対応なら既定（ES256）。
+    pub fn signer_for(&self, alg: Option<&str>) -> &Arc<dyn JwsSigner> {
+        match alg {
+            Some(a) if a != self.signer.alg() => self
+                .extra_signers
+                .iter()
+                .find(|s| s.alg() == a)
+                .unwrap_or(&self.signer),
+            _ => &self.signer,
+        }
+    }
+
+    /// jwks / discovery 用に全署名鍵を列挙する。
+    pub fn all_signers(&self) -> impl Iterator<Item = &Arc<dyn JwsSigner>> {
+        std::iter::once(&self.signer).chain(self.extra_signers.iter())
     }
 
     pub fn with_signer(mut self, signer: Arc<dyn JwsSigner>) -> Self {

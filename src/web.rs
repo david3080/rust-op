@@ -122,7 +122,7 @@ async fn discovery(State(p): State<Arc<Provider>>) -> Json<serde_json::Value> {
         "response_types_supported": ["code"],
         "grant_types_supported": p.grants.keys().collect::<Vec<_>>(),
         "subject_types_supported": ["public"],
-        "id_token_signing_alg_values_supported": [p.signer.alg()],
+        "id_token_signing_alg_values_supported": p.all_signers().map(|s| s.alg()).collect::<Vec<_>>(),
         "scopes_supported": ["openid", "profile", "email", "address", "phone", "offline_access"],
         "claims_supported": crate::claims::all_supported_claims(),
         "claims_parameter_supported": false,
@@ -141,7 +141,8 @@ async fn discovery(State(p): State<Arc<Provider>>) -> Json<serde_json::Value> {
 }
 
 async fn jwks(State(p): State<Arc<Provider>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "keys": [p.signer.public_jwk()] }))
+    let keys: Vec<_> = p.all_signers().map(|s| s.public_jwk()).collect();
+    Json(serde_json::json!({ "keys": keys }))
 }
 
 /* ===== authorize ===== */

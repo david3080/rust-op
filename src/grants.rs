@@ -46,6 +46,7 @@ async fn issue_access_and_id(
     auth_time: Option<u64>,
     acr: Option<&str>,
     dpop_jkt: Option<String>,
+    id_token_alg: Option<&str>,
 ) -> (String, String) {
     let access_token = opaque();
     p.store
@@ -77,7 +78,7 @@ async fn issue_access_and_id(
     if let Some(a) = acr {
         claims["acr"] = serde_json::json!(a);
     }
-    let id_token = p.signer.sign(&claims);
+    let id_token = p.signer_for(id_token_alg).sign(&claims);
     (access_token, id_token)
 }
 
@@ -181,6 +182,7 @@ impl GrantHandler for AuthorizationCodeGrant {
             Some(code.auth_time),
             code.acr.as_deref(),
             dpop_jkt,
+            client.id_token_signed_response_alg.as_deref(),
         )
         .await;
         let refresh_token =
@@ -245,7 +247,7 @@ impl GrantHandler for RefreshTokenGrant {
 
         let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
         let (access_token, id_token) =
-            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, None, None, dpop_jkt)
+            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref())
                 .await;
         // ローテーションした新しい refresh token を再発行。
         let refresh_token =
@@ -310,7 +312,7 @@ impl GrantHandler for CibaGrant {
             CibaStatus::Approved => {
                 let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
                 let (access_token, id_token) =
-                    issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt)
+                    issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref())
                         .await;
                 // CIBA は単回。発行後に消費する。
                 ciba::delete(fs, auth_req_id).await.ok();

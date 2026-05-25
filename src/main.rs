@@ -54,6 +54,7 @@ async fn main() {
         jwks: vec![],
         require_par: false,
         require_pkce: false,
+        id_token_signed_response_alg: None,
     };
 
     // OIDF Conformance Suite (Basic OP) 用の静的クライアント 2 つ。
@@ -75,6 +76,7 @@ async fn main() {
         jwks: vec![],
         require_par: false,
         require_pkce: false,
+        id_token_signed_response_alg: None,
     };
 
     // Flutter ネイティブアプリ fido2demo（public + PKCE, custom scheme, DPoP）。
@@ -89,6 +91,7 @@ async fn main() {
         jwks: vec![],
         require_par: false,
         require_pkce: false,
+        id_token_signed_response_alg: None,
     };
 
     // CIBA Consumption Device 用クライアント（poll, client_secret_basic）。
@@ -103,6 +106,7 @@ async fn main() {
         jwks: vec![],
         require_par: false,
         require_pkce: false,
+        id_token_signed_response_alg: None,
     };
 
     // OIDF FAPI 2.0 用クライアント 2 つ（private_key_jwt + PAR + PKCE + DPoP）。
@@ -122,6 +126,8 @@ async fn main() {
         jwks: vec![model::JwkPub { kid: kid.into(), x: x.into(), y: y.into() }],
         require_par: true,
         require_pkce: true,
+        // FAPI2 は ES256 必須（RS256 不可）。既定 ES256 で良いので None。
+        id_token_signed_response_alg: None,
     };
 
     let mut provider = Provider::new(issuer.clone())
@@ -165,6 +171,22 @@ async fn main() {
             },
             Ok(None) => tracing::warn!("signing key secret not found; using ephemeral key"),
             Err(e) => tracing::error!("secret access failed ({e}); using ephemeral key"),
+        }
+        // RS256 署名鍵（OIDC Core §15.1 で必須）を Secret Manager から固定ロード。
+        // 無ければ起動ごとの一時鍵（jwks がインスタンス毎に変わる点に注意）。
+        match fs.access_secret("oidc-signing-key-rs256").await {
+            Ok(Some(pem)) => match jws::Rs256Signer::from_pkcs8_pem(&pem) {
+                Ok(signer) => {
+                    tracing::info!("loaded RS256 signing key from Secret Manager");
+                    provider = provider.add_signer(std::sync::Arc::new(signer));
+                }
+                Err(e) => tracing::error!("RS256 key from secret invalid ({e}); skipping RS256"),
+            },
+            Ok(None) => {
+                tracing::warn!("RS256 key secret not found; generating ephemeral RS256 key");
+                provider = provider.add_signer(std::sync::Arc::new(jws::Rs256Signer::generate()));
+            }
+            Err(e) => tracing::error!("RS256 secret access failed ({e}); skipping RS256"),
         }
         // セッション/コード/トークンも Firestore に永続化（インスタンス跨ぎ）。
         provider = provider

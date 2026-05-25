@@ -82,6 +82,66 @@ impl JwsSigner for Es256Signer {
     }
 }
 
+/// RS256 (RSASSA-PKCS1-v1.5 / SHA-256)。OIDC Core §15.1 は OP に RS256 を要求する。
+pub struct Rs256Signer {
+    key: rsa::RsaPrivateKey,
+    kid: String,
+    n: String,
+    e: String,
+}
+
+impl Rs256Signer {
+    pub fn generate() -> Self {
+        let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        Self::from_key(key)
+    }
+
+    /// PKCS#8 PEM から読み込む（Secret Manager 保存鍵の読込に使う）。
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, String> {
+        use rsa::pkcs8::DecodePrivateKey;
+        let key = rsa::RsaPrivateKey::from_pkcs8_pem(pem.trim())
+            .map_err(|e| format!("rsa pkcs8 pem: {e}"))?;
+        Ok(Self::from_key(key))
+    }
+
+    fn from_key(key: rsa::RsaPrivateKey) -> Self {
+        use rsa::traits::PublicKeyParts;
+        let n = b64url(key.n().to_bytes_be());
+        let e = b64url(key.e().to_bytes_be());
+        // RFC 7638 RSA Thumbprint: canonical JSON はキー昇順 e,kty,n。
+        let canonical = format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#);
+        let kid = b64url(<sha2::Sha256 as sha2::Digest>::digest(canonical.as_bytes()));
+        Self { key, kid, n, e }
+    }
+}
+
+impl JwsSigner for Rs256Signer {
+    fn alg(&self) -> &str {
+        "RS256"
+    }
+    fn sign(&self, claims: &serde_json::Value) -> String {
+        use sha2::Digest;
+        let header = serde_json::json!({ "alg": "RS256", "typ": "JWT", "kid": self.kid });
+        let signing_input = format!("{}.{}", b64url(header.to_string()), b64url(claims.to_string()));
+        let hashed = sha2::Sha256::digest(signing_input.as_bytes());
+        let sig = self
+            .key
+            .sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hashed)
+            .expect("rsa sign");
+        format!("{signing_input}.{}", b64url(sig))
+    }
+    fn public_jwk(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kty": "RSA",
+            "n": self.n,
+            "e": self.e,
+            "alg": "RS256",
+            "use": "sig",
+            "kid": self.kid,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +216,31 @@ mod tests {
     fn kid_equals_jwk_thumbprint() {
         let signer = Es256Signer::generate();
         assert_eq!(signer.kid, crate::es256::jwk_thumbprint_p256(&signer.x, &signer.y));
+    }
+
+    #[test]
+    fn rs256_sign_produces_verifiable_jws() {
+        use rsa::traits::PublicKeyParts;
+        use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
+        use sha2::Digest;
+        let signer = Rs256Signer::generate();
+        let jwt = signer.sign(&serde_json::json!({"sub": "alice"}));
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let header: serde_json::Value = serde_json::from_slice(&b64d(parts[0])).unwrap();
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["kid"], signer.kid);
+        // 公開 JWK の n,e で署名検証できる。
+        let jwk = signer.public_jwk();
+        let n = BigUint::from_bytes_be(&b64d(jwk["n"].as_str().unwrap()));
+        let e = BigUint::from_bytes_be(&b64d(jwk["e"].as_str().unwrap()));
+        let pk = RsaPublicKey::new(n, e).unwrap();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let hashed = sha2::Sha256::digest(signing_input.as_bytes());
+        assert!(pk
+            .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hashed, &b64d(parts[2]))
+            .is_ok());
+        // public_jwk の e は本物の指数（PublicKeyParts と一致）。
+        assert_eq!(b64d(jwk["e"].as_str().unwrap()), signer.key.e().to_bytes_be());
     }
 }

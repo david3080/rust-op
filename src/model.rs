@@ -30,6 +30,8 @@ pub struct Client {
     pub require_par: bool,
     /// FAPI: PKCE 必須。
     pub require_pkce: bool,
+    /// id_token の署名 alg（OIDC `id_token_signed_response_alg`）。None は既定（ES256）。
+    pub id_token_signed_response_alg: Option<String>,
 }
 
 impl Client {
