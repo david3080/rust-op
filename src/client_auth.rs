@@ -215,3 +215,178 @@ impl ClientAuthMethod for PrivateKeyJwt {
         Ok(client)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::es256::b64url_encode;
+    use crate::model::JwkPub;
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+
+    const ISS: &str = "https://op.example.com";
+
+    fn provider() -> Provider {
+        Provider::new(ISS)
+    }
+
+    fn secret_client(id: &str, secret: &str, method: &str) -> Client {
+        Client {
+            client_id: id.into(),
+            redirect_uris: vec![],
+            token_endpoint_auth_method: method.into(),
+            client_secret: Some(secret.into()),
+            grant_types: vec![],
+            post_logout_redirect_uris: vec![],
+            dpop_bound: false,
+            jwks: vec![],
+            require_par: false,
+            require_pkce: false,
+            id_token_signed_response_alg: None,
+        }
+    }
+
+    fn input(assertion: Option<&str>, body: Option<(&str, &str)>, basic: Option<(&str, &str)>) -> ClientAuthInput {
+        ClientAuthInput {
+            basic: basic.map(|(i, s)| (i.into(), s.into())),
+            body_client_id: body.map(|(i, _)| i.into()),
+            body_client_secret: body.map(|(_, s)| s.into()),
+            client_assertion: assertion.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn secret_eq_is_value_equality() {
+        assert!(secret_eq("hunter2", "hunter2"));
+        assert!(!secret_eq("hunter2", "hunter3"));
+        assert!(!secret_eq("hunter2", "hunter2x")); // 長さ違い
+    }
+
+    #[tokio::test]
+    async fn secret_post_accepts_correct_rejects_wrong() {
+        let p = provider().with_client(secret_client("rp", "s3cret", "client_secret_post"));
+        assert!(ClientSecretPost
+            .authenticate(&p, &input(None, Some(("rp", "s3cret")), None))
+            .await
+            .is_ok());
+        assert!(ClientSecretPost
+            .authenticate(&p, &input(None, Some(("rp", "nope")), None))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn secret_basic_unknown_client_rejected() {
+        let p = provider();
+        assert!(ClientSecretBasic
+            .authenticate(&p, &input(None, None, Some(("ghost", "x"))))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn none_auth_rejects_confidential_client() {
+        let p = provider().with_client(secret_client("rp", "s", "client_secret_post"));
+        assert!(NoneAuth
+            .authenticate(&p, &input(None, Some(("rp", "")), None))
+            .await
+            .is_err());
+    }
+
+    fn pkjwt_client(id: &str, key: &SigningKey, kid: &str) -> Client {
+        let pt = key.verifying_key().to_encoded_point(false);
+        Client {
+            client_id: id.into(),
+            redirect_uris: vec![],
+            token_endpoint_auth_method: "private_key_jwt".into(),
+            client_secret: None,
+            grant_types: vec![],
+            post_logout_redirect_uris: vec![],
+            dpop_bound: false,
+            jwks: vec![JwkPub {
+                kid: kid.into(),
+                x: b64url_encode(pt.x().unwrap()),
+                y: b64url_encode(pt.y().unwrap()),
+            }],
+            require_par: false,
+            require_pkce: false,
+            id_token_signed_response_alg: None,
+        }
+    }
+
+    fn assertion(key: &SigningKey, kid: &str, alg: &str, claims: serde_json::Value) -> String {
+        let header = serde_json::json!({ "alg": alg, "typ": "JWT", "kid": kid });
+        let h = b64url_encode(serde_json::to_vec(&header).unwrap());
+        let pl = b64url_encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{h}.{pl}");
+        let sig: Signature = key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", b64url_encode(sig.to_bytes()))
+    }
+
+    fn good_claims(id: &str, jti: &str) -> serde_json::Value {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300;
+        serde_json::json!({ "iss": id, "sub": id, "aud": ISS, "exp": exp, "jti": jti })
+    }
+
+    #[tokio::test]
+    async fn pkjwt_accepts_valid_assertion() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let p = provider().with_client(pkjwt_client("rp", &key, "k1"));
+        let a = assertion(&key, "k1", "ES256", good_claims("rp", "j1"));
+        assert!(PrivateKeyJwt::default()
+            .authenticate(&p, &input(Some(&a), None, None))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn pkjwt_rejects_alg_aud_and_expiry() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let p = provider().with_client(pkjwt_client("rp", &key, "k1"));
+        let auth = PrivateKeyJwt::default();
+        // alg != ES256
+        let none_alg = assertion(&key, "k1", "none", good_claims("rp", "ja"));
+        assert!(auth.authenticate(&p, &input(Some(&none_alg), None, None)).await.is_err());
+        // aud が issuer 以外
+        let mut c = good_claims("rp", "jb");
+        c["aud"] = serde_json::json!("https://evil");
+        let wrong_aud = assertion(&key, "k1", "ES256", c);
+        assert!(auth.authenticate(&p, &input(Some(&wrong_aud), None, None)).await.is_err());
+        // 期限切れ
+        let mut c2 = good_claims("rp", "jc");
+        c2["exp"] = serde_json::json!(1000);
+        let expired = assertion(&key, "k1", "ES256", c2);
+        assert!(auth.authenticate(&p, &input(Some(&expired), None, None)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pkjwt_rejects_jti_replay() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let p = provider().with_client(pkjwt_client("rp", &key, "k1"));
+        let auth = PrivateKeyJwt::default();
+        let a1 = assertion(&key, "k1", "ES256", good_claims("rp", "dup"));
+        let a2 = assertion(&key, "k1", "ES256", good_claims("rp", "dup"));
+        assert!(auth.authenticate(&p, &input(Some(&a1), None, None)).await.is_ok());
+        assert!(auth.authenticate(&p, &input(Some(&a2), None, None)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pkjwt_rejects_iss_sub_mismatch_and_bad_signature() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let other = SigningKey::random(&mut rand_core::OsRng);
+        let p = provider().with_client(pkjwt_client("rp", &key, "k1"));
+        let auth = PrivateKeyJwt::default();
+        // iss != sub
+        let mut c = good_claims("rp", "je");
+        c["iss"] = serde_json::json!("other");
+        let mismatch = assertion(&key, "k1", "ES256", c);
+        assert!(auth.authenticate(&p, &input(Some(&mismatch), None, None)).await.is_err());
+        // 別鍵署名（署名検証で落ちる）
+        let bad_sig = assertion(&other, "k1", "ES256", good_claims("rp", "jf"));
+        assert!(auth.authenticate(&p, &input(Some(&bad_sig), None, None)).await.is_err());
+    }
+}

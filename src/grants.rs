@@ -310,12 +310,16 @@ impl GrantHandler for CibaGrant {
                 Err(OAuthError::AccessDenied("end-user denied the request".into()))
             }
             CibaStatus::Approved => {
+                // CIBA は単回。Approved→削除を CAS で原子化し、並行 poll での二重発行を防ぐ。
+                // 消費に成功した呼び出しだけがトークンを発行できる。
+                let req = ciba::consume_if_approved(fs, auth_req_id)
+                    .await
+                    .map_err(OAuthError::ServerError)?
+                    .ok_or_else(|| OAuthError::InvalidGrant("auth_req_id already used".into()))?;
                 let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
                 let (access_token, id_token) =
                     issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref())
                         .await;
-                // CIBA は単回。発行後に消費する。
-                ciba::delete(fs, auth_req_id).await.ok();
                 Ok(TokenResponse {
                     access_token,
                     token_type: token_type.into(),
@@ -326,5 +330,205 @@ impl GrantHandler for CibaGrant {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jws::b64url;
+    use crate::model::{AuthorizationCode, Client, RefreshToken};
+    use crate::provider::Provider;
+    use sha2::{Digest, Sha256};
+
+    fn provider() -> Provider {
+        Provider::new("https://op.example.com")
+    }
+
+    fn client(id: &str) -> Client {
+        Client {
+            client_id: id.into(),
+            redirect_uris: vec!["https://rp/cb".into()],
+            token_endpoint_auth_method: "none".into(),
+            client_secret: None,
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+            post_logout_redirect_uris: vec![],
+            dpop_bound: false,
+            jwks: vec![],
+            require_par: false,
+            require_pkce: false,
+            id_token_signed_response_alg: None,
+        }
+    }
+
+    fn base_code(code: &str, client_id: &str) -> AuthorizationCode {
+        AuthorizationCode {
+            code: code.into(),
+            client_id: client_id.into(),
+            account_id: "user@example.com".into(),
+            redirect_uri: "https://rp/cb".into(),
+            scope: "openid".into(),
+            nonce: None,
+            code_challenge: None,
+            code_challenge_method: None,
+            auth_time: 0,
+            acr: None,
+            dpop_jkt: None,
+            expires_at: u64::MAX,
+        }
+    }
+
+    fn rt(token: &str, client_id: &str, scope: &str) -> RefreshToken {
+        RefreshToken {
+            token: token.into(),
+            client_id: client_id.into(),
+            account_id: "user@example.com".into(),
+            scope: scope.into(),
+        }
+    }
+
+    fn form(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[tokio::test]
+    async fn auth_code_happy_path_issues_tokens() {
+        let p = provider();
+        let c = client("rp");
+        p.store.save_code(base_code("C1", "rp")).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        let r = AuthorizationCodeGrant.handle(&p, &c, &f, None).await.unwrap();
+        assert!(!r.access_token.is_empty());
+        assert_eq!(r.token_type, "Bearer");
+        assert!(r.id_token.is_some());
+        assert!(r.refresh_token.is_none()); // offline_access 無し
+    }
+
+    #[tokio::test]
+    async fn auth_code_reuse_is_rejected() {
+        let p = provider();
+        let c = client("rp");
+        p.store.save_code(base_code("C1", "rp")).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        assert!(AuthorizationCodeGrant.handle(&p, &c, &f, None).await.is_ok());
+        let again = AuthorizationCodeGrant.handle(&p, &c, &f, None).await;
+        assert!(matches!(again, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    #[tokio::test]
+    async fn auth_code_issued_to_another_client_rejected() {
+        let p = provider();
+        p.store.save_code(base_code("C1", "rp")).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        let r = AuthorizationCodeGrant.handle(&p, &client("evil"), &f, None).await;
+        assert!(matches!(r, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    #[tokio::test]
+    async fn auth_code_redirect_uri_mismatch_rejected() {
+        let p = provider();
+        let c = client("rp");
+        p.store.save_code(base_code("C1", "rp")).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://evil/cb")]);
+        let r = AuthorizationCodeGrant.handle(&p, &c, &f, None).await;
+        assert!(matches!(r, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    #[tokio::test]
+    async fn auth_code_pkce_success_and_failure() {
+        let verifier = "the-verifier-string-1234567890ABCdef";
+        let challenge = b64url(Sha256::digest(verifier.as_bytes()));
+        let p = provider();
+        let c = client("rp");
+
+        let mut code = base_code("C1", "rp");
+        code.code_challenge = Some(challenge.clone());
+        p.store.save_code(code).await;
+        let bad = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb"), ("code_verifier", "wrong")]);
+        assert!(matches!(
+            AuthorizationCodeGrant.handle(&p, &c, &bad, None).await,
+            Err(OAuthError::InvalidGrant(_))
+        ));
+
+        let mut code2 = base_code("C1", "rp");
+        code2.code_challenge = Some(challenge);
+        p.store.save_code(code2).await;
+        let ok = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb"), ("code_verifier", verifier)]);
+        assert!(AuthorizationCodeGrant.handle(&p, &c, &ok, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auth_code_dpop_jkt_binding_enforced() {
+        let p = provider();
+        let c = client("rp");
+        let mut code = base_code("C1", "rp");
+        code.dpop_jkt = Some("JKT-A".into());
+        p.store.save_code(code).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        // 束縛済み jkt と proof jkt 不一致は拒否。
+        assert!(matches!(
+            AuthorizationCodeGrant.handle(&p, &c, &f, Some("JKT-B".into())).await,
+            Err(OAuthError::InvalidDpopProof(_))
+        ));
+        // 一致なら DPoP トークンを発行。
+        let mut code2 = base_code("C1", "rp");
+        code2.dpop_jkt = Some("JKT-A".into());
+        p.store.save_code(code2).await;
+        let r = AuthorizationCodeGrant.handle(&p, &c, &f, Some("JKT-A".into())).await.unwrap();
+        assert_eq!(r.token_type, "DPoP");
+    }
+
+    #[tokio::test]
+    async fn auth_code_offline_access_issues_refresh() {
+        let p = provider();
+        let c = client("rp");
+        let mut code = base_code("C1", "rp");
+        code.scope = "openid offline_access".into();
+        p.store.save_code(code).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        let r = AuthorizationCodeGrant.handle(&p, &c, &f, None).await.unwrap();
+        assert!(r.refresh_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_and_reuse_rejected() {
+        let p = provider();
+        let c = client("rp");
+        p.store.save_refresh_token(rt("RT1", "rp", "openid offline_access")).await;
+        let f = form(&[("refresh_token", "RT1")]);
+        let r = RefreshTokenGrant.handle(&p, &c, &f, None).await.unwrap();
+        assert!(r.refresh_token.is_some());
+        assert_ne!(r.refresh_token.as_deref(), Some("RT1")); // ローテーション
+        assert!(matches!(
+            RefreshTokenGrant.handle(&p, &c, &f, None).await,
+            Err(OAuthError::InvalidGrant(_))
+        )); // 旧 RT 再利用は拒否
+    }
+
+    #[tokio::test]
+    async fn refresh_issued_to_another_client_rejected() {
+        let p = provider();
+        p.store.save_refresh_token(rt("RT1", "rp", "openid")).await;
+        let f = form(&[("refresh_token", "RT1")]);
+        assert!(matches!(
+            RefreshTokenGrant.handle(&p, &client("evil"), &f, None).await,
+            Err(OAuthError::InvalidGrant(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_scope_widening_rejected_narrowing_ok() {
+        let p = provider();
+        let c = client("rp");
+        p.store.save_refresh_token(rt("RT1", "rp", "openid profile")).await;
+        let widen = form(&[("refresh_token", "RT1"), ("scope", "openid profile email")]);
+        assert!(matches!(
+            RefreshTokenGrant.handle(&p, &c, &widen, None).await,
+            Err(OAuthError::InvalidScope(_))
+        ));
+        p.store.save_refresh_token(rt("RT2", "rp", "openid profile")).await;
+        let narrow = form(&[("refresh_token", "RT2"), ("scope", "openid")]);
+        let r = RefreshTokenGrant.handle(&p, &c, &narrow, None).await.unwrap();
+        assert_eq!(r.scope, "openid");
     }
 }

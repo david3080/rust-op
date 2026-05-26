@@ -241,6 +241,37 @@ impl Firestore {
         Err(format!("cas {}", r.status()))
     }
 
+    /// updateTime が一致するときだけ削除する（compare-and-set 削除）。
+    /// 削除できたら Ok(true)、他者が先に更新/削除（FAILED_PRECONDITION / NOT_FOUND）なら Ok(false)。
+    /// CIBA poll の「承認の単回消費」を原子的に行うために使う。
+    pub async fn delete_doc_if_unchanged(
+        &self,
+        col: &str,
+        id: &str,
+        update_time: &str,
+    ) -> Result<bool, String> {
+        let tok = self.token().await?;
+        let r = self
+            .http
+            .delete(self.doc_url(col, id))
+            .query(&[("currentDocument.updateTime", update_time)])
+            .bearer_auth(tok)
+            .send()
+            .await
+            .map_err(|e| format!("cas delete: {e}"))?;
+        if r.status().is_success() {
+            return Ok(true);
+        }
+        if r.status() == reqwest::StatusCode::BAD_REQUEST
+            || r.status() == reqwest::StatusCode::CONFLICT
+            || r.status() == reqwest::StatusCode::PRECONDITION_FAILED
+            || r.status() == reqwest::StatusCode::NOT_FOUND
+        {
+            return Ok(false);
+        }
+        Err(format!("cas delete {}", r.status()))
+    }
+
     /// 単一フィールド完全一致のクエリ。各ドキュメントの (id, fields) を返す。
     pub async fn query_eq(
         &self,

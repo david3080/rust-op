@@ -148,6 +148,28 @@ pub async fn delete(fs: &Firestore, auth_req_id: &str) -> Result<(), String> {
     fs.delete_doc(COL, auth_req_id).await
 }
 
+/// Approved の要求を原子的に「消費（削除）」する。CIBA は単回なので、poll が並行しても
+/// CAS 削除に成功した呼び出しだけがトークンを発行できる。消費できたら Ok(Some(req))、
+/// 既に消費済み/Pending/Denied/レース敗北なら Ok(None)。
+pub async fn consume_if_approved(
+    fs: &Firestore,
+    auth_req_id: &str,
+) -> Result<Option<BackchannelAuthRequest>, String> {
+    let (fields, update_time) = match fs.get_doc_with_update_time(COL, auth_req_id).await? {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    let req = BackchannelAuthRequest::from_fields(AuthReqId(auth_req_id.to_string()), &fields);
+    if req.status != CibaStatus::Approved {
+        return Ok(None);
+    }
+    if fs.delete_doc_if_unchanged(COL, auth_req_id, &update_time).await? {
+        Ok(Some(req))
+    } else {
+        Ok(None) // 他者が先に消費（レース敗北）
+    }
+}
+
 /// アカウントの pending な要求一覧（承認 UI 用）。期限切れは除く。
 pub async fn list_pending(fs: &Firestore, account: &str) -> Result<Vec<BackchannelAuthRequest>, String> {
     let rows = fs.query_eq(COL, "account", account).await?;
@@ -156,4 +178,52 @@ pub async fn list_pending(fs: &Firestore, account: &str) -> Result<Vec<Backchann
         .map(|(id, f)| BackchannelAuthRequest::from_fields(AuthReqId(id), &f))
         .filter(|r| r.status == CibaStatus::Pending && !r.expired())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_str_roundtrip_and_unknown_defaults_pending() {
+        for s in [CibaStatus::Pending, CibaStatus::Approved, CibaStatus::Denied] {
+            assert_eq!(CibaStatus::parse(s.as_str()), s);
+        }
+        assert_eq!(CibaStatus::parse("garbage"), CibaStatus::Pending);
+    }
+
+    #[test]
+    fn fields_roundtrip_preserves_values() {
+        let req = BackchannelAuthRequest {
+            auth_req_id: AuthReqId("abc".into()),
+            client_id: "rp".into(),
+            account: "u@example.com".into(),
+            scope: "openid profile".into(),
+            binding_message: "確認してください".into(),
+            status: CibaStatus::Approved,
+            expires_at: 1_900_000_000,
+        };
+        let back = BackchannelAuthRequest::from_fields(AuthReqId("abc".into()), &req.fields());
+        assert_eq!(back.client_id, "rp");
+        assert_eq!(back.account, "u@example.com");
+        assert_eq!(back.scope, "openid profile");
+        assert_eq!(back.binding_message, "確認してください");
+        assert_eq!(back.status, CibaStatus::Approved);
+        assert_eq!(back.expires_at, 1_900_000_000);
+    }
+
+    #[test]
+    fn expired_reflects_clock() {
+        let mk = |exp| BackchannelAuthRequest {
+            auth_req_id: AuthReqId("x".into()),
+            client_id: "c".into(),
+            account: "a".into(),
+            scope: "openid".into(),
+            binding_message: String::new(),
+            status: CibaStatus::Pending,
+            expires_at: exp,
+        };
+        assert!(mk(0).expired());
+        assert!(!mk(now() + 100).expired());
+    }
 }

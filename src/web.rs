@@ -10,7 +10,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum_extra::extract::cookie::{Cookie, CookieJar};
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ pub fn router(provider: Provider) -> Router {
     // FIDO2 Conformance 用エンドポイントは base_path に依らずトップレベル /fido/* に置く。
     let fido = crate::fido::router(Arc::new(crate::fido::FidoState::from_env()));
     let shared = Arc::new(provider);
-    let inner = Router::new()
+    let mut inner = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/jwks", get(jwks))
         .route("/authorize", get(authorize))
@@ -50,10 +50,6 @@ pub fn router(provider: Provider) -> Router {
         .route("/ciba/{auth_req_id}/passkey-options", post(ciba_approve_options))
         .route("/ciba/{auth_req_id}/approve", post(ciba_approve))
         .route("/ciba/{auth_req_id}/reject", post(ciba_reject))
-        // CIBA Consumption デモ（Web だけで CIBA を体験）。
-        .route("/ciba-demo", get(ciba_demo_page))
-        .route("/ciba-demo/start", post(ciba_demo_start))
-        .route("/ciba-demo/poll", get(ciba_demo_poll))
         // メール確認つきユーザー登録（Web HTML フロー + ネイティブ JSON API）。
         .route("/register", get(register_form).post(register_submit))
         .route("/register/verify", get(verify_form))
@@ -63,8 +59,18 @@ pub fn router(provider: Provider) -> Router {
         .route("/register/passkey/verify", post(register_passkey_verify))
         // ブラウザで完結する RP デモ。
         .route("/", get(demo_start))
-        .route("/callback", get(demo_callback))
-        .with_state(shared.clone());
+        .route("/callback", get(demo_callback));
+
+    // CIBA Consumption デモ（Web だけで CIBA を体験）。無認証で FCM push を誘発でき、
+    // 承認後に email/profile を無認証ポーラへ返すため、本番では既定で無効。
+    // デモ時のみ環境変数 CIBA_DEMO_ENABLED=1 で有効化する。
+    if std::env::var("CIBA_DEMO_ENABLED").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        inner = inner
+            .route("/ciba-demo", get(ciba_demo_page))
+            .route("/ciba-demo/start", post(ciba_demo_start))
+            .route("/ciba-demo/poll", get(ciba_demo_poll));
+    }
+    let inner = inner.with_state(shared.clone());
 
     // メールリンク /r はトップレベル（base_path 非依存、AASA の paths と一致）。
     let magic = Router::new()
@@ -497,7 +503,12 @@ async fn finalize_login(
     p.store
         .save_session(Session { sid: sid.clone(), account_id: account_sub, auth_time })
         .await;
-    let cookie = Cookie::build((SID_COOKIE, sid)).path("/").http_only(true).build();
+    let cookie = Cookie::build((SID_COOKIE, sid))
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Lax)
+        .build();
     (jar.add(cookie), p.path(&format!("/authorize/resume?uid={uid}")))
 }
 
