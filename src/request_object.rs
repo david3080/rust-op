@@ -225,6 +225,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_exp_more_than_60min_future() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let c = client_with_key(&key);
+        let mut pl = good_payload();
+        pl["exp"] = json!(now() + 3700); // > 60分
+        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_or_future_or_old_nbf() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let c = client_with_key(&key);
+        // 欠落
+        let mut pl = good_payload();
+        pl.as_object_mut().unwrap().remove("nbf");
+        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        // 未来
+        let mut pl = good_payload();
+        pl["nbf"] = json!(now() + 600);
+        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        // 60分超過去
+        let mut pl = good_payload();
+        pl["nbf"] = json!(now() - 4000);
+        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_iat_and_jti() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let c = client_with_key(&key);
+        let mut pl = good_payload();
+        pl.as_object_mut().unwrap().remove("iat");
+        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        let mut pl = good_payload();
+        pl.as_object_mut().unwrap().remove("jti");
+        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+    }
+
+    #[test]
+    fn accepts_aud_as_array_containing_issuer() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let c = client_with_key(&key);
+        let mut pl = good_payload();
+        pl["aud"] = json!(["https://other", ISS]);
+        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_ok());
+    }
+
+    #[test]
     fn rejects_unknown_kid() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let c = client_with_key(&key);

@@ -225,8 +225,23 @@ mod tests {
     fn rejects_iat_out_of_window() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
-        let proof = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs() - 600));
-        assert!(v.verify(&proof, HTM, HTU, None).is_err());
+        // 過去側
+        let past = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs() - 600));
+        assert!(v.verify(&past, HTM, HTU, None).is_err());
+        // 未来側（.abs() の両側を踏む）
+        let future = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs() + 600));
+        assert!(v.verify(&future, HTM, HTU, None).is_err());
+    }
+
+    #[test]
+    fn htu_ignores_query_and_fragment() {
+        // RFC 9449 §4.3: proof の htu に query/fragment があっても、サーバ側 htu と
+        // path まで一致すれば受理する。
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let v = Es256Dpop::default();
+        let htu_with_extra = format!("{HTU}?foo=bar#frag");
+        let proof = make_proof(&key, &header(&key), &payload(HTM, &htu_with_extra, now_secs()));
+        assert!(v.verify(&proof, HTM, HTU, None).is_ok());
     }
 
     #[test]

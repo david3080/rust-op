@@ -267,31 +267,7 @@ fn challenge_expired(fields: &serde_json::Value) -> bool {
         .get("expiresAt")
         .and_then(|v| v.get("timestampValue"))
         .and_then(|v| v.as_str())
-        .map(parse_rfc3339_secs)
+        .map(crate::firestore::parse_rfc3339_secs)
         .unwrap_or(0);
     exp < now()
-}
-
-/// RFC3339 (秒精度, 末尾 Z) を epoch 秒へ。失敗時 0。
-fn parse_rfc3339_secs(s: &str) -> u64 {
-    if s.len() < 19 {
-        return 0;
-    }
-    let num = |a: usize, b: usize| -> i64 { s[a..b].parse().unwrap_or(0) };
-    let (y, mo, d) = (num(0, 4), num(5, 7), num(8, 10));
-    let (h, mi, sec) = (num(11, 13), num(14, 16), num(17, 19));
-    days_from_civil(y, mo as u32, d as u32) as u64 * 86400
-        + (h as u64) * 3600
-        + (mi as u64) * 60
-        + sec as u64
-}
-
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
 }

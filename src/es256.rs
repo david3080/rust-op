@@ -93,20 +93,14 @@ mod tests {
     }
 
     #[test]
-    fn thumbprint_is_stable_known_vector() {
-        // canonical {"crv":"P-256","kty":"EC","x":"AA","y":"BB"} の SHA-256(b64url)。
-        // 値が変わったら canonical JSON の生成が壊れたサイン（リグレッション固定）。
-        let got = jwk_thumbprint_p256("AA", "BB");
-        let expected = {
-            let canonical = r#"{"crv":"P-256","kty":"EC","x":"AA","y":"BB"}"#;
-            b64url_encode(Sha256::digest(canonical.as_bytes()))
-        };
-        assert_eq!(got, expected);
-        assert_eq!(got.len(), 43); // SHA-256 → 32byte → b64url no-pad 43 文字
-    }
-
-    #[test]
-    fn thumbprint_differs_for_different_coordinates() {
+    fn thumbprint_matches_known_answer_and_differs_per_key() {
+        // RFC 7638: canonical {"crv":"P-256","kty":"EC","x":"AA","y":"BB"} の SHA-256(b64url)。
+        // 固定値で、canonical JSON の生成（キー順・フォーマット）が壊れたら検出する。
+        assert_eq!(
+            jwk_thumbprint_p256("AA", "BB"),
+            "CeklDX4_DJrArRhgR02px71cEGk-KZ43X9yURY2Vg9Y"
+        );
+        // 座標が違えば thumbprint も変わる。
         assert_ne!(jwk_thumbprint_p256("AA", "BB"), jwk_thumbprint_p256("AA", "CC"));
     }
 }

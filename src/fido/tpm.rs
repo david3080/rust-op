@@ -162,7 +162,7 @@ fn check_aik_cert(cert: &Certificate) -> Result<(), String> {
         if ext.extn_id == OID_EKU {
             let eku = ExtendedKeyUsage::from_der(ext.extn_value.as_bytes())
                 .map_err(|e| format!("eku: {e}"))?;
-            if eku.0.iter().any(|o| *o == OID_TCG_AIK) {
+            if eku.0.contains(&OID_TCG_AIK) {
                 eku_ok = true;
             }
         } else if ext.extn_id == OID_BASIC_CONSTRAINTS {

@@ -219,7 +219,7 @@ impl Store for FirestoreStore {
     async fn find_account(&self, sub: &str) -> Account {
         // 静的デフォルトの上に、ユーザーが保存した編集可能 claim を重ねる。
         let mut account = account_for(sub);
-        if let Ok(profile) = crate::registration::get_profile(&*self.fs, sub).await {
+        if let Ok(profile) = crate::registration::get_profile(&self.fs, sub).await {
             for (k, v) in profile {
                 account.claims.insert(k, json!(v));
             }

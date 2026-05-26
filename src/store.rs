@@ -120,6 +120,53 @@ impl Store for MemoryStore {
     }
 }
 
+/// sub から標準 claim 一式を持つ Account を生成（PoC のダミー値）。
+/// MemoryStore / FirestoreStore 共通。claim の scope 絞りは userinfo 側で行う。
+pub fn account_for(sub: &str) -> Account {
+    let email = if sub.contains('@') {
+        sub.to_string()
+    } else {
+        format!("{sub}@example.com")
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut claims = HashMap::new();
+    let mut put = |k: &str, v: serde_json::Value| {
+        claims.insert(k.to_string(), v);
+    };
+    put("sub", serde_json::json!(sub));
+    put("name", serde_json::json!(sub));
+    put("given_name", serde_json::json!(sub));
+    put("family_name", serde_json::json!("User"));
+    put("middle_name", serde_json::json!("Test"));
+    put("nickname", serde_json::json!(sub));
+    put("preferred_username", serde_json::json!(sub));
+    put("profile", serde_json::json!(format!("https://example.com/u/{sub}")));
+    put("picture", serde_json::json!("https://example.com/avatar.png"));
+    put("website", serde_json::json!("https://example.com"));
+    put("gender", serde_json::json!("other"));
+    put("birthdate", serde_json::json!("2000-01-01"));
+    put("zoneinfo", serde_json::json!("Asia/Tokyo"));
+    put("locale", serde_json::json!("ja-JP"));
+    put("updated_at", serde_json::json!(now));
+    put("email", serde_json::json!(email));
+    put("email_verified", serde_json::json!(true));
+    put(
+        "address",
+        serde_json::json!({
+            "formatted": "Tokyo, Japan",
+            "country": "JP",
+            "locality": "Tokyo",
+            "postal_code": "100-0001",
+        }),
+    );
+    put("phone_number", serde_json::json!("+81-3-0000-0000"));
+    put("phone_number_verified", serde_json::json!(false));
+    Account { sub: sub.to_string(), claims }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,51 +215,4 @@ mod tests {
         let s = MemoryStore::default();
         assert!(s.take_code("nope").await.is_none());
     }
-}
-
-/// sub から標準 claim 一式を持つ Account を生成（PoC のダミー値）。
-/// MemoryStore / FirestoreStore 共通。claim の scope 絞りは userinfo 側で行う。
-pub fn account_for(sub: &str) -> Account {
-    let email = if sub.contains('@') {
-        sub.to_string()
-    } else {
-        format!("{sub}@example.com")
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut claims = HashMap::new();
-    let mut put = |k: &str, v: serde_json::Value| {
-        claims.insert(k.to_string(), v);
-    };
-    put("sub", serde_json::json!(sub));
-    put("name", serde_json::json!(sub));
-    put("given_name", serde_json::json!(sub));
-    put("family_name", serde_json::json!("User"));
-    put("middle_name", serde_json::json!("Test"));
-    put("nickname", serde_json::json!(sub));
-    put("preferred_username", serde_json::json!(sub));
-    put("profile", serde_json::json!(format!("https://example.com/u/{sub}")));
-    put("picture", serde_json::json!("https://example.com/avatar.png"));
-    put("website", serde_json::json!("https://example.com"));
-    put("gender", serde_json::json!("other"));
-    put("birthdate", serde_json::json!("2000-01-01"));
-    put("zoneinfo", serde_json::json!("Asia/Tokyo"));
-    put("locale", serde_json::json!("ja-JP"));
-    put("updated_at", serde_json::json!(now));
-    put("email", serde_json::json!(email));
-    put("email_verified", serde_json::json!(true));
-    put(
-        "address",
-        serde_json::json!({
-            "formatted": "Tokyo, Japan",
-            "country": "JP",
-            "locality": "Tokyo",
-            "postal_code": "100-0001",
-        }),
-    );
-    put("phone_number", serde_json::json!("+81-3-0000-0000"));
-    put("phone_number_verified", serde_json::json!(false));
-    Account { sub: sub.to_string(), claims }
 }

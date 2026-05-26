@@ -76,6 +76,23 @@ mod tests {
     }
 
     #[test]
+    fn rs384_accepts_valid_rejects_tampered() {
+        use sha2::Sha384;
+        let (sk, n, e) = rsa_keypair();
+        let msg = b"sha384-signed";
+        let sig = sk
+            .sign(Pkcs1v15Sign::new::<Sha384>(), &Sha384::digest(msg))
+            .unwrap();
+        assert!(verify_rs384(&n, &e, msg, &sig).is_ok());
+        assert!(verify_rs384(&n, &e, b"different", &sig).is_err());
+        // SHA-256 で署名したものは RS384 検証に通らない。
+        let sig256 = sk
+            .sign(Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(msg))
+            .unwrap();
+        assert!(verify_rs384(&n, &e, msg, &sig256).is_err());
+    }
+
+    #[test]
     fn rs1_accepts_valid_rejects_wrong_hash_alg() {
         let (sk, n, e) = rsa_keypair();
         let msg = b"sha1-signed";

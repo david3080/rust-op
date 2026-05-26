@@ -25,9 +25,6 @@ pub enum OAuthError {
     AccessDenied(String),
     #[error("login_required: {0}")]
     LoginRequired(String),
-    #[allow(dead_code)] // JAR 対応で未使用化。エラー taxonomy として残す。
-    #[error("request_not_supported: {0}")]
-    RequestNotSupported(String),
     #[error("request_uri_not_supported: {0}")]
     RequestUriNotSupported(String),
     #[error("invalid_dpop_proof: {0}")]
@@ -52,7 +49,6 @@ impl OAuthError {
             OAuthError::InvalidScope(_) => "invalid_scope",
             OAuthError::AccessDenied(_) => "access_denied",
             OAuthError::LoginRequired(_) => "login_required",
-            OAuthError::RequestNotSupported(_) => "request_not_supported",
             OAuthError::RequestUriNotSupported(_) => "request_uri_not_supported",
             OAuthError::InvalidDpopProof(_) => "invalid_dpop_proof",
             OAuthError::AuthorizationPending(_) => "authorization_pending",
@@ -72,7 +68,6 @@ impl OAuthError {
             | OAuthError::InvalidScope(s)
             | OAuthError::AccessDenied(s)
             | OAuthError::LoginRequired(s)
-            | OAuthError::RequestNotSupported(s)
             | OAuthError::RequestUriNotSupported(s)
             | OAuthError::InvalidDpopProof(s)
             | OAuthError::AuthorizationPending(s)

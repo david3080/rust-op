@@ -114,7 +114,7 @@ pub fn check_flags(flags: u8, require_uv: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cose_get_int<'a>(m: &'a [(Cbor, Cbor)], key: i128) -> Option<&'a Cbor> {
+fn cose_get_int(m: &[(Cbor, Cbor)], key: i128) -> Option<&Cbor> {
     m.iter()
         .find(|(k, _)| matches!(k, Cbor::Integer(i) if i128::from(*i) == key))
         .map(|(_, v)| v)

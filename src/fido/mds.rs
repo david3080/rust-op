@@ -5,6 +5,7 @@
 //!    （有効期限 + 各リンク署名 + 失効[CRL]。失効は revocation.rs）。
 //! 2. leaf 公開鍵で JWS 署名検証。
 //! 3. payload.entries を aaguid でキャッシュ。
+//!
 //! 参照時: aaguid lookup → statusReports が compromised なら拒否 → metadataStatement 返却。
 //!
 //! MDS の root はここで明示的に信頼するため、verify.rs の「x5c 内自己署名拒否」とは別経路。
@@ -257,12 +258,11 @@ pub fn validate_attestation_chain(x5c_der: &[Vec<u8>], roots_b64: &[String]) -> 
     validate_chain_to_roots(x5c_der, &roots, false).map(|_| ())
 }
 
+/// verify_blob の成功値: (no, entries, x5c チェーン DER)。
+pub type VerifiedBlob = (i64, Vec<Entry>, Vec<Vec<u8>>);
+
 /// BLOB(JWS Compact) を検証して (no, entries, x5cチェーンDER) を返す。`prev_no` 以下の no は拒否。
-pub fn verify_blob(
-    blob: &str,
-    roots_der: &[Vec<u8>],
-    prev_no: i64,
-) -> Result<(i64, Vec<Entry>, Vec<Vec<u8>>), String> {
+pub fn verify_blob(blob: &str, roots_der: &[Vec<u8>], prev_no: i64) -> Result<VerifiedBlob, String> {
     let parts: Vec<&str> = blob.trim().split('.').collect();
     if parts.len() != 3 {
         return Err("mds blob not a JWS compact".into());

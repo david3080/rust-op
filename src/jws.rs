@@ -5,8 +5,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 
+/// base64url(no-pad) エンコード。実体は es256 に集約。
 pub fn b64url(bytes: impl AsRef<[u8]>) -> String {
-    URL_SAFE_NO_PAD.encode(bytes)
+    crate::es256::b64url_encode(bytes)
 }
 
 /// 署名鍵の概念。alg / 署名 / 公開 JWK を提供する。
