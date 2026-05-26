@@ -624,6 +624,7 @@ async fn login_passkey_verify(
         &cred.pub_x,
         &cred.pub_y,
         cred.sign_count,
+        false, // 通常ログインは UP のみ（従来通り）
     ) {
         Ok(new_count) => {
             let _ = crate::registration::update_sign_count(fs, &email, new_count).await;
@@ -1216,22 +1217,6 @@ async fn session_account(p: &Provider, jar: &CookieJar) -> Option<String> {
     p.store.get_session(&sid).await.map(|s| s.account_id)
 }
 
-/// CIBA 操作の主体を特定。access token(Bearer/DPoP)を優先し、無ければ session cookie。
-/// access token = プロフィール画面/ネイティブアプリ、cookie = /oidc/ciba HTML 用。
-/// path_suffix は DPoP htu 構築用（呼び出し側が auth_req_id 込みで渡す）。
-async fn ciba_actor(
-    p: &Provider,
-    headers: &HeaderMap,
-    jar: &CookieJar,
-    method: &str,
-    path_suffix: &str,
-) -> Option<String> {
-    if let Ok(at) = authenticate_token(p, headers, method, path_suffix, None).await {
-        return Some(at.account_id);
-    }
-    session_account(p, jar).await
-}
-
 /// プロフィール画面のポーリング用: 自分宛の pending CIBA 依頼一覧（access token 認証）。
 async fn ciba_pending_list(State(p): State<Arc<Provider>>, headers: HeaderMap) -> Response {
     let at = match authenticate_token(&p, &headers, "GET", "/ciba/pending", None).await {
@@ -1444,21 +1429,16 @@ setInterval(()=>{if(!window.__busy)location.reload();},4000);
 
 async fn ciba_approve_options(
     State(p): State<Arc<Provider>>,
-    headers: HeaderMap,
-    jar: CookieJar,
     Path(auth_req_id): Path<String>,
 ) -> Response {
     let fs = match &p.firestore {
         Some(f) => f,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    let suffix = format!("/ciba/{auth_req_id}/passkey-options");
-    let account = match ciba_actor(&p, &headers, &jar, "POST", &suffix).await {
-        Some(a) => a,
-        None => return (StatusCode::UNAUTHORIZED, "login required").into_response(),
-    };
+    // 承認主体は CIBA 要求の account（login_hint ユーザー）から決まる。アプリへの
+    // ログインは不要で、パスキー assertion（UV 必須）が本人性を証明する。
     let req = match crate::ciba::get(fs, &auth_req_id).await {
-        Ok(Some(r)) if r.account == account && !r.expired() => r,
+        Ok(Some(r)) if !r.expired() => r,
         _ => return (StatusCode::NOT_FOUND, "request not found").into_response(),
     };
     let cred = match crate::registration::get_credential(fs, &req.account).await {
@@ -1483,6 +1463,7 @@ async fn ciba_approve_options(
         "challenge": challenge,
         "rpId": p.rp_id(),
         "timeout": 60000,
+        "userVerification": "required",
         "allowCredentials": [{ "type": "public-key", "id": cred.credential_id, "transports": ["internal", "hybrid"] }],
     }))
     .into_response()
@@ -1490,8 +1471,6 @@ async fn ciba_approve_options(
 
 async fn ciba_approve(
     State(p): State<Arc<Provider>>,
-    headers: HeaderMap,
-    jar: CookieJar,
     Path(auth_req_id): Path<String>,
     Json(req): Json<AuthVerifyReq>,
 ) -> Response {
@@ -1499,11 +1478,8 @@ async fn ciba_approve(
         Some(f) => f,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    let suffix = format!("/ciba/{auth_req_id}/approve");
-    let account = match ciba_actor(&p, &headers, &jar, "POST", &suffix).await {
-        Some(a) => a,
-        None => return (StatusCode::UNAUTHORIZED, "login required").into_response(),
-    };
+    // 承認はログイン不要。チャレンジに紐づくユーザー（passkey-options で発行時に束縛）
+    // と CIBA 要求の account が一致し、そのユーザーの登録鍵で assertion を検証する。
     let challenge = match crate::webauthn::extract_challenge(&req.response.client_data_json) {
         Some(c) => c,
         None => return (StatusCode::BAD_REQUEST, "no challenge").into_response(),
@@ -1512,9 +1488,10 @@ async fn ciba_approve(
         Ok(Some(t)) => t,
         _ => return (StatusCode::BAD_REQUEST, "challenge invalid/expired").into_response(),
     };
-    if kind != crate::registration::ChallengeKind::CibaApprove || uid != auth_req_id || email != account {
+    if kind != crate::registration::ChallengeKind::CibaApprove || uid != auth_req_id {
         return (StatusCode::BAD_REQUEST, "challenge context mismatch").into_response();
     }
+    let account = email; // チャレンジ発行時に束縛されたユーザー = 承認主体。
     let ciba_req = match crate::ciba::get(fs, &auth_req_id).await {
         Ok(Some(r)) if r.account == account && !r.expired() => r,
         _ => return (StatusCode::NOT_FOUND, "request not found").into_response(),
@@ -1536,6 +1513,7 @@ async fn ciba_approve(
         &cred.pub_x,
         &cred.pub_y,
         cred.sign_count,
+        true, // CIBA 承認は UV(生体/PIN) 必須
     ) {
         Ok(n) => {
             let _ = crate::registration::update_sign_count(fs, &account, n).await;
@@ -1543,34 +1521,35 @@ async fn ciba_approve(
         Err(e) => return (StatusCode::UNAUTHORIZED, format!("passkey verify failed: {e}")).into_response(),
     }
     let _ = ciba_req; // 検証済み。承認に進む。
-    if let Err(e) = crate::ciba::set_status(fs, &auth_req_id, crate::ciba::CibaStatus::Approved).await {
-        tracing::error!("set_status: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+    // 先勝ち: Pending のときだけ Approved へ原子的に遷移。既に承認/拒否済みなら 409。
+    match crate::ciba::transition_if_pending(fs, &auth_req_id, crate::ciba::CibaStatus::Approved).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::CONFLICT, "already handled").into_response(),
+        Err(e) => {
+            tracing::error!("transition: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
     }
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 async fn ciba_reject(
     State(p): State<Arc<Provider>>,
-    headers: HeaderMap,
-    jar: CookieJar,
     Path(auth_req_id): Path<String>,
 ) -> Response {
     let fs = match &p.firestore {
         Some(f) => f,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    let suffix = format!("/ciba/{auth_req_id}/reject");
-    let account = match ciba_actor(&p, &headers, &jar, "POST", &suffix).await {
-        Some(a) => a,
-        None => return (StatusCode::UNAUTHORIZED, "login required").into_response(),
-    };
-    match crate::ciba::get(fs, &auth_req_id).await {
-        Ok(Some(r)) if r.account == account => {}
-        _ => return (StatusCode::NOT_FOUND, "request not found").into_response(),
+    // 拒否はログイン不要。auth_req_id を知る当事者（ユーザー端末/開始側）の fail-safe 操作。
+    // 先勝ち: Pending のときだけ Denied へ。既に処理済みなら何もしない（冪等に 204）。
+    match crate::ciba::transition_if_pending(fs, &auth_req_id, crate::ciba::CibaStatus::Denied).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!("transition: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
+        }
     }
-    let _ = crate::ciba::set_status(fs, &auth_req_id, crate::ciba::CibaStatus::Denied).await;
-    StatusCode::NO_CONTENT.into_response()
 }
 
 /* ===== CIBA Consumption デモ（FCM 無しで Web だけで CIBA を体験する） =====

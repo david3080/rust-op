@@ -82,15 +82,15 @@ pub fn verify_authentication(
     pub_x_b64: &str,
     pub_y_b64: &str,
     stored_sign_count: u32,
+    require_uv: bool,
 ) -> Result<u32, String> {
     let client_data =
         verify::check_client_data(client_data_json_b64, "webauthn.get", expected_challenge, origin)?;
     let auth_data = b64d(authenticator_data_b64)?;
     let ad = verify::parse_auth_data(&auth_data)?;
     verify::check_rp_id_hash(ad.rp_id_hash, rp_id)?;
-    if ad.flags & verify::FLAG_UP == 0 {
-        return Err("UP flag not set".into());
-    }
+    // UP は常に必須。UV は require_uv（CIBA 承認など高リスク操作）のとき必須。
+    verify::check_flags(ad.flags, require_uv)?;
     let key = CredKey::Es256 {
         x: b64d(pub_x_b64)?,
         y: b64d(pub_y_b64)?,
@@ -172,7 +172,7 @@ mod tests {
         let (x, y) = ec_xy(&key);
         let (ad, sig, cdj) = make_authentication(&key, 5);
         let new_count =
-            verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&x), &b64e2(&y), 1).unwrap();
+            verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&x), &b64e2(&y), 1, false).unwrap();
         assert_eq!(new_count, 5);
     }
 
@@ -182,7 +182,7 @@ mod tests {
         let (x, y) = ec_xy(&key);
         let (ad, sig, cdj) = make_authentication(&key, 5);
         // stored=5、受信=5 → 増えていない → クローン疑い。
-        let r = verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&x), &b64e2(&y), 5);
+        let r = verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&x), &b64e2(&y), 5, false);
         assert!(r.is_err());
     }
 
@@ -193,7 +193,7 @@ mod tests {
         let (ox, oy) = ec_xy(&other);
         let (ad, sig, cdj) = make_authentication(&key, 5);
         // 別鍵 (other) の (x,y) で検証 → 署名検証で落ちる。
-        let r = verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&ox), &b64e2(&oy), 1);
+        let r = verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&ox), &b64e2(&oy), 1, false);
         assert!(r.is_err());
     }
 
@@ -203,8 +203,18 @@ mod tests {
         let (x, y) = ec_xy(&key);
         let (ad, sig, cdj) = make_authentication(&key, 0);
         // 受信 signCount=0 は「カウンタ非対応」として stored に関わらず許容。
-        let r = verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&x), &b64e2(&y), 9);
+        let r = verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&x), &b64e2(&y), 9, false);
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn authentication_uv_required_rejects_without_uv_flag() {
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let (x, y) = ec_xy(&key);
+        // make_authentication は UP のみ（UV フラグ無し）。
+        let (ad, sig, cdj) = make_authentication(&key, 5);
+        let r = verify_authentication(&cdj, &ad, &sig, CH, ORIGIN, RP, &b64e2(&x), &b64e2(&y), 1, true);
+        assert!(r.is_err()); // UV 必須なのに UV 無し → 拒否
     }
 
     #[test]

@@ -124,12 +124,24 @@ pub async fn get(fs: &Firestore, auth_req_id: &str) -> Result<Option<Backchannel
     }
 }
 
-pub async fn set_status(fs: &Firestore, auth_req_id: &str, status: CibaStatus) -> Result<(), String> {
-    if let Some(mut req) = get(fs, auth_req_id).await? {
-        req.status = status;
-        fs.set_doc(COL, auth_req_id, req.fields()).await?;
+/// Pending のときだけ status へ原子的に遷移する（CIBA の「先勝ち」）。
+/// 遷移できたら Ok(true)。既に Pending でない / 他者が先に更新（レース敗北）なら Ok(false)。
+/// updateTime プリコンディションで承認と拒否の競合を一意に決める。
+pub async fn transition_if_pending(
+    fs: &Firestore,
+    auth_req_id: &str,
+    status: CibaStatus,
+) -> Result<bool, String> {
+    let (fields, update_time) = match fs.get_doc_with_update_time(COL, auth_req_id).await? {
+        Some(x) => x,
+        None => return Ok(false),
+    };
+    let mut req = BackchannelAuthRequest::from_fields(AuthReqId(auth_req_id.to_string()), &fields);
+    if req.status != CibaStatus::Pending {
+        return Ok(false); // 既に承認/拒否済み（後発は負け）
     }
-    Ok(())
+    req.status = status;
+    fs.set_doc_if_unchanged(COL, auth_req_id, req.fields(), &update_time).await
 }
 
 pub async fn delete(fs: &Firestore, auth_req_id: &str) -> Result<(), String> {
