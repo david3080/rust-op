@@ -1990,23 +1990,36 @@ async fn authenticate_token(
     };
     let at = match p.store.get_access_token(&token).await {
         Some(at) => at,
-        None => return Err((StatusCode::UNAUTHORIZED, "invalid token").into_response()),
+        None => {
+            tracing::warn!("token auth failed [{method} {path_suffix}]: invalid/expired token");
+            return Err((StatusCode::UNAUTHORIZED, "invalid token").into_response());
+        }
     };
     // DPoP 束縛トークンは DPoP scheme + proof（jkt 一致 / ath 一致）を要求。
     if let Some(jkt) = &at.jkt {
         if scheme != "DPoP" {
+            tracing::warn!("token auth failed [{path_suffix}]: DPoP scheme required (got {scheme})");
             return Err((StatusCode::UNAUTHORIZED, "DPoP scheme required").into_response());
         }
         let proof = match dpop_header(headers) {
             Some(p) => p,
-            None => return Err((StatusCode::UNAUTHORIZED, "DPoP proof required").into_response()),
+            None => {
+                tracing::warn!("token auth failed [{path_suffix}]: DPoP proof missing or duplicated");
+                return Err((StatusCode::UNAUTHORIZED, "DPoP proof required").into_response());
+            }
         };
         let htu = format!("{}{}", p.issuer, path_suffix);
         let want_ath = crate::dpop::ath(&token);
         match p.dpop.verify(&proof, method, &htu, Some(&want_ath)) {
             Ok(got) if &got == jkt => {}
-            Ok(_) => return Err((StatusCode::UNAUTHORIZED, "DPoP jkt mismatch").into_response()),
-            Err(e) => return Err((StatusCode::UNAUTHORIZED, format!("DPoP: {e}")).into_response()),
+            Ok(_) => {
+                tracing::warn!("token auth failed [{path_suffix}]: DPoP jkt mismatch (token bound to different key)");
+                return Err((StatusCode::UNAUTHORIZED, "DPoP jkt mismatch").into_response());
+            }
+            Err(e) => {
+                tracing::warn!("token auth failed [{path_suffix}]: DPoP proof invalid: {e}");
+                return Err((StatusCode::UNAUTHORIZED, format!("DPoP: {e}")).into_response());
+            }
         }
     }
     Ok(at)
