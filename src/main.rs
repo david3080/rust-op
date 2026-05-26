@@ -216,6 +216,7 @@ async fn main() {
         // セッション/コード/トークンも Firestore に永続化（インスタンス跨ぎ）。
         provider = provider
             .with_store(std::sync::Arc::new(firestore_store::FirestoreStore::new(fs.clone())))
+            .with_ciba(std::sync::Arc::new(ciba::FirestoreCibaStore::new(fs.clone())))
             .with_firestore(fs);
         if let Ok(key) = std::env::var("RESEND_API_KEY") {
             provider = provider.with_mailer(std::sync::Arc::new(mailer::ResendMailer::new(key)));

@@ -2,6 +2,7 @@
 //! 新機能 = 新しい trait impl を register するだけ、が拡張の基本方針。
 
 use crate::auth_checks::*;
+use crate::ciba::{CibaStore, MemoryCibaStore};
 use crate::client_auth::*;
 use crate::dpop::{DpopVerifier, Es256Dpop};
 use crate::firestore::Firestore;
@@ -29,6 +30,8 @@ pub struct Provider {
     pub extra_signers: Vec<Arc<dyn JwsSigner>>,
     /// メール確認登録用（Cloud Run 上でのみ Some）。
     pub firestore: Option<Arc<Firestore>>,
+    /// CIBA バックチャネル要求の永続化。既定は In-memory、本番は Firestore 実装を注入する。
+    pub ciba: Arc<dyn CibaStore>,
     pub mailer: Arc<dyn Mailer>,
     pub dpop: Arc<dyn DpopVerifier>,
     pub clients: HashMap<String, Client>,
@@ -74,6 +77,7 @@ impl Provider {
             extra_signers: Vec::new(),
             firestore: None,
             mailer: Arc::new(LogMailer),
+            ciba: Arc::new(MemoryCibaStore::default()),
             dpop: Arc::new(Es256Dpop::default()),
             clients: HashMap::new(),
             checks,
@@ -95,6 +99,11 @@ impl Provider {
 
     pub fn with_firestore(mut self, fs: Arc<Firestore>) -> Self {
         self.firestore = Some(fs);
+        self
+    }
+
+    pub fn with_ciba(mut self, ciba: Arc<dyn CibaStore>) -> Self {
+        self.ciba = ciba;
         self
     }
 

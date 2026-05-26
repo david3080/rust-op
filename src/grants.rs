@@ -1,7 +1,7 @@
 //! grant_type ごとのハンドラ。node-oidc-provider の `actions/grants/*` 相当。
 //! ciba を足す時はこの trait に impl を増やし Provider に登録する。
 
-use crate::ciba::{self, CibaStatus};
+use crate::ciba::CibaStatus;
 use crate::error::OAuthError;
 use crate::jws::b64url;
 use crate::model::{AccessToken, Client, RefreshToken, TokenResponse};
@@ -280,14 +280,12 @@ impl GrantHandler for CibaGrant {
         form: &HashMap<String, String>,
         dpop_jkt: Option<String>,
     ) -> Result<TokenResponse, OAuthError> {
-        let fs = p
-            .firestore
-            .as_ref()
-            .ok_or_else(|| OAuthError::ServerError("CIBA requires Firestore".into()))?;
         let auth_req_id = form
             .get("auth_req_id")
             .ok_or_else(|| OAuthError::InvalidRequest("auth_req_id required".into()))?;
-        let req = ciba::get(fs, auth_req_id)
+        let req = p
+            .ciba
+            .get(auth_req_id)
             .await
             .map_err(OAuthError::ServerError)?
             .ok_or_else(|| OAuthError::InvalidGrant("unknown auth_req_id".into()))?;
@@ -296,7 +294,7 @@ impl GrantHandler for CibaGrant {
             return Err(OAuthError::InvalidGrant("auth_req_id issued to another client".into()));
         }
         if req.expired() {
-            ciba::delete(fs, auth_req_id).await.ok();
+            p.ciba.delete(auth_req_id).await.ok();
             return Err(OAuthError::ExpiredToken("auth_req_id expired".into()));
         }
 
@@ -306,13 +304,15 @@ impl GrantHandler for CibaGrant {
                 "authorization pending".into(),
             )),
             CibaStatus::Denied => {
-                ciba::delete(fs, auth_req_id).await.ok();
+                p.ciba.delete(auth_req_id).await.ok();
                 Err(OAuthError::AccessDenied("end-user denied the request".into()))
             }
             CibaStatus::Approved => {
                 // CIBA は単回。Approved→削除を CAS で原子化し、並行 poll での二重発行を防ぐ。
                 // 消費に成功した呼び出しだけがトークンを発行できる。
-                let req = ciba::consume_if_approved(fs, auth_req_id)
+                let req = p
+                    .ciba
+                    .consume_if_approved(auth_req_id)
                     .await
                     .map_err(OAuthError::ServerError)?
                     .ok_or_else(|| OAuthError::InvalidGrant("auth_req_id already used".into()))?;
@@ -530,5 +530,81 @@ mod tests {
         let narrow = form(&[("refresh_token", "RT2"), ("scope", "openid")]);
         let r = RefreshTokenGrant.handle(&p, &c, &narrow, None).await.unwrap();
         assert_eq!(r.scope, "openid");
+    }
+
+    // ===== CIBA grant 統合テスト（MemoryCibaStore 注入）=====
+    // grant ロジックが store を正しく使うことを検証する。Firestore の updateTime CAS
+    // 自体の検証ではない（そこはコードレビュー担保 / MemoryCibaStore の単体テストで補強）。
+    use crate::ciba::{CibaStatus, CibaStore, MemoryCibaStore};
+
+    async fn seed_ciba(status: CibaStatus) -> (Provider, String) {
+        let store = std::sync::Arc::new(MemoryCibaStore::default());
+        let id = store.create("rp", "user@example.com", "openid", "msg").await.unwrap();
+        if status != CibaStatus::Pending {
+            store.transition_if_pending(id.as_str(), status).await.unwrap();
+        }
+        let p = provider().with_ciba(store);
+        (p, id.0)
+    }
+
+    #[tokio::test]
+    async fn ciba_pending_returns_authorization_pending() {
+        let (p, id) = seed_ciba(CibaStatus::Pending).await;
+        let f = form(&[("auth_req_id", &id)]);
+        assert!(matches!(
+            CibaGrant.handle(&p, &client("rp"), &f, None).await,
+            Err(OAuthError::AuthorizationPending(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ciba_denied_returns_access_denied() {
+        let (p, id) = seed_ciba(CibaStatus::Denied).await;
+        let f = form(&[("auth_req_id", &id)]);
+        assert!(matches!(
+            CibaGrant.handle(&p, &client("rp"), &f, None).await,
+            Err(OAuthError::AccessDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ciba_unknown_and_other_client_rejected() {
+        let (p, id) = seed_ciba(CibaStatus::Approved).await;
+        // 未知の auth_req_id
+        let unknown = form(&[("auth_req_id", "no-such-id")]);
+        assert!(matches!(
+            CibaGrant.handle(&p, &client("rp"), &unknown, None).await,
+            Err(OAuthError::InvalidGrant(_))
+        ));
+        // 別クライアントが他人の auth_req_id を使う
+        let f = form(&[("auth_req_id", &id)]);
+        assert!(matches!(
+            CibaGrant.handle(&p, &client("evil"), &f, None).await,
+            Err(OAuthError::InvalidGrant(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ciba_approved_issues_tokens_once_then_rejects_reuse() {
+        let (p, id) = seed_ciba(CibaStatus::Approved).await;
+        let f = form(&[("auth_req_id", &id)]);
+        // 1 回目: トークン発行。
+        let r = CibaGrant.handle(&p, &client("rp"), &f, None).await.unwrap();
+        assert!(!r.access_token.is_empty());
+        assert!(r.id_token.is_some());
+        assert_eq!(r.scope, "openid");
+        // 2 回目（並行 poll 相当の後発）: 既に単回消費済みなので拒否。二重発行しない。
+        assert!(matches!(
+            CibaGrant.handle(&p, &client("rp"), &f, None).await,
+            Err(OAuthError::InvalidGrant(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ciba_approved_with_dpop_issues_dpop_token() {
+        let (p, id) = seed_ciba(CibaStatus::Approved).await;
+        let f = form(&[("auth_req_id", &id)]);
+        let r = CibaGrant.handle(&p, &client("rp"), &f, Some("JKT".into())).await.unwrap();
+        assert_eq!(r.token_type, "DPoP");
     }
 }

@@ -1234,11 +1234,7 @@ async fn ciba_pending_list(State(p): State<Arc<Provider>>, headers: HeaderMap) -
         Ok(at) => at,
         Err(r) => return r,
     };
-    let fs = match &p.firestore {
-        Some(f) => f,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
-    };
-    let pending = crate::ciba::list_pending(fs, &at.account_id).await.unwrap_or_default();
+    let pending = p.ciba.list_pending(&at.account_id).await.unwrap_or_default();
     let items: Vec<serde_json::Value> = pending
         .iter()
         .map(|r| {
@@ -1347,7 +1343,7 @@ async fn backchannel_auth(
             return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
         }
     }
-    match crate::ciba::create(fs, &client.client_id, &login_hint, &scope, &binding).await {
+    match p.ciba.create(&client.client_id, &login_hint, &scope, &binding).await {
         Ok(id) => {
             // FCM で iPhone に承認要求を通知（Cloud Run suspend を避けるため await）。
             // token 未登録/送信失敗でも Web 承認は可能なのでベストエフォート。
@@ -1367,10 +1363,6 @@ async fn backchannel_auth(
 
 /// 承認 UI: ログイン済セッションが自分宛の pending 要求を承認/拒否する。
 async fn ciba_pending(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
-    let fs = match &p.firestore {
-        Some(f) => f,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
-    };
     let account = match session_account(&p, &jar).await {
         Some(a) => a,
         None => {
@@ -1381,7 +1373,7 @@ async fn ciba_pending(State(p): State<Arc<Provider>>, jar: CookieJar) -> Respons
             .into_response()
         }
     };
-    let pending = crate::ciba::list_pending(fs, &account).await.unwrap_or_default();
+    let pending = p.ciba.list_pending(&account).await.unwrap_or_default();
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
     let rows: String = pending
         .iter()
@@ -1448,7 +1440,7 @@ async fn ciba_approve_options(
     };
     // 承認主体は CIBA 要求の account（login_hint ユーザー）から決まる。アプリへの
     // ログインは不要で、パスキー assertion（UV 必須）が本人性を証明する。
-    let req = match crate::ciba::get(fs, &auth_req_id).await {
+    let req = match p.ciba.get(&auth_req_id).await {
         Ok(Some(r)) if !r.expired() => r,
         _ => return (StatusCode::NOT_FOUND, "request not found").into_response(),
     };
@@ -1503,7 +1495,7 @@ async fn ciba_approve(
         return (StatusCode::BAD_REQUEST, "challenge context mismatch").into_response();
     }
     let account = email; // チャレンジ発行時に束縛されたユーザー = 承認主体。
-    let ciba_req = match crate::ciba::get(fs, &auth_req_id).await {
+    let ciba_req = match p.ciba.get(&auth_req_id).await {
         Ok(Some(r)) if r.account == account && !r.expired() => r,
         _ => return (StatusCode::NOT_FOUND, "request not found").into_response(),
     };
@@ -1533,7 +1525,7 @@ async fn ciba_approve(
     }
     let _ = ciba_req; // 検証済み。承認に進む。
     // 先勝ち: Pending のときだけ Approved へ原子的に遷移。既に承認/拒否済みなら 409。
-    match crate::ciba::transition_if_pending(fs, &auth_req_id, crate::ciba::CibaStatus::Approved).await {
+    match p.ciba.transition_if_pending(&auth_req_id, crate::ciba::CibaStatus::Approved).await {
         Ok(true) => {}
         Ok(false) => return (StatusCode::CONFLICT, "already handled").into_response(),
         Err(e) => {
@@ -1548,13 +1540,9 @@ async fn ciba_reject(
     State(p): State<Arc<Provider>>,
     Path(auth_req_id): Path<String>,
 ) -> Response {
-    let fs = match &p.firestore {
-        Some(f) => f,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
-    };
     // 拒否はログイン不要。auth_req_id を知る当事者（ユーザー端末/開始側）の fail-safe 操作。
     // 先勝ち: Pending のときだけ Denied へ。既に処理済みなら何もしない（冪等に 204）。
-    match crate::ciba::transition_if_pending(fs, &auth_req_id, crate::ciba::CibaStatus::Denied).await {
+    match p.ciba.transition_if_pending(&auth_req_id, crate::ciba::CibaStatus::Denied).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!("transition: {e}");
@@ -1588,7 +1576,7 @@ async fn ciba_demo_start(State(p): State<Arc<Provider>>, Json(req): Json<CibaDem
         }
     }
     let binding = "Web CIBA デモのログインを承認してください";
-    match crate::ciba::create(fs, "ciba-rp", &login_hint, "openid", binding).await {
+    match p.ciba.create("ciba-rp", &login_hint, "openid", binding).await {
         Ok(id) => {
             let _ = crate::fcm::send_ciba_request(fs, &login_hint, "ciba-rp", "openid", binding, id.as_str()).await;
             Json(serde_json::json!({ "auth_req_id": id.0 })).into_response()
@@ -1610,7 +1598,7 @@ async fn ciba_demo_poll(State(p): State<Arc<Provider>>, Query(q): Query<CibaDemo
         Some(f) => f,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    let req = match crate::ciba::get(fs, &q.auth_req_id).await {
+    let req = match p.ciba.get(&q.auth_req_id).await {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };

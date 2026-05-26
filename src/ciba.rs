@@ -2,7 +2,9 @@
 //! Rust を生かす: auth_req_id は newtype、status は網羅 enum、Firestore 永続化。
 
 use crate::firestore::{self, Firestore};
+use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TTL_SECS: u64 = 300;
@@ -50,6 +52,7 @@ impl CibaStatus {
     }
 }
 
+#[derive(Clone)]
 pub struct BackchannelAuthRequest {
     pub auth_req_id: AuthReqId,
     pub client_id: String,
@@ -94,90 +97,185 @@ impl BackchannelAuthRequest {
     }
 }
 
-pub async fn create(
-    fs: &Firestore,
-    client_id: &str,
-    account: &str,
-    scope: &str,
-    binding_message: &str,
-) -> Result<AuthReqId, String> {
-    let req = BackchannelAuthRequest {
-        auth_req_id: AuthReqId::generate(),
-        client_id: client_id.to_string(),
-        account: account.to_string(),
-        scope: scope.to_string(),
-        binding_message: binding_message.to_string(),
-        status: CibaStatus::Pending,
-        expires_at: now() + TTL_SECS,
-    };
-    fs.set_doc(COL, req.auth_req_id.as_str(), req.fields()).await?;
-    Ok(req.auth_req_id)
+/// CIBA バックチャネル要求の永続化。本番は Firestore、テストは In-memory。
+/// transition_if_pending / consume_if_approved は CIBA の「先勝ち」「単回消費」を担う
+/// CAS 操作で、承認/拒否の競合と並行 poll の二重発行を一意に決める。
+#[async_trait]
+pub trait CibaStore: Send + Sync {
+    async fn create(
+        &self,
+        client_id: &str,
+        account: &str,
+        scope: &str,
+        binding_message: &str,
+    ) -> Result<AuthReqId, String>;
+    async fn get(&self, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String>;
+    /// Pending のときだけ status へ原子的に遷移。遷移できたら Ok(true)、
+    /// 既に Pending でない/レース敗北なら Ok(false)。
+    async fn transition_if_pending(&self, auth_req_id: &str, status: CibaStatus) -> Result<bool, String>;
+    /// Approved を原子的に消費（削除）。消費できたら Ok(Some(req))、
+    /// 既に消費済み/Pending/Denied/レース敗北なら Ok(None)。
+    async fn consume_if_approved(&self, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String>;
+    async fn delete(&self, auth_req_id: &str) -> Result<(), String>;
+    /// アカウントの pending な要求一覧（承認 UI 用）。期限切れは除く。
+    async fn list_pending(&self, account: &str) -> Result<Vec<BackchannelAuthRequest>, String>;
 }
 
-pub async fn get(fs: &Firestore, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String> {
-    match fs.get_doc(COL, auth_req_id).await? {
-        Some(f) => Ok(Some(BackchannelAuthRequest::from_fields(
-            AuthReqId(auth_req_id.to_string()),
-            &f,
-        ))),
-        None => Ok(None),
+/// 本番実装。Firestore の updateTime プリコンディションで CAS を実現する。
+pub struct FirestoreCibaStore {
+    fs: Arc<Firestore>,
+}
+
+impl FirestoreCibaStore {
+    pub fn new(fs: Arc<Firestore>) -> Self {
+        Self { fs }
     }
 }
 
-/// Pending のときだけ status へ原子的に遷移する（CIBA の「先勝ち」）。
-/// 遷移できたら Ok(true)。既に Pending でない / 他者が先に更新（レース敗北）なら Ok(false)。
-/// updateTime プリコンディションで承認と拒否の競合を一意に決める。
-pub async fn transition_if_pending(
-    fs: &Firestore,
-    auth_req_id: &str,
-    status: CibaStatus,
-) -> Result<bool, String> {
-    let (fields, update_time) = match fs.get_doc_with_update_time(COL, auth_req_id).await? {
-        Some(x) => x,
-        None => return Ok(false),
-    };
-    let mut req = BackchannelAuthRequest::from_fields(AuthReqId(auth_req_id.to_string()), &fields);
-    if req.status != CibaStatus::Pending {
-        return Ok(false); // 既に承認/拒否済み（後発は負け）
+#[async_trait]
+impl CibaStore for FirestoreCibaStore {
+    async fn create(
+        &self,
+        client_id: &str,
+        account: &str,
+        scope: &str,
+        binding_message: &str,
+    ) -> Result<AuthReqId, String> {
+        let req = BackchannelAuthRequest {
+            auth_req_id: AuthReqId::generate(),
+            client_id: client_id.to_string(),
+            account: account.to_string(),
+            scope: scope.to_string(),
+            binding_message: binding_message.to_string(),
+            status: CibaStatus::Pending,
+            expires_at: now() + TTL_SECS,
+        };
+        self.fs.set_doc(COL, req.auth_req_id.as_str(), req.fields()).await?;
+        Ok(req.auth_req_id)
     }
-    req.status = status;
-    fs.set_doc_if_unchanged(COL, auth_req_id, req.fields(), &update_time).await
+
+    async fn get(&self, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String> {
+        match self.fs.get_doc(COL, auth_req_id).await? {
+            Some(f) => Ok(Some(BackchannelAuthRequest::from_fields(
+                AuthReqId(auth_req_id.to_string()),
+                &f,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    async fn transition_if_pending(&self, auth_req_id: &str, status: CibaStatus) -> Result<bool, String> {
+        let (fields, update_time) = match self.fs.get_doc_with_update_time(COL, auth_req_id).await? {
+            Some(x) => x,
+            None => return Ok(false),
+        };
+        let mut req = BackchannelAuthRequest::from_fields(AuthReqId(auth_req_id.to_string()), &fields);
+        if req.status != CibaStatus::Pending {
+            return Ok(false);
+        }
+        req.status = status;
+        self.fs.set_doc_if_unchanged(COL, auth_req_id, req.fields(), &update_time).await
+    }
+
+    async fn consume_if_approved(&self, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String> {
+        let (fields, update_time) = match self.fs.get_doc_with_update_time(COL, auth_req_id).await? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let req = BackchannelAuthRequest::from_fields(AuthReqId(auth_req_id.to_string()), &fields);
+        if req.status != CibaStatus::Approved {
+            return Ok(None);
+        }
+        if self.fs.delete_doc_if_unchanged(COL, auth_req_id, &update_time).await? {
+            Ok(Some(req))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete(&self, auth_req_id: &str) -> Result<(), String> {
+        self.fs.delete_doc(COL, auth_req_id).await
+    }
+
+    async fn list_pending(&self, account: &str) -> Result<Vec<BackchannelAuthRequest>, String> {
+        let rows = self.fs.query_eq(COL, "account", account).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, f)| BackchannelAuthRequest::from_fields(AuthReqId(id), &f))
+            .filter(|r| r.status == CibaStatus::Pending && !r.expired())
+            .collect())
+    }
 }
 
-pub async fn delete(fs: &Firestore, auth_req_id: &str) -> Result<(), String> {
-    fs.delete_doc(COL, auth_req_id).await
+/// In-memory 実装（Provider のデフォルト / テスト用）。Mutex 下で状態遷移するので
+/// 「先勝ち」「単回消費」のロジックは満たすが、Firestore の updateTime CAS 自体の
+/// 検証にはならない（そこはコードレビューで担保）。
+#[derive(Default)]
+pub struct MemoryCibaStore {
+    map: std::sync::Mutex<std::collections::HashMap<String, BackchannelAuthRequest>>,
 }
 
-/// Approved の要求を原子的に「消費（削除）」する。CIBA は単回なので、poll が並行しても
-/// CAS 削除に成功した呼び出しだけがトークンを発行できる。消費できたら Ok(Some(req))、
-/// 既に消費済み/Pending/Denied/レース敗北なら Ok(None)。
-pub async fn consume_if_approved(
-    fs: &Firestore,
-    auth_req_id: &str,
-) -> Result<Option<BackchannelAuthRequest>, String> {
-    let (fields, update_time) = match fs.get_doc_with_update_time(COL, auth_req_id).await? {
-        Some(x) => x,
-        None => return Ok(None),
-    };
-    let req = BackchannelAuthRequest::from_fields(AuthReqId(auth_req_id.to_string()), &fields);
-    if req.status != CibaStatus::Approved {
-        return Ok(None);
+#[async_trait]
+impl CibaStore for MemoryCibaStore {
+    async fn create(
+        &self,
+        client_id: &str,
+        account: &str,
+        scope: &str,
+        binding_message: &str,
+    ) -> Result<AuthReqId, String> {
+        let id = AuthReqId::generate();
+        let req = BackchannelAuthRequest {
+            auth_req_id: id.clone(),
+            client_id: client_id.to_string(),
+            account: account.to_string(),
+            scope: scope.to_string(),
+            binding_message: binding_message.to_string(),
+            status: CibaStatus::Pending,
+            expires_at: now() + TTL_SECS,
+        };
+        self.map.lock().unwrap().insert(id.0.clone(), req);
+        Ok(id)
     }
-    if fs.delete_doc_if_unchanged(COL, auth_req_id, &update_time).await? {
-        Ok(Some(req))
-    } else {
-        Ok(None) // 他者が先に消費（レース敗北）
-    }
-}
 
-/// アカウントの pending な要求一覧（承認 UI 用）。期限切れは除く。
-pub async fn list_pending(fs: &Firestore, account: &str) -> Result<Vec<BackchannelAuthRequest>, String> {
-    let rows = fs.query_eq(COL, "account", account).await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, f)| BackchannelAuthRequest::from_fields(AuthReqId(id), &f))
-        .filter(|r| r.status == CibaStatus::Pending && !r.expired())
-        .collect())
+    async fn get(&self, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String> {
+        Ok(self.map.lock().unwrap().get(auth_req_id).cloned())
+    }
+
+    async fn transition_if_pending(&self, auth_req_id: &str, status: CibaStatus) -> Result<bool, String> {
+        let mut map = self.map.lock().unwrap();
+        match map.get_mut(auth_req_id) {
+            Some(req) if req.status == CibaStatus::Pending => {
+                req.status = status;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn consume_if_approved(&self, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String> {
+        let mut map = self.map.lock().unwrap();
+        match map.get(auth_req_id) {
+            Some(req) if req.status == CibaStatus::Approved => Ok(map.remove(auth_req_id)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn delete(&self, auth_req_id: &str) -> Result<(), String> {
+        self.map.lock().unwrap().remove(auth_req_id);
+        Ok(())
+    }
+
+    async fn list_pending(&self, account: &str) -> Result<Vec<BackchannelAuthRequest>, String> {
+        Ok(self
+            .map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.account == account && r.status == CibaStatus::Pending && !r.expired())
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +308,29 @@ mod tests {
         assert_eq!(back.binding_message, "確認してください");
         assert_eq!(back.status, CibaStatus::Approved);
         assert_eq!(back.expires_at, 1_900_000_000);
+    }
+
+    #[tokio::test]
+    async fn memory_store_transition_is_first_wins() {
+        let s = MemoryCibaStore::default();
+        let id = s.create("rp", "u", "openid", "").await.unwrap();
+        // 先勝ち: 最初の Pending→Approved だけ成功し、後発は負ける。
+        assert!(s.transition_if_pending(id.as_str(), CibaStatus::Approved).await.unwrap());
+        assert!(!s.transition_if_pending(id.as_str(), CibaStatus::Denied).await.unwrap());
+        assert_eq!(s.get(id.as_str()).await.unwrap().unwrap().status, CibaStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn memory_store_consume_is_single_use() {
+        let s = MemoryCibaStore::default();
+        let id = s.create("rp", "u", "openid", "").await.unwrap();
+        // Approved でないと消費できない。
+        assert!(s.consume_if_approved(id.as_str()).await.unwrap().is_none());
+        s.transition_if_pending(id.as_str(), CibaStatus::Approved).await.unwrap();
+        // 単回消費: 1 回目だけ Some、2 回目は None（並行 poll の二重発行防止）。
+        assert!(s.consume_if_approved(id.as_str()).await.unwrap().is_some());
+        assert!(s.consume_if_approved(id.as_str()).await.unwrap().is_none());
+        assert!(s.get(id.as_str()).await.unwrap().is_none());
     }
 
     #[test]
