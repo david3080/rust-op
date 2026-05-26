@@ -38,3 +38,45 @@ pub fn all_supported_claims() -> Vec<&'static str> {
     out.extend_from_slice(PHONE);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_always_included_even_without_scopes() {
+        assert_eq!(claim_names_for_scopes(""), vec!["sub"]);
+        assert_eq!(claim_names_for_scopes("openid"), vec!["sub"]);
+    }
+
+    #[test]
+    fn unknown_scopes_ignored() {
+        assert_eq!(claim_names_for_scopes("openid bogus foobar"), vec!["sub"]);
+    }
+
+    #[test]
+    fn profile_email_release_their_claims() {
+        let p = claim_names_for_scopes("openid profile");
+        assert!(p.contains(&"sub") && p.contains(&"name") && p.contains(&"birthdate"));
+        assert!(!p.contains(&"email")); // email scope 無しでは出さない
+        let e = claim_names_for_scopes("openid email");
+        assert!(e.contains(&"email") && e.contains(&"email_verified"));
+        assert!(!e.contains(&"name"));
+    }
+
+    #[test]
+    fn all_scopes_union_is_superset_and_has_no_leak_beyond_supported() {
+        let all = claim_names_for_scopes("openid profile email address phone");
+        for c in [
+            "sub", "name", "email", "email_verified", "address", "phone_number",
+            "phone_number_verified",
+        ] {
+            assert!(all.contains(&c), "missing {c}");
+        }
+        // 解放集合は discovery の claims_supported に収まる（漏洩なし）。
+        let supported = all_supported_claims();
+        for c in &all {
+            assert!(supported.contains(c), "{c} not in claims_supported");
+        }
+    }
+}

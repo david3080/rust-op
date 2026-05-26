@@ -6,6 +6,12 @@ use crate::error::OAuthError;
 use crate::model::Client;
 use crate::provider::Provider;
 use async_trait::async_trait;
+use subtle::ConstantTimeEq;
+
+/// client_secret の定数時間比較（タイミング攻撃対策）。
+fn secret_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
 
 /// token endpoint から渡る認証材料。
 pub struct ClientAuthInput {
@@ -73,7 +79,7 @@ impl ClientAuthMethod for ClientSecretPost {
             .cloned()
             .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
         match &client.client_secret {
-            Some(s) if s == secret => Ok(client),
+            Some(s) if secret_eq(s, secret) => Ok(client),
             _ => Err(OAuthError::InvalidClient("bad client secret".into())),
         }
     }
@@ -97,7 +103,7 @@ impl ClientAuthMethod for ClientSecretBasic {
             .cloned()
             .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
         match &client.client_secret {
-            Some(s) if s == secret => Ok(client),
+            Some(s) if secret_eq(s, secret) => Ok(client),
             _ => Err(OAuthError::InvalidClient("bad client secret".into())),
         }
     }

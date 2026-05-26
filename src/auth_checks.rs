@@ -102,3 +102,117 @@ impl AuthorizationCheck for CheckPkce {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AuthParams, Client};
+
+    fn client(public: bool, require_pkce: bool) -> Client {
+        Client {
+            client_id: "c".into(),
+            redirect_uris: vec!["https://rp/cb".into()],
+            token_endpoint_auth_method: if public { "none".into() } else { "client_secret_basic".into() },
+            client_secret: if public { None } else { Some("s".into()) },
+            grant_types: vec!["authorization_code".into()],
+            post_logout_redirect_uris: vec![],
+            dpop_bound: false,
+            jwks: vec![],
+            require_par: false,
+            require_pkce,
+            id_token_signed_response_alg: None,
+        }
+    }
+
+    fn params() -> AuthParams {
+        AuthParams {
+            client_id: Some("c".into()),
+            redirect_uri: Some("https://rp/cb".into()),
+            response_type: Some("code".into()),
+            scope: Some("openid".into()),
+            state: None,
+            nonce: None,
+            prompt: None,
+            max_age: None,
+            acr_values: None,
+            response_mode: None,
+            code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
+            code_challenge_method: Some("S256".into()),
+            dpop_jkt: None,
+        }
+    }
+
+    /// client 解決済みの ctx を作る（redirect/pkce チェックの前提）。
+    fn ctx_with(p: AuthParams, c: Client) -> AuthContext {
+        let mut ctx = AuthContext::new(p);
+        ctx.client = Some(c);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn check_client_resolves_and_rejects_unknown() {
+        let p = Provider::new("https://op").with_client(client(true, false));
+        let mut ok = AuthContext::new(params());
+        assert!(CheckClient.check(&p, &mut ok).await.is_ok());
+        assert!(ok.client.is_some());
+
+        let mut bad = AuthContext::new(AuthParams { client_id: Some("zzz".into()), ..params() });
+        assert!(matches!(
+            CheckClient.check(&p, &mut bad).await,
+            Err(OAuthError::InvalidClient(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_redirect_uri_requires_exact_registered_match() {
+        let p = Provider::new("https://op");
+        let mut ok = ctx_with(params(), client(true, false));
+        assert!(CheckRedirectUri.check(&p, &mut ok).await.is_ok());
+        assert_eq!(ok.redirect_uri.as_deref(), Some("https://rp/cb"));
+
+        let mut bad = ctx_with(
+            AuthParams { redirect_uri: Some("https://evil/cb".into()), ..params() },
+            client(true, false),
+        );
+        assert!(CheckRedirectUri.check(&p, &mut bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_response_type_code_only() {
+        let p = Provider::new("https://op");
+        assert!(CheckResponseType.check(&p, &mut AuthContext::new(params())).await.is_ok());
+        let mut tok = AuthContext::new(AuthParams { response_type: Some("token".into()), ..params() });
+        assert!(matches!(
+            CheckResponseType.check(&p, &mut tok).await,
+            Err(OAuthError::UnsupportedResponseType(_))
+        ));
+        let mut none = AuthContext::new(AuthParams { response_type: None, ..params() });
+        assert!(CheckResponseType.check(&p, &mut none).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_scope_requires_openid() {
+        let p = Provider::new("https://op");
+        assert!(CheckScope.check(&p, &mut AuthContext::new(params())).await.is_ok());
+        let mut no = AuthContext::new(AuthParams { scope: Some("profile email".into()), ..params() });
+        assert!(matches!(
+            CheckScope.check(&p, &mut no).await,
+            Err(OAuthError::InvalidScope(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_pkce_rules() {
+        let p = Provider::new("https://op");
+        // public + S256 challenge → OK
+        assert!(CheckPkce.check(&p, &mut ctx_with(params(), client(true, false))).await.is_ok());
+        // public + challenge 無し → 必須エラー
+        let no_pkce = AuthParams { code_challenge: None, code_challenge_method: None, ..params() };
+        assert!(CheckPkce.check(&p, &mut ctx_with(no_pkce.clone(), client(true, false))).await.is_err());
+        // confidential + challenge 無し → OK（必須でない）
+        assert!(CheckPkce.check(&p, &mut ctx_with(no_pkce, client(false, false))).await.is_ok());
+        // challenge あり + plain method → S256 必須エラー
+        let plain = AuthParams { code_challenge_method: Some("plain".into()), ..params() };
+        assert!(CheckPkce.check(&p, &mut ctx_with(plain, client(false, false))).await.is_err());
+    }
+}
