@@ -8,6 +8,7 @@ pub(super) async fn discovery(State(p): State<Arc<Provider>>) -> Json<serde_json
         "issuer": i,
         "authorization_endpoint": format!("{i}/authorize"),
         "token_endpoint": format!("{i}/token"),
+        "introspection_endpoint": format!("{i}/introspect"),
         "userinfo_endpoint": format!("{i}/userinfo"),
         "jwks_uri": format!("{i}/jwks"),
         "response_types_supported": ["code"],
@@ -306,6 +307,64 @@ pub(super) async fn token(
         Err(e) => e.into_response(),
     }
 }
+
+/* ===== Token Introspection (RFC 7662) ===== */
+
+/// introspect は資格情報で認証できる confidential クライアント(RS)のみ許可する。
+/// public(none) は認証不可なのでトークン有効性オラクルを与えない。
+fn require_confidential(client: &crate::model::Client) -> Result<(), OAuthError> {
+    if client.is_public() {
+        return Err(OAuthError::InvalidClient(
+            "confidential client authentication required".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// 有効トークンの introspection 応答本体（active=true）。
+/// DPoP 束縛トークンは cnf.jkt を含め、RS が proof と照合できるようにする。
+fn introspection_active_body(at: &crate::model::AccessToken) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "active": true,
+        "scope": at.scope,
+        "client_id": at.client_id,
+        "sub": at.account_id,
+        "token_type": if at.jkt.is_some() { "DPoP" } else { "Bearer" },
+    });
+    if let Some(jkt) = &at.jkt {
+        body["cnf"] = serde_json::json!({ "jkt": jkt });
+    }
+    body
+}
+
+/// 分離した RS 向けのトークン検証窓口。同居エンドポイント(/profile, /userinfo)は
+/// 従来どおり store 直引きで検証するため、これは外部 RS だけが使う。
+/// 呼び出し元(RS)は confidential クライアント認証必須。無効トークンは active=false のみ返す。
+pub(super) async fn introspect(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    // RFC 7662 §2.1: 呼び出し元は認証必須。public(none) は不可（資格情報で認証できる RS のみ）。
+    let client = match authenticate_client(&p, &headers, &form).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(e) = require_confidential(&client) {
+        return e.into_response();
+    }
+    let token = match form.get("token") {
+        Some(t) => t,
+        None => return OAuthError::InvalidRequest("token required".into()).into_response(),
+    };
+    // RFC 7662 §2.2: 無効/未知/失効は active=false のみ（それ以外の情報は漏らさない）。
+    // access token のみ対象。期限切れ/未知は get_access_token が None を返す。
+    let body = match p.store.get_access_token(token).await {
+        Some(at) => introspection_active_body(&at),
+        None => serde_json::json!({ "active": false }),
+    };
+    ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
 /* ===== RP-Initiated Logout (OpenID Connect RP-Initiated Logout 1.0) ===== */
 
 #[derive(serde::Deserialize)]
@@ -521,4 +580,63 @@ pub(super) async fn userinfo_post(State(p): State<Arc<Provider>>, headers: Heade
         .ok()
         .and_then(|m| m.get("access_token").cloned());
     userinfo_respond(&p, &headers, "POST", body_token).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::AccessToken;
+
+    fn at(jkt: Option<&str>) -> AccessToken {
+        AccessToken {
+            token: "AT".into(),
+            client_id: "rp".into(),
+            account_id: "user@example.com".into(),
+            scope: "openid profile".into(),
+            jkt: jkt.map(str::to_string),
+        }
+    }
+
+    fn client(method: &str) -> crate::model::Client {
+        crate::model::Client {
+            client_id: "rs".into(),
+            redirect_uris: vec![],
+            token_endpoint_auth_method: method.into(),
+            client_secret: None,
+            grant_types: vec![],
+            post_logout_redirect_uris: vec![],
+            dpop_bound: false,
+            jwks: vec![],
+            require_par: false,
+            require_pkce: false,
+            id_token_signed_response_alg: None,
+        }
+    }
+
+    #[test]
+    fn introspect_requires_confidential_client() {
+        // public(none) は拒否、confidential は許可。
+        assert!(require_confidential(&client("none")).is_err());
+        assert!(require_confidential(&client("client_secret_basic")).is_ok());
+        assert!(require_confidential(&client("private_key_jwt")).is_ok());
+    }
+
+    #[test]
+    fn introspection_dpop_token_includes_cnf_jkt() {
+        let b = introspection_active_body(&at(Some("JKT123")));
+        assert_eq!(b["active"], true);
+        assert_eq!(b["token_type"], "DPoP");
+        assert_eq!(b["sub"], "user@example.com");
+        assert_eq!(b["scope"], "openid profile");
+        assert_eq!(b["client_id"], "rp");
+        assert_eq!(b["cnf"]["jkt"], "JKT123");
+    }
+
+    #[test]
+    fn introspection_bearer_token_has_no_cnf() {
+        let b = introspection_active_body(&at(None));
+        assert_eq!(b["active"], true);
+        assert_eq!(b["token_type"], "Bearer");
+        assert!(b.get("cnf").is_none());
+    }
 }

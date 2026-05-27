@@ -44,6 +44,7 @@ pub fn router(provider: Provider) -> Router {
         .route("/interaction/{uid}/passkey/options", post(login::login_passkey_options))
         .route("/interaction/{uid}/passkey/verify", post(login::login_passkey_verify))
         .route("/token", post(oidc::token))
+        .route("/introspect", post(oidc::introspect))
         .route("/end-session", get(oidc::end_session))
         .route("/par", post(oidc::par))
         .route("/userinfo", get(oidc::userinfo_get).post(oidc::userinfo_post))
