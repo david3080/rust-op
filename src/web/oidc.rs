@@ -9,6 +9,7 @@ pub(super) async fn discovery(State(p): State<Arc<Provider>>) -> Json<serde_json
         "authorization_endpoint": format!("{i}/authorize"),
         "token_endpoint": format!("{i}/token"),
         "introspection_endpoint": format!("{i}/introspect"),
+        "revocation_endpoint": format!("{i}/revoke"),
         "userinfo_endpoint": format!("{i}/userinfo"),
         "jwks_uri": format!("{i}/jwks"),
         "response_types_supported": ["code"],
@@ -364,6 +365,39 @@ pub(super) async fn introspect(
         None => serde_json::json!({ "active": false }),
     };
     ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+/* ===== Token Revocation (RFC 7009) ===== */
+
+/// クライアントが自分のトークンを失効する。token endpoint と同じクライアント認証。
+/// public クライアントも自分のトークンを失効できる（RFC 7009）。
+/// 所有者でない/未知トークンでも 200 を返す（情報を漏らさない）。
+pub(super) async fn revoke(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let client = match authenticate_client(&p, &headers, &form).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let token = match form.get("token") {
+        Some(t) => t,
+        None => return OAuthError::InvalidRequest("token required".into()).into_response(),
+    };
+    // token_type_hint は最適化のみ。access/refresh の両方を試す。
+    // 自分(client_id 一致)のトークンだけ失効する。
+    if let Some(at) = p.store.get_access_token(token).await {
+        if at.client_id == client.client_id {
+            p.store.revoke_access_token(token).await;
+        }
+    }
+    if let Some(rt) = p.store.get_refresh_token(token).await {
+        if rt.client_id == client.client_id {
+            p.store.revoke_refresh_token(token).await;
+        }
+    }
+    // RFC 7009 §2.2: 成功・無効トークンいずれも 200。
+    ([(header::CACHE_CONTROL, "no-store")], StatusCode::OK).into_response()
 }
 /* ===== RP-Initiated Logout (OpenID Connect RP-Initiated Logout 1.0) ===== */
 

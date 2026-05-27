@@ -25,10 +25,16 @@ pub trait Store: Send + Sync {
 
     async fn save_access_token(&self, t: AccessToken);
     async fn get_access_token(&self, token: &str) -> Option<AccessToken>;
+    /// アクセストークンを失効（削除）する（RFC 7009）。未知でも no-op。
+    async fn revoke_access_token(&self, token: &str);
 
     async fn save_refresh_token(&self, t: RefreshToken);
     /// リフレッシュトークンは使用時にローテーション（取得と同時に削除）。
     async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken>;
+    /// 消費せず参照する（失効時の所有者確認用）。
+    async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken>;
+    /// リフレッシュトークンを失効（削除）する（RFC 7009）。未知でも no-op。
+    async fn revoke_refresh_token(&self, token: &str);
 
     /// sub からアカウントを解決。未登録なら自動生成する（PoC 用）。
     async fn find_account(&self, sub: &str) -> Account;
@@ -109,11 +115,20 @@ impl Store for MemoryStore {
     async fn get_access_token(&self, token: &str) -> Option<AccessToken> {
         self.access_tokens.lock().unwrap().get(token).cloned()
     }
+    async fn revoke_access_token(&self, token: &str) {
+        self.access_tokens.lock().unwrap().remove(token);
+    }
     async fn save_refresh_token(&self, t: RefreshToken) {
         self.refresh_tokens.lock().unwrap().insert(t.token.clone(), t);
     }
     async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken> {
         self.refresh_tokens.lock().unwrap().remove(token)
+    }
+    async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken> {
+        self.refresh_tokens.lock().unwrap().get(token).cloned()
+    }
+    async fn revoke_refresh_token(&self, token: &str) {
+        self.refresh_tokens.lock().unwrap().remove(token);
     }
     async fn find_account(&self, sub: &str) -> Account {
         account_for(sub)
@@ -214,5 +229,28 @@ mod tests {
     async fn unknown_code_returns_none() {
         let s = MemoryStore::default();
         assert!(s.take_code("nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_access_token_removes_it() {
+        let s = MemoryStore::default();
+        s.save_access_token(at("AT1")).await;
+        assert!(s.get_access_token("AT1").await.is_some());
+        s.revoke_access_token("AT1").await;
+        assert!(s.get_access_token("AT1").await.is_none());
+        // 未知トークンの失効は no-op（パニックしない）。
+        s.revoke_access_token("nope").await;
+    }
+
+    #[tokio::test]
+    async fn get_refresh_token_peeks_without_consuming() {
+        let s = MemoryStore::default();
+        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into() }).await;
+        // peek は消費しない。
+        assert!(s.get_refresh_token("RT1").await.is_some());
+        assert!(s.get_refresh_token("RT1").await.is_some());
+        // revoke で消える。
+        s.revoke_refresh_token("RT1").await;
+        assert!(s.get_refresh_token("RT1").await.is_none());
     }
 }

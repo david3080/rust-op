@@ -192,6 +192,10 @@ impl Store for FirestoreStore {
         })
     }
 
+    async fn revoke_access_token(&self, token: &str) {
+        let _ = self.fs.delete_doc("accessTokens", token).await;
+    }
+
     async fn save_refresh_token(&self, t: RefreshToken) {
         let f = json!({
             "clientId": fs_h::s(&t.client_id),
@@ -214,6 +218,23 @@ impl Store for FirestoreStore {
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
         })
+    }
+
+    async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken> {
+        let f = self.fs.get_doc("refreshTokens", token).await.ok()??;
+        if doc_expired(&f) {
+            return None;
+        }
+        Some(RefreshToken {
+            token: token.to_string(),
+            client_id: fs_h::field_str(&f, "clientId").unwrap_or("").to_string(),
+            account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
+            scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
+        })
+    }
+
+    async fn revoke_refresh_token(&self, token: &str) {
+        let _ = self.fs.delete_doc("refreshTokens", token).await;
     }
 
     async fn find_account(&self, sub: &str) -> Account {
