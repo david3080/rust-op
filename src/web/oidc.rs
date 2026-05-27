@@ -353,6 +353,13 @@ fn introspection_active_body(at: &crate::model::AccessToken) -> serde_json::Valu
     if let Some(aud) = &at.aud {
         body["aud"] = serde_json::json!(aud);
     }
+    // Step-up Authentication Challenge (RFC 9470): RS が acr/auth_time で十分性を判断する。
+    if let Some(acr) = &at.acr {
+        body["acr"] = serde_json::json!(acr);
+    }
+    if let Some(t) = at.auth_time {
+        body["auth_time"] = serde_json::json!(t);
+    }
     body
 }
 
@@ -647,6 +654,8 @@ mod tests {
             scope: "openid profile".into(),
             jkt: jkt.map(str::to_string),
             aud: None,
+            acr: None,
+            auth_time: None,
         }
     }
 
@@ -699,6 +708,16 @@ mod tests {
         a.aud = Some("https://api.example.com".into());
         let b = introspection_active_body(&a);
         assert_eq!(b["aud"], "https://api.example.com");
+    }
+
+    #[test]
+    fn introspection_exposes_acr_and_auth_time_for_step_up() {
+        let mut a = at(None);
+        a.acr = Some("urn:acr:bronze".into());
+        a.auth_time = Some(1_700_000_000);
+        let b = introspection_active_body(&a);
+        assert_eq!(b["acr"], "urn:acr:bronze");
+        assert_eq!(b["auth_time"], 1_700_000_000u64);
     }
 
     #[test]

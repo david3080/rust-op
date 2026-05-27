@@ -58,6 +58,8 @@ async fn issue_access_and_id(
             scope: scope.to_string(),
             jkt: dpop_jkt,
             aud: resource.map(str::to_string),
+            acr: acr.map(str::to_string),
+            auth_time,
         })
         .await;
 
@@ -97,6 +99,8 @@ async fn maybe_issue_refresh(
     account_id: &str,
     scope: &str,
     resource: Option<&str>,
+    acr: Option<&str>,
+    auth_time: Option<u64>,
 ) -> Option<String> {
     if !has_scope(scope, "offline_access") {
         return None;
@@ -109,6 +113,8 @@ async fn maybe_issue_refresh(
             account_id: account_id.to_string(),
             scope: scope.to_string(),
             resource: resource.map(str::to_string),
+            acr: acr.map(str::to_string),
+            auth_time,
         })
         .await;
     Some(token)
@@ -196,6 +202,8 @@ impl GrantHandler for AuthorizationCodeGrant {
             &code.account_id,
             &code.scope,
             code.resource.as_deref(),
+            code.acr.as_deref(),
+            Some(code.auth_time),
         )
         .await;
         // 再利用時に失効させるため、発行トークンをコードに紐付ける。
@@ -257,12 +265,13 @@ impl GrantHandler for RefreshTokenGrant {
         };
 
         let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
+        // 認証コンテキスト(acr/auth_time)は再認証しないので元のリフレッシュトークンから引き継ぐ。
         let (access_token, id_token) =
-            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref(), rt.resource.as_deref())
+            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, rt.auth_time, rt.acr.as_deref(), dpop_jkt, client.id_token_signed_response_alg.as_deref(), rt.resource.as_deref())
                 .await;
-        // ローテーションした新しい refresh token を再発行。aud(resource)は引き継ぐ。
+        // ローテーションした新しい refresh token を再発行。aud(resource)/acr/auth_time を引き継ぐ。
         let refresh_token =
-            maybe_issue_refresh(p, &client.client_id, &rt.account_id, &scope, rt.resource.as_deref()).await;
+            maybe_issue_refresh(p, &client.client_id, &rt.account_id, &scope, rt.resource.as_deref(), rt.acr.as_deref(), rt.auth_time).await;
 
         Ok(TokenResponse {
             access_token,
@@ -397,6 +406,8 @@ mod tests {
             account_id: "user@example.com".into(),
             scope: scope.into(),
             resource: None,
+            acr: None,
+            auth_time: None,
         }
     }
 

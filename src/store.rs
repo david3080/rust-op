@@ -205,7 +205,7 @@ mod tests {
     }
 
     fn at(t: &str) -> AccessToken {
-        AccessToken { token: t.into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), jkt: None, aud: None }
+        AccessToken { token: t.into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), jkt: None, aud: None, acr: None, auth_time: None }
     }
 
     #[tokio::test]
@@ -213,7 +213,7 @@ mod tests {
         let s = MemoryStore::default();
         s.save_code(code("C1")).await;
         s.save_access_token(at("AT1")).await;
-        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None }).await;
+        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, acr: None, auth_time: None }).await;
         s.link_issued_tokens("C1", "AT1", Some("RT1")).await;
 
         // 初回消費は成功し、発行トークンは生きている。
@@ -246,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn get_refresh_token_peeks_without_consuming() {
         let s = MemoryStore::default();
-        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None }).await;
+        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, acr: None, auth_time: None }).await;
         // peek は消費しない。
         assert!(s.get_refresh_token("RT1").await.is_some());
         assert!(s.get_refresh_token("RT1").await.is_some());

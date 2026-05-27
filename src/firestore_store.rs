@@ -182,6 +182,12 @@ impl Store for FirestoreStore {
         if let Some(aud) = &t.aud {
             f["aud"] = fs_h::s(aud);
         }
+        if let Some(acr) = &t.acr {
+            f["acr"] = fs_h::s(acr);
+        }
+        if let Some(at) = t.auth_time {
+            f["authTime"] = fs_h::int(at);
+        }
         let _ = self.fs.set_doc("accessTokens", &t.token, f).await;
     }
 
@@ -197,6 +203,8 @@ impl Store for FirestoreStore {
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
             jkt: fs_h::field_str(&f, "jkt").map(str::to_string),
             aud: fs_h::field_str(&f, "aud").map(str::to_string),
+            acr: fs_h::field_str(&f, "acr").map(str::to_string),
+            auth_time: fs_h::field_u64(&f, "authTime"),
         })
     }
 
@@ -214,6 +222,12 @@ impl Store for FirestoreStore {
         if let Some(r) = &t.resource {
             f["resource"] = fs_h::s(r);
         }
+        if let Some(acr) = &t.acr {
+            f["acr"] = fs_h::s(acr);
+        }
+        if let Some(at) = t.auth_time {
+            f["authTime"] = fs_h::int(at);
+        }
         let _ = self.fs.set_doc("refreshTokens", &t.token, f).await;
     }
 
@@ -229,6 +243,8 @@ impl Store for FirestoreStore {
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
             resource: fs_h::field_str(&f, "resource").map(str::to_string),
+            acr: fs_h::field_str(&f, "acr").map(str::to_string),
+            auth_time: fs_h::field_u64(&f, "authTime"),
         })
     }
 
@@ -243,6 +259,8 @@ impl Store for FirestoreStore {
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
             resource: fs_h::field_str(&f, "resource").map(str::to_string),
+            acr: fs_h::field_str(&f, "acr").map(str::to_string),
+            auth_time: fs_h::field_u64(&f, "authTime"),
         })
     }
 

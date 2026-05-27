@@ -21,6 +21,7 @@ mod registration;
 mod request_object;
 mod response_mode;
 mod sig;
+mod step_up;
 mod store;
 mod web;
 mod webauthn;

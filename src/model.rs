@@ -118,6 +118,9 @@ pub struct AccessToken {
     pub jkt: Option<String>,
     /// Resource Indicators (RFC 8707): トークンの aud（対象リソース）。
     pub aud: Option<String>,
+    /// 認証コンテキスト（Step-up Authentication Challenge / RFC 9470 で RS が評価）。
+    pub acr: Option<String>,
+    pub auth_time: Option<u64>,
 }
 
 /// リフレッシュトークン。使用時にローテーション（消費して新規発行）する。
@@ -129,6 +132,9 @@ pub struct RefreshToken {
     pub scope: String,
     /// Resource Indicators (RFC 8707): リフレッシュ後のトークンに引き継ぐ aud。
     pub resource: Option<String>,
+    /// 認証コンテキスト。リフレッシュは再認証しないので元の値を引き継ぐ（auth_time は不変）。
+    pub acr: Option<String>,
+    pub auth_time: Option<u64>,
 }
 
 /// ユーザーアカウント。claims は OIDC の claim マップ。
