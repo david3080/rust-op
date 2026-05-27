@@ -139,6 +139,7 @@ mod tests {
             code_challenge: Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into()),
             code_challenge_method: Some("S256".into()),
             dpop_jkt: None,
+            resource: None,
         }
     }
 

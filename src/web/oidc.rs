@@ -195,10 +195,24 @@ async fn run_checks(p: &Provider, ctx: &mut AuthContext) -> Result<(), OAuthErro
     Ok(())
 }
 
+/// Resource Indicators (RFC 8707): resource は fragment 無しの絶対 URI。
+fn valid_resource(r: &str) -> bool {
+    !r.contains('#') && r.split_once("://").is_some_and(|(s, rest)| !s.is_empty() && !rest.is_empty())
+}
+
 /// 検証通過後、認可コードを発行して redirect_uri に返す。
 async fn issue_code(p: &Provider, ctx: &AuthContext) -> Response {
     let redirect_uri = ctx.redirect_uri.clone().expect("redirect validated");
     let account_id = ctx.account_id.clone().expect("account present");
+    if let Some(r) = &ctx.params.resource {
+        if !valid_resource(r) {
+            return authorize_error(
+                p,
+                ctx,
+                OAuthError::InvalidTarget("resource must be an absolute URI without fragment".into()),
+            );
+        }
+    }
     let code = uuid::Uuid::new_v4().simple().to_string();
     p.store
         .save_code(AuthorizationCode {
@@ -219,6 +233,7 @@ async fn issue_code(p: &Provider, ctx: &AuthContext) -> Response {
                 .and_then(|s| s.split_whitespace().next())
                 .map(|s| s.to_string()),
             dpop_jkt: ctx.params.dpop_jkt.clone(),
+            resource: ctx.params.resource.clone(),
             expires_at: now() + 60,
         })
         .await;
@@ -334,6 +349,9 @@ fn introspection_active_body(at: &crate::model::AccessToken) -> serde_json::Valu
     });
     if let Some(jkt) = &at.jkt {
         body["cnf"] = serde_json::json!({ "jkt": jkt });
+    }
+    if let Some(aud) = &at.aud {
+        body["aud"] = serde_json::json!(aud);
     }
     body
 }
@@ -628,6 +646,7 @@ mod tests {
             account_id: "user@example.com".into(),
             scope: "openid profile".into(),
             jkt: jkt.map(str::to_string),
+            aud: None,
         }
     }
 
@@ -672,5 +691,22 @@ mod tests {
         assert_eq!(b["active"], true);
         assert_eq!(b["token_type"], "Bearer");
         assert!(b.get("cnf").is_none());
+    }
+
+    #[test]
+    fn introspection_includes_aud_when_resource_bound() {
+        let mut a = at(None);
+        a.aud = Some("https://api.example.com".into());
+        let b = introspection_active_body(&a);
+        assert_eq!(b["aud"], "https://api.example.com");
+    }
+
+    #[test]
+    fn valid_resource_requires_absolute_uri_without_fragment() {
+        assert!(valid_resource("https://api.example.com"));
+        assert!(valid_resource("https://api.example.com/v1"));
+        assert!(!valid_resource("api.example.com")); // scheme なし
+        assert!(!valid_resource("https://api.example.com/#x")); // fragment 不可
+        assert!(!valid_resource("://x")); // scheme 空
     }
 }

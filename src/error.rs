@@ -21,6 +21,8 @@ pub enum OAuthError {
     UnsupportedResponseType(String),
     #[error("invalid_scope: {0}")]
     InvalidScope(String),
+    #[error("invalid_target: {0}")]
+    InvalidTarget(String),
     #[error("access_denied: {0}")]
     AccessDenied(String),
     #[error("login_required: {0}")]
@@ -47,6 +49,7 @@ impl OAuthError {
             OAuthError::UnsupportedGrantType(_) => "unsupported_grant_type",
             OAuthError::UnsupportedResponseType(_) => "unsupported_response_type",
             OAuthError::InvalidScope(_) => "invalid_scope",
+            OAuthError::InvalidTarget(_) => "invalid_target",
             OAuthError::AccessDenied(_) => "access_denied",
             OAuthError::LoginRequired(_) => "login_required",
             OAuthError::RequestUriNotSupported(_) => "request_uri_not_supported",
@@ -66,6 +69,7 @@ impl OAuthError {
             | OAuthError::UnsupportedGrantType(s)
             | OAuthError::UnsupportedResponseType(s)
             | OAuthError::InvalidScope(s)
+            | OAuthError::InvalidTarget(s)
             | OAuthError::AccessDenied(s)
             | OAuthError::LoginRequired(s)
             | OAuthError::RequestUriNotSupported(s)

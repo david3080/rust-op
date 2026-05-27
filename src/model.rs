@@ -60,6 +60,8 @@ pub struct AuthParams {
     pub code_challenge_method: Option<String>,
     /// DPoP key binding (RFC 9449 §10): 認可コード/トークンを特定 jkt に束縛する要求。
     pub dpop_jkt: Option<String>,
+    /// Resource Indicators (RFC 8707): トークンの対象リソース(API)。aud に束縛する。
+    pub resource: Option<String>,
 }
 
 /// ログイン待ちの認可リクエスト。node-oidc-provider の Interaction 相当。
@@ -99,6 +101,8 @@ pub struct AuthorizationCode {
     pub acr: Option<String>,
     /// DPoP key binding: PAR/authorize で dpop_jkt 指定時、token の proof jkt と一致必須。
     pub dpop_jkt: Option<String>,
+    /// Resource Indicators (RFC 8707): 発行されるトークンの aud に束縛するリソース。
+    pub resource: Option<String>,
     /// FAPI: 認可コードは短命。epoch 秒。
     pub expires_at: u64,
 }
@@ -112,6 +116,8 @@ pub struct AccessToken {
     pub scope: String,
     /// DPoP 束縛時の JWK Thumbprint（cnf.jkt）。
     pub jkt: Option<String>,
+    /// Resource Indicators (RFC 8707): トークンの aud（対象リソース）。
+    pub aud: Option<String>,
 }
 
 /// リフレッシュトークン。使用時にローテーション（消費して新規発行）する。
@@ -121,6 +127,8 @@ pub struct RefreshToken {
     pub client_id: String,
     pub account_id: String,
     pub scope: String,
+    /// Resource Indicators (RFC 8707): リフレッシュ後のトークンに引き継ぐ aud。
+    pub resource: Option<String>,
 }
 
 /// ユーザーアカウント。claims は OIDC の claim マップ。

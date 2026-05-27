@@ -47,6 +47,7 @@ async fn issue_access_and_id(
     acr: Option<&str>,
     dpop_jkt: Option<String>,
     id_token_alg: Option<&str>,
+    resource: Option<&str>,
 ) -> (String, String) {
     let access_token = opaque();
     p.store
@@ -56,6 +57,7 @@ async fn issue_access_and_id(
             account_id: account_id.to_string(),
             scope: scope.to_string(),
             jkt: dpop_jkt,
+            aud: resource.map(str::to_string),
         })
         .await;
 
@@ -94,6 +96,7 @@ async fn maybe_issue_refresh(
     client_id: &str,
     account_id: &str,
     scope: &str,
+    resource: Option<&str>,
 ) -> Option<String> {
     if !has_scope(scope, "offline_access") {
         return None;
@@ -105,6 +108,7 @@ async fn maybe_issue_refresh(
             client_id: client_id.to_string(),
             account_id: account_id.to_string(),
             scope: scope.to_string(),
+            resource: resource.map(str::to_string),
         })
         .await;
     Some(token)
@@ -183,10 +187,17 @@ impl GrantHandler for AuthorizationCodeGrant {
             code.acr.as_deref(),
             dpop_jkt,
             client.id_token_signed_response_alg.as_deref(),
+            code.resource.as_deref(),
         )
         .await;
-        let refresh_token =
-            maybe_issue_refresh(p, &client.client_id, &code.account_id, &code.scope).await;
+        let refresh_token = maybe_issue_refresh(
+            p,
+            &client.client_id,
+            &code.account_id,
+            &code.scope,
+            code.resource.as_deref(),
+        )
+        .await;
         // 再利用時に失効させるため、発行トークンをコードに紐付ける。
         p.store
             .link_issued_tokens(code_val, &access_token, refresh_token.as_deref())
@@ -247,11 +258,11 @@ impl GrantHandler for RefreshTokenGrant {
 
         let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
         let (access_token, id_token) =
-            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref())
+            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref(), rt.resource.as_deref())
                 .await;
-        // ローテーションした新しい refresh token を再発行。
+        // ローテーションした新しい refresh token を再発行。aud(resource)は引き継ぐ。
         let refresh_token =
-            maybe_issue_refresh(p, &client.client_id, &rt.account_id, &scope).await;
+            maybe_issue_refresh(p, &client.client_id, &rt.account_id, &scope, rt.resource.as_deref()).await;
 
         Ok(TokenResponse {
             access_token,
@@ -318,7 +329,7 @@ impl GrantHandler for CibaGrant {
                     .ok_or_else(|| OAuthError::InvalidGrant("auth_req_id already used".into()))?;
                 let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
                 let (access_token, id_token) =
-                    issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref())
+                    issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref(), None)
                         .await;
                 Ok(TokenResponse {
                     access_token,
@@ -374,6 +385,7 @@ mod tests {
             auth_time: 0,
             acr: None,
             dpop_jkt: None,
+            resource: None,
             expires_at: u64::MAX,
         }
     }
@@ -384,6 +396,7 @@ mod tests {
             client_id: client_id.into(),
             account_id: "user@example.com".into(),
             scope: scope.into(),
+            resource: None,
         }
     }
 

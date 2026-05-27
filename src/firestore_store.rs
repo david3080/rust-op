@@ -118,6 +118,9 @@ impl Store for FirestoreStore {
         if let Some(v) = &c.dpop_jkt {
             f["dpopJkt"] = fs_h::s(v);
         }
+        if let Some(v) = &c.resource {
+            f["resource"] = fs_h::s(v);
+        }
         let _ = self.fs.set_doc("authCodes", &c.code, f).await;
     }
 
@@ -153,6 +156,7 @@ impl Store for FirestoreStore {
             auth_time: fs_h::field_u64(&f, "authTime").unwrap_or(0),
             acr: fs_h::field_str(&f, "acr").map(str::to_string),
             dpop_jkt: fs_h::field_str(&f, "dpopJkt").map(str::to_string),
+            resource: fs_h::field_str(&f, "resource").map(str::to_string),
             expires_at: fs_h::field_ts_secs(&f, "expiresAt").unwrap_or(0),
         })
     }
@@ -175,6 +179,9 @@ impl Store for FirestoreStore {
         if let Some(jkt) = &t.jkt {
             f["jkt"] = fs_h::s(jkt);
         }
+        if let Some(aud) = &t.aud {
+            f["aud"] = fs_h::s(aud);
+        }
         let _ = self.fs.set_doc("accessTokens", &t.token, f).await;
     }
 
@@ -189,6 +196,7 @@ impl Store for FirestoreStore {
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
             jkt: fs_h::field_str(&f, "jkt").map(str::to_string),
+            aud: fs_h::field_str(&f, "aud").map(str::to_string),
         })
     }
 
@@ -197,12 +205,15 @@ impl Store for FirestoreStore {
     }
 
     async fn save_refresh_token(&self, t: RefreshToken) {
-        let f = json!({
+        let mut f = json!({
             "clientId": fs_h::s(&t.client_id),
             "accountId": fs_h::s(&t.account_id),
             "scope": fs_h::s(&t.scope),
             "expiresAt": fs_h::ts(&fs_h::rfc3339(now() + REFRESH_TTL)),
         });
+        if let Some(r) = &t.resource {
+            f["resource"] = fs_h::s(r);
+        }
         let _ = self.fs.set_doc("refreshTokens", &t.token, f).await;
     }
 
@@ -217,6 +228,7 @@ impl Store for FirestoreStore {
             client_id: fs_h::field_str(&f, "clientId").unwrap_or("").to_string(),
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
+            resource: fs_h::field_str(&f, "resource").map(str::to_string),
         })
     }
 
@@ -230,6 +242,7 @@ impl Store for FirestoreStore {
             client_id: fs_h::field_str(&f, "clientId").unwrap_or("").to_string(),
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
+            resource: fs_h::field_str(&f, "resource").map(str::to_string),
         })
     }
 
