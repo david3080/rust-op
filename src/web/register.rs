@@ -277,7 +277,10 @@ pub(super) async fn register_passkey_options(
             "displayName": email,
         },
         "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }],
-        "authenticatorSelection": { "residentKey": "preferred", "userVerification": "preferred" },
+        // requireResidentKey は WebAuthn 仕様では非推奨（residentKey に置換）だが、
+        // Dart の passkeys パッケージ(AuthenticatorSelectionType)が非 null bool として
+        // 要求するため明示する。"preferred" なので必須ではない＝false。
+        "authenticatorSelection": { "requireResidentKey": false, "residentKey": "preferred", "userVerification": "preferred" },
         "attestation": "none",
         "timeout": 60000,
         "excludeCredentials": exclude,
