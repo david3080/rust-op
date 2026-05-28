@@ -142,19 +142,47 @@ fn passkey_register_page(p: &Provider, token: &str) -> Html<String> {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
+    // UA 判別: モバイル(iOS/Android)はアプリ起動を一次手段に、デスクトップは Web のみ。
+    // 自動で navigator.credentials.create を発火させない（ユーザーの明示クリックを要求）。
     let body = r##"<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>passkey 登録</title>
-<style>body{font-family:-apple-system,sans-serif;max-width:360px;margin:48px auto;padding:0 16px}
-button{width:100%;padding:12px;font-size:16px;background:#3367d6;color:#fff;border:0;border-radius:6px}
-#msg{font-size:14px}.applink{display:block;margin-top:20px;font-size:13px;text-align:center}</style></head><body>
+<style>body{font-family:-apple-system,sans-serif;max-width:380px;margin:40px auto;padding:0 16px;color:#222}
+h1{font-size:20px;margin:0 0 8px}p{font-size:14px;line-height:1.6}
+button,.btn{display:block;width:100%;padding:13px;margin-top:12px;font-size:16px;border:0;border-radius:8px;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box}
+.primary{background:#3367d6;color:#fff}.secondary{background:#f1f3f4;color:#3367d6}
+.small{font-size:12px;color:#5f6368;margin-top:8px}
+#msg{font-size:14px;margin-top:14px;min-height:1.4em}#fallback{margin-top:16px}</style></head><body>
 <h1>passkey を作成</h1>
-<p>このデバイスの生体認証等で passkey を作成し、登録を完了します。</p>
-<button onclick="reg()">passkey を作成して登録</button>
+<div id="mobile" hidden>
+ <p>fido2demo アプリで安全に登録します。</p>
+ <button class="primary" onclick="openApp()">アプリで開く</button>
+ <p class="small">インストール済みなら自動で開きます。開かない場合は下のボタンから Web で続行できます。</p>
+ <div id="fallback" hidden>
+  <button class="secondary" onclick="reg()">Web で登録を続ける</button>
+  <p class="small">同期 passkey（iCloud Keychain 等）として作成されます。</p>
+ </div>
+</div>
+<div id="desktop" hidden>
+ <p>このデバイスの生体認証等で passkey を作成し、登録を完了します。</p>
+ <button class="primary" onclick="reg()">passkey を作成して登録</button>
+</div>
 <p id="msg"></p>
-<a class="applink" href="jp.co.sonrisa.fido2demo://r?t=__TOKEN__">iPhone アプリで続ける</a>
 <script>
 __WEBAUTHN_JS__
 const TOKEN="__TOKEN__",OPT="__OPT__",VER="__VER__",LOGIN="__LOGIN__";
+const ua=navigator.userAgent;
+const isAndroid=/Android/i.test(ua);
+const isIOS=/iPad|iPhone|iPod/i.test(ua)||(/(Macintosh).*Mobile/i.test(ua));
+document.getElementById((isAndroid||isIOS)?'mobile':'desktop').hidden=false;
+function openApp(){
+ // iOS=カスタムスキーム / Android=intent URL（fallback付き）。アプリ未起動なら1.5秒後にWebボタン提示。
+ const url=isAndroid
+  ?('intent://magic?t='+TOKEN+'#Intent;scheme=jp.co.sonrisa.fido2demo;package=jp.co.sonrisa.fido2demo;S.browser_fallback_url='+encodeURIComponent('https://oidc.sonrisa.co.jp/r?t='+TOKEN)+';end')
+  :('jp.co.sonrisa.fido2demo://magic?t='+TOKEN);
+ const timer=setTimeout(()=>{document.getElementById('fallback').hidden=false;},1500);
+ document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(timer);},{once:true});
+ location.href=url;
+}
 async function reg(){
  const msg=document.getElementById('msg');msg.textContent='処理中…';
  try{
