@@ -15,11 +15,18 @@ pub(super) async fn ciba_pending_list(State(p): State<Arc<Provider>>, headers: H
     let items: Vec<serde_json::Value> = pending
         .iter()
         .map(|r| {
+            // authorization_details は JSON 配列文字列を保持しているので、解析して構造のまま返す。
+            // 解析失敗（または無し）なら null にしておき、fido2demo は binding_message に fallback する。
+            let ad: Option<serde_json::Value> = r
+                .authorization_details
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
             serde_json::json!({
                 "auth_req_id": r.auth_req_id.as_str(),
                 "client_id": r.client_id,
                 "scope": r.scope,
                 "binding_message": r.binding_message,
+                "authorization_details": ad,
             })
         })
         .collect();
@@ -111,6 +118,51 @@ pub(super) async fn backchannel_auth(
         return OAuthError::InvalidScope("openid scope required".into()).into_response();
     }
     let binding = form.get("binding_message").cloned().unwrap_or_default();
+    // RFC 9396 authorization_details: 任意。JSON 配列で各要素に type 必須。
+    // 4KB / 5 entry の cap を入れて DoS と乱用を抑える。中身の意味は OP は判定せず
+    // 受け取って access token に紐付ける（gateway 側の MandatePolicy で照合する）。
+    let authorization_details = match form.get("authorization_details") {
+        Some(raw) => {
+            if raw.len() > 4096 {
+                return OAuthError::InvalidRequest("authorization_details too large".into())
+                    .into_response();
+            }
+            let v: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(_) => {
+                    return OAuthError::InvalidRequest(
+                        "authorization_details must be JSON".into(),
+                    )
+                    .into_response();
+                }
+            };
+            let arr = match v.as_array() {
+                Some(a) => a,
+                None => {
+                    return OAuthError::InvalidRequest(
+                        "authorization_details must be a JSON array".into(),
+                    )
+                    .into_response();
+                }
+            };
+            if arr.is_empty() || arr.len() > 5 {
+                return OAuthError::InvalidRequest(
+                    "authorization_details must have 1..=5 entries".into(),
+                )
+                .into_response();
+            }
+            for e in arr {
+                if !e.get("type").and_then(|t| t.as_str()).is_some() {
+                    return OAuthError::InvalidRequest(
+                        "authorization_details entry requires 'type'".into(),
+                    )
+                    .into_response();
+                }
+            }
+            Some(raw.clone())
+        }
+        None => None,
+    };
     // login_hint は passkey 登録済みアカウントであること（未登録は即拒否）。
     match crate::registration::get_credential(fs, &login_hint).await {
         Ok(Some(_)) => {}
@@ -120,11 +172,44 @@ pub(super) async fn backchannel_auth(
             return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
         }
     }
-    match p.ciba.create(&client.client_id, &login_hint, &scope, &binding).await {
+    // dedup: 同 (client_id, account) に未解決の pending があれば、新規発行も push もせず
+    // 既存の auth_req_id を返す（冪等）。連発時の端末スパム抑止。
+    match p.ciba.find_pending_for(&client.client_id, &login_hint).await {
+        Ok(Some(existing)) => {
+            let remaining = existing.expires_at.saturating_sub(now_secs());
+            return (
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({
+                    "auth_req_id": existing.auth_req_id.0,
+                    "expires_in": remaining,
+                    "interval": 2,
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("ciba find_pending_for: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
+    }
+    // レート制限: dedup を抜けた要求の連発（例: 拒否直後の再試行）を抑止。
+    if !p.ciba_rate.check_and_record(&client.client_id, &login_hint) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::CACHE_CONTROL, "no-store"), (header::RETRY_AFTER, "60")],
+            Json(serde_json::json!({
+                "error": "slow_down",
+                "error_description": "rate limit exceeded for this client/user",
+            })),
+        )
+            .into_response();
+    }
+    match p.ciba.create(&client.client_id, &login_hint, &scope, &binding, authorization_details.as_deref()).await {
         Ok(id) => {
             // FCM で iPhone に承認要求を通知（Cloud Run suspend を避けるため await）。
             // token 未登録/送信失敗でも Web 承認は可能なのでベストエフォート。
-            let _ = crate::fcm::send_ciba_request(fs, &login_hint, &client.client_id, &scope, &binding, id.as_str()).await;
+            let _ = crate::fcm::send_ciba_request(fs, &login_hint, &client.client_id, &scope, &binding, id.as_str(), authorization_details.as_deref()).await;
             (
                 [(header::CACHE_CONTROL, "no-store")],
                 Json(serde_json::json!({ "auth_req_id": id.0, "expires_in": 300, "interval": 2 })),
@@ -136,6 +221,13 @@ pub(super) async fn backchannel_auth(
             (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
         }
     }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 承認 UI: ログイン済セッションが自分宛の pending 要求を承認/拒否する。
@@ -353,9 +445,9 @@ pub(super) async fn ciba_demo_start(State(p): State<Arc<Provider>>, Json(req): J
         }
     }
     let binding = "Web CIBA デモのログインを承認してください";
-    match p.ciba.create("ciba-rp", &login_hint, "openid", binding).await {
+    match p.ciba.create("ciba-rp", &login_hint, "openid", binding, None).await {
         Ok(id) => {
-            let _ = crate::fcm::send_ciba_request(fs, &login_hint, "ciba-rp", "openid", binding, id.as_str()).await;
+            let _ = crate::fcm::send_ciba_request(fs, &login_hint, "ciba-rp", "openid", binding, id.as_str(), None).await;
             Json(serde_json::json!({ "auth_req_id": id.0 })).into_response()
         }
         Err(e) => {

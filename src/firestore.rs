@@ -31,6 +31,11 @@ pub fn field_u64(fields: &Value, name: &str) -> Option<u64> {
     fields.get(name)?.get("integerValue")?.as_str()?.parse().ok()
 }
 
+/// fields から bool。未存在は None（呼び出し側が unwrap_or(false) する）。
+pub fn field_bool(fields: &Value, name: &str) -> Option<bool> {
+    fields.get(name)?.get("booleanValue")?.as_bool()
+}
+
 /// fields から timestampValue を epoch 秒で。
 pub fn field_ts_secs(fields: &Value, name: &str) -> Option<u64> {
     Some(parse_rfc3339_secs(

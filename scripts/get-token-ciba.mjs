@@ -30,13 +30,19 @@ async function main() {
   err(`[CIBA] scope="${scope}"`);
 
   // 1) backchannel-authentication（client_secret_basic）
+  const params = { login_hint: loginHint, scope, binding_message: binding };
+  // RFC 9396: AUTH_DETAILS 環境変数（JSON 配列文字列）があれば mandate として送る
+  if (process.env.AUTH_DETAILS) {
+    params.authorization_details = process.env.AUTH_DETAILS;
+    err(`[CIBA] authorization_details=${process.env.AUTH_DETAILS}`);
+  }
   let r = await fetch(`${OP}/backchannel-authentication`, {
     method: 'POST',
     headers: {
       authorization: BASIC,
       'content-type': 'application/x-www-form-urlencoded',
     },
-    body: form({ login_hint: loginHint, scope, binding_message: binding }),
+    body: form(params),
   });
   if (r.status !== 200) {
     err(`[CIBA] backchannel-authentication failed ${r.status}: ${await r.text()}`);

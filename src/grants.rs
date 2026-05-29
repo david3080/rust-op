@@ -37,6 +37,7 @@ fn has_scope(scope: &str, want: &str) -> bool {
 
 /// access token を保存し、id_token(ES256)を署名して返す。両 grant で共通。
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn issue_access_and_id(
     p: &Provider,
     client_id: &str,
@@ -48,6 +49,7 @@ async fn issue_access_and_id(
     dpop_jkt: Option<String>,
     id_token_alg: Option<&str>,
     resource: Option<&str>,
+    authorization_details: Option<&str>,
 ) -> (String, String) {
     let access_token = opaque();
     p.store
@@ -60,6 +62,8 @@ async fn issue_access_and_id(
             aud: resource.map(str::to_string),
             acr: acr.map(str::to_string),
             auth_time,
+            authorization_details: authorization_details.map(str::to_string),
+            mandate_consumed: false,
         })
         .await;
 
@@ -194,6 +198,7 @@ impl GrantHandler for AuthorizationCodeGrant {
             dpop_jkt,
             client.id_token_signed_response_alg.as_deref(),
             code.resource.as_deref(),
+            None,
         )
         .await;
         let refresh_token = maybe_issue_refresh(
@@ -218,6 +223,7 @@ impl GrantHandler for AuthorizationCodeGrant {
             scope: code.scope,
             id_token: Some(id_token),
             refresh_token,
+            authorization_details: None,
         })
     }
 }
@@ -267,7 +273,7 @@ impl GrantHandler for RefreshTokenGrant {
         let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
         // 認証コンテキスト(acr/auth_time)は再認証しないので元のリフレッシュトークンから引き継ぐ。
         let (access_token, id_token) =
-            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, rt.auth_time, rt.acr.as_deref(), dpop_jkt, client.id_token_signed_response_alg.as_deref(), rt.resource.as_deref())
+            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, rt.auth_time, rt.acr.as_deref(), dpop_jkt, client.id_token_signed_response_alg.as_deref(), rt.resource.as_deref(), None)
                 .await;
         // ローテーションした新しい refresh token を再発行。aud(resource)/acr/auth_time を引き継ぐ。
         let refresh_token =
@@ -280,6 +286,7 @@ impl GrantHandler for RefreshTokenGrant {
             scope,
             id_token: Some(id_token),
             refresh_token,
+            authorization_details: None,
         })
     }
 }
@@ -338,8 +345,13 @@ impl GrantHandler for CibaGrant {
                     .ok_or_else(|| OAuthError::InvalidGrant("auth_req_id already used".into()))?;
                 let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
                 let (access_token, id_token) =
-                    issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref(), None)
+                    issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref(), None, req.authorization_details.as_deref())
                         .await;
+                // 承認時の authorization_details を JSON 配列としてレスポンスへ載せる（RFC 9396）。
+                let ad_value = req
+                    .authorization_details
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
                 Ok(TokenResponse {
                     access_token,
                     token_type: token_type.into(),
@@ -347,6 +359,7 @@ impl GrantHandler for CibaGrant {
                     scope: req.scope,
                     id_token: Some(id_token),
                     refresh_token: None,
+                    authorization_details: ad_value,
                 })
             }
         }
@@ -563,7 +576,7 @@ mod tests {
 
     async fn seed_ciba(status: CibaStatus) -> (Provider, String) {
         let store = std::sync::Arc::new(MemoryCibaStore::default());
-        let id = store.create("rp", "user@example.com", "openid", "msg").await.unwrap();
+        let id = store.create("rp", "user@example.com", "openid", "msg", None).await.unwrap();
         if status != CibaStatus::Pending {
             store.transition_if_pending(id.as_str(), status).await.unwrap();
         }

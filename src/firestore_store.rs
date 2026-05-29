@@ -188,6 +188,12 @@ impl Store for FirestoreStore {
         if let Some(at) = t.auth_time {
             f["authTime"] = fs_h::int(at);
         }
+        if let Some(ad) = &t.authorization_details {
+            f["authorizationDetails"] = fs_h::s(ad);
+        }
+        if t.mandate_consumed {
+            f["mandateConsumed"] = fs_h::b(true);
+        }
         let _ = self.fs.set_doc("accessTokens", &t.token, f).await;
     }
 
@@ -205,11 +211,37 @@ impl Store for FirestoreStore {
             aud: fs_h::field_str(&f, "aud").map(str::to_string),
             acr: fs_h::field_str(&f, "acr").map(str::to_string),
             auth_time: fs_h::field_u64(&f, "authTime"),
+            authorization_details: fs_h::field_str(&f, "authorizationDetails")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            mandate_consumed: fs_h::field_bool(&f, "mandateConsumed").unwrap_or(false),
         })
     }
 
     async fn revoke_access_token(&self, token: &str) {
         let _ = self.fs.delete_doc("accessTokens", token).await;
+    }
+
+    /// updateTime CAS で mandate_consumed: false → true を 1 回だけ成功させる。
+    async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String> {
+        let (mut f, update_time) = match self
+            .fs
+            .get_doc_with_update_time("accessTokens", token)
+            .await?
+        {
+            Some(x) => x,
+            None => return Ok(false),
+        };
+        if doc_expired(&f) {
+            return Ok(false);
+        }
+        if fs_h::field_bool(&f, "mandateConsumed").unwrap_or(false) {
+            return Ok(false);
+        }
+        f["mandateConsumed"] = fs_h::b(true);
+        self.fs
+            .set_doc_if_unchanged("accessTokens", token, f, &update_time)
+            .await
     }
 
     async fn save_refresh_token(&self, t: RefreshToken) {

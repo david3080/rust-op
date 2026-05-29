@@ -360,6 +360,12 @@ fn introspection_active_body(at: &crate::model::AccessToken) -> serde_json::Valu
     if let Some(t) = at.auth_time {
         body["auth_time"] = serde_json::json!(t);
     }
+    // RFC 9396: 承認済み mandate を RS に伝える。RS は request body と照合する。
+    if let Some(ad) = at.authorization_details.as_deref() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(ad) {
+            body["authorization_details"] = v;
+        }
+    }
     body
 }
 
@@ -391,6 +397,39 @@ pub(super) async fn introspect(
     };
     ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
 }
+/// RFC 9396 mandate の単回消費窓口。RS が introspection で mandate を確認 → body と一致したら
+/// この endpoint を CAS 呼び出し → 成功した呼び出しだけ実行に進む。
+/// 認証は introspection と同じ confidential client 必須（呼べる RS を絞る）。
+pub(super) async fn mandate_consume(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let client = match authenticate_client(&p, &headers, &form).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    if let Err(e) = require_confidential(&client) {
+        return e.into_response();
+    }
+    let token = match form.get("token") {
+        Some(t) => t,
+        None => return OAuthError::InvalidRequest("token required".into()).into_response(),
+    };
+    let consumed = match p.store.consume_mandate_if_unused(token).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("consume_mandate_if_unused: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
+    };
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "consumed": consumed })),
+    )
+        .into_response()
+}
+
 /* ===== Token Revocation (RFC 7009) ===== */
 
 /// クライアントが自分のトークンを失効する。token endpoint と同じクライアント認証。
@@ -656,6 +695,8 @@ mod tests {
             aud: None,
             acr: None,
             auth_time: None,
+            authorization_details: None,
+            mandate_consumed: false,
         }
     }
 

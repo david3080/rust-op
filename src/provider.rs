@@ -2,7 +2,7 @@
 //! 新機能 = 新しい trait impl を register するだけ、が拡張の基本方針。
 
 use crate::auth_checks::*;
-use crate::ciba::{CibaStore, MemoryCibaStore};
+use crate::ciba::{CibaRateLimiter, CibaStore, MemoryCibaStore};
 use crate::client_auth::*;
 use crate::dpop::{DpopVerifier, Es256Dpop};
 use crate::firestore::Firestore;
@@ -32,6 +32,8 @@ pub struct Provider {
     pub firestore: Option<Arc<Firestore>>,
     /// CIBA バックチャネル要求の永続化。既定は In-memory、本番は Firestore 実装を注入する。
     pub ciba: Arc<dyn CibaStore>,
+    /// CIBA の (client_id, account) ごとレート制限。push スパム抑止のバックストップ。
+    pub ciba_rate: Arc<CibaRateLimiter>,
     pub mailer: Arc<dyn Mailer>,
     pub dpop: Arc<dyn DpopVerifier>,
     pub clients: HashMap<String, Client>,
@@ -78,6 +80,7 @@ impl Provider {
             firestore: None,
             mailer: Arc::new(LogMailer),
             ciba: Arc::new(MemoryCibaStore::default()),
+            ciba_rate: Arc::new(CibaRateLimiter::default()),
             dpop: Arc::new(Es256Dpop::default()),
             clients: HashMap::new(),
             checks,

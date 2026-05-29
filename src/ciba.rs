@@ -61,6 +61,9 @@ pub struct BackchannelAuthRequest {
     pub binding_message: String,
     pub status: CibaStatus,
     pub expires_at: u64,
+    /// RFC 9396 authorization_details の JSON 配列を文字列で保持（無ければ None）。
+    /// JWT には埋め込まず、access token レコードに紐付け /introspection で運ぶ。
+    pub authorization_details: Option<String>,
 }
 
 impl BackchannelAuthRequest {
@@ -68,14 +71,17 @@ impl BackchannelAuthRequest {
         self.expires_at < now()
     }
     fn fields(&self) -> serde_json::Value {
-        json!({
-            "clientId": firestore::s(&self.client_id),
-            "account": firestore::s(&self.account),
-            "scope": firestore::s(&self.scope),
-            "bindingMessage": firestore::s(&self.binding_message),
-            "status": firestore::s(self.status.as_str()),
-            "expiresAt": firestore::ts(&firestore::rfc3339(self.expires_at)),
-        })
+        let mut obj = serde_json::Map::new();
+        obj.insert("clientId".into(), firestore::s(&self.client_id));
+        obj.insert("account".into(), firestore::s(&self.account));
+        obj.insert("scope".into(), firestore::s(&self.scope));
+        obj.insert("bindingMessage".into(), firestore::s(&self.binding_message));
+        obj.insert("status".into(), firestore::s(self.status.as_str()));
+        obj.insert("expiresAt".into(), firestore::ts(&firestore::rfc3339(self.expires_at)));
+        if let Some(ad) = &self.authorization_details {
+            obj.insert("authorizationDetails".into(), firestore::s(ad));
+        }
+        serde_json::Value::Object(obj)
     }
     fn from_fields(auth_req_id: AuthReqId, f: &serde_json::Value) -> Self {
         let g = |k: &str| firestore::field_str(f, k).unwrap_or("").to_string();
@@ -85,6 +91,9 @@ impl BackchannelAuthRequest {
             .and_then(|v| v.as_str())
             .map(firestore::parse_rfc3339_secs)
             .unwrap_or(0);
+        let authorization_details = firestore::field_str(f, "authorizationDetails")
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         Self {
             auth_req_id,
             client_id: g("clientId"),
@@ -93,6 +102,7 @@ impl BackchannelAuthRequest {
             binding_message: g("bindingMessage"),
             status: CibaStatus::parse(firestore::field_str(f, "status").unwrap_or("pending")),
             expires_at,
+            authorization_details,
         }
     }
 }
@@ -108,6 +118,7 @@ pub trait CibaStore: Send + Sync {
         account: &str,
         scope: &str,
         binding_message: &str,
+        authorization_details: Option<&str>,
     ) -> Result<AuthReqId, String>;
     async fn get(&self, auth_req_id: &str) -> Result<Option<BackchannelAuthRequest>, String>;
     /// Pending のときだけ status へ原子的に遷移。遷移できたら Ok(true)、
@@ -119,6 +130,68 @@ pub trait CibaStore: Send + Sync {
     async fn delete(&self, auth_req_id: &str) -> Result<(), String>;
     /// アカウントの pending な要求一覧（承認 UI 用）。期限切れは除く。
     async fn list_pending(&self, account: &str) -> Result<Vec<BackchannelAuthRequest>, String>;
+    /// (client_id, account) に紐づく active な Pending を 1 件返す。dedup 用。
+    /// 既定実装は list_pending を client_id で絞る。
+    async fn find_pending_for(
+        &self,
+        client_id: &str,
+        account: &str,
+    ) -> Result<Option<BackchannelAuthRequest>, String> {
+        Ok(self
+            .list_pending(account)
+            .await?
+            .into_iter()
+            .find(|r| r.client_id == client_id))
+    }
+}
+
+/// (client_id, account) 単位の sliding-window レート制限。
+/// in-memory（インスタンス単位）。Cloud Run は同時インスタンスが少ない CIBA RP では
+/// 1〜数個に収まるので、まず十分な防御。スパムの主因（同 RP × 同ユーザの連発）に効く。
+pub struct CibaRateLimiter {
+    window: std::time::Duration,
+    max: usize,
+    map: std::sync::Mutex<
+        std::collections::HashMap<(String, String), std::collections::VecDeque<std::time::Instant>>,
+    >,
+}
+
+impl CibaRateLimiter {
+    pub fn new(window: std::time::Duration, max: usize) -> Self {
+        Self {
+            window,
+            max,
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 許可なら true（履歴に今を記録）。超過なら false。
+    pub fn check_and_record(&self, client_id: &str, account: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.map.lock().unwrap();
+        let dq = map
+            .entry((client_id.to_string(), account.to_string()))
+            .or_default();
+        while let Some(&front) = dq.front() {
+            if now.duration_since(front) > self.window {
+                dq.pop_front();
+            } else {
+                break;
+            }
+        }
+        if dq.len() >= self.max {
+            return false;
+        }
+        dq.push_back(now);
+        true
+    }
+}
+
+impl Default for CibaRateLimiter {
+    /// 60 秒に 3 要求まで。ciba-rp の正常運用では絶対超えない値。
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_secs(60), 3)
+    }
 }
 
 /// 本番実装。Firestore の updateTime プリコンディションで CAS を実現する。
@@ -140,6 +213,7 @@ impl CibaStore for FirestoreCibaStore {
         account: &str,
         scope: &str,
         binding_message: &str,
+        authorization_details: Option<&str>,
     ) -> Result<AuthReqId, String> {
         let req = BackchannelAuthRequest {
             auth_req_id: AuthReqId::generate(),
@@ -149,6 +223,7 @@ impl CibaStore for FirestoreCibaStore {
             binding_message: binding_message.to_string(),
             status: CibaStatus::Pending,
             expires_at: now() + TTL_SECS,
+            authorization_details: authorization_details.map(|s| s.to_string()),
         };
         self.fs.set_doc(COL, req.auth_req_id.as_str(), req.fields()).await?;
         Ok(req.auth_req_id)
@@ -223,6 +298,7 @@ impl CibaStore for MemoryCibaStore {
         account: &str,
         scope: &str,
         binding_message: &str,
+        authorization_details: Option<&str>,
     ) -> Result<AuthReqId, String> {
         let id = AuthReqId::generate();
         let req = BackchannelAuthRequest {
@@ -233,6 +309,7 @@ impl CibaStore for MemoryCibaStore {
             binding_message: binding_message.to_string(),
             status: CibaStatus::Pending,
             expires_at: now() + TTL_SECS,
+            authorization_details: authorization_details.map(|s| s.to_string()),
         };
         self.map.lock().unwrap().insert(id.0.clone(), req);
         Ok(id)
@@ -300,6 +377,10 @@ mod tests {
             binding_message: "確認してください".into(),
             status: CibaStatus::Approved,
             expires_at: 1_900_000_000,
+            authorization_details: Some(
+                r#"[{"type":"payment","amount":"1500","currency":"JPY","merchant":"shop"}]"#
+                    .to_string(),
+            ),
         };
         let back = BackchannelAuthRequest::from_fields(AuthReqId("abc".into()), &req.fields());
         assert_eq!(back.client_id, "rp");
@@ -308,12 +389,50 @@ mod tests {
         assert_eq!(back.binding_message, "確認してください");
         assert_eq!(back.status, CibaStatus::Approved);
         assert_eq!(back.expires_at, 1_900_000_000);
+        assert_eq!(back.authorization_details, req.authorization_details);
+    }
+
+    #[tokio::test]
+    async fn find_pending_for_filters_by_client() {
+        let s = MemoryCibaStore::default();
+        let a = s.create("rp-a", "u@example.com", "openid", "msg-a", None).await.unwrap();
+        let _b = s.create("rp-b", "u@example.com", "openid", "msg-b", None).await.unwrap();
+        let found = s.find_pending_for("rp-a", "u@example.com").await.unwrap().unwrap();
+        assert_eq!(found.auth_req_id.0, a.0);
+        assert_eq!(found.client_id, "rp-a");
+        // 該当無し
+        assert!(s.find_pending_for("rp-c", "u@example.com").await.unwrap().is_none());
+        assert!(s.find_pending_for("rp-a", "other@example.com").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn rate_limiter_admits_then_blocks_within_window() {
+        let rl = CibaRateLimiter::new(std::time::Duration::from_secs(60), 3);
+        assert!(rl.check_and_record("rp", "u"));
+        assert!(rl.check_and_record("rp", "u"));
+        assert!(rl.check_and_record("rp", "u"));
+        // 4 回目で拒否
+        assert!(!rl.check_and_record("rp", "u"));
+        // 別 client は独立
+        assert!(rl.check_and_record("rp2", "u"));
+        // 別 account も独立
+        assert!(rl.check_and_record("rp", "v"));
+    }
+
+    #[test]
+    fn rate_limiter_recovers_after_window() {
+        let rl = CibaRateLimiter::new(std::time::Duration::from_millis(50), 2);
+        assert!(rl.check_and_record("rp", "u"));
+        assert!(rl.check_and_record("rp", "u"));
+        assert!(!rl.check_and_record("rp", "u"));
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        assert!(rl.check_and_record("rp", "u"));
     }
 
     #[tokio::test]
     async fn memory_store_transition_is_first_wins() {
         let s = MemoryCibaStore::default();
-        let id = s.create("rp", "u", "openid", "").await.unwrap();
+        let id = s.create("rp", "u", "openid", "", None).await.unwrap();
         // 先勝ち: 最初の Pending→Approved だけ成功し、後発は負ける。
         assert!(s.transition_if_pending(id.as_str(), CibaStatus::Approved).await.unwrap());
         assert!(!s.transition_if_pending(id.as_str(), CibaStatus::Denied).await.unwrap());
@@ -323,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn memory_store_consume_is_single_use() {
         let s = MemoryCibaStore::default();
-        let id = s.create("rp", "u", "openid", "").await.unwrap();
+        let id = s.create("rp", "u", "openid", "", None).await.unwrap();
         // Approved でないと消費できない。
         assert!(s.consume_if_approved(id.as_str()).await.unwrap().is_none());
         s.transition_if_pending(id.as_str(), CibaStatus::Approved).await.unwrap();
@@ -343,6 +462,7 @@ mod tests {
             binding_message: String::new(),
             status: CibaStatus::Pending,
             expires_at: exp,
+            authorization_details: None,
         };
         assert!(mk(0).expired());
         assert!(!mk(now() + 100).expired());

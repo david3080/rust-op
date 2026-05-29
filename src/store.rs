@@ -27,6 +27,9 @@ pub trait Store: Send + Sync {
     async fn get_access_token(&self, token: &str) -> Option<AccessToken>;
     /// アクセストークンを失効（削除）する（RFC 7009）。未知でも no-op。
     async fn revoke_access_token(&self, token: &str);
+    /// mandate の単回消費。`mandate_consumed: false → true` を CAS で 1 回だけ成功させる。
+    /// 成功: Ok(true)、既消費/無効トークン: Ok(false)。
+    async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String>;
 
     async fn save_refresh_token(&self, t: RefreshToken);
     /// リフレッシュトークンは使用時にローテーション（取得と同時に削除）。
@@ -118,6 +121,16 @@ impl Store for MemoryStore {
     async fn revoke_access_token(&self, token: &str) {
         self.access_tokens.lock().unwrap().remove(token);
     }
+    async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String> {
+        let mut map = self.access_tokens.lock().unwrap();
+        match map.get_mut(token) {
+            Some(at) if !at.mandate_consumed => {
+                at.mandate_consumed = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
     async fn save_refresh_token(&self, t: RefreshToken) {
         self.refresh_tokens.lock().unwrap().insert(t.token.clone(), t);
     }
@@ -205,7 +218,20 @@ mod tests {
     }
 
     fn at(t: &str) -> AccessToken {
-        AccessToken { token: t.into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), jkt: None, aud: None, acr: None, auth_time: None }
+        AccessToken { token: t.into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), jkt: None, aud: None, acr: None, auth_time: None, authorization_details: None, mandate_consumed: false }
+    }
+
+    #[tokio::test]
+    async fn consume_mandate_is_single_use() {
+        let s = MemoryStore::default();
+        s.save_access_token(at("AT1")).await;
+        // 初回成功、2 回目以降は失敗（先勝ち）。
+        assert!(s.consume_mandate_if_unused("AT1").await.unwrap());
+        assert!(!s.consume_mandate_if_unused("AT1").await.unwrap());
+        // 未知トークンも false。
+        assert!(!s.consume_mandate_if_unused("UNKNOWN").await.unwrap());
+        // 消費フラグが永続化されている。
+        assert!(s.get_access_token("AT1").await.unwrap().mandate_consumed);
     }
 
     #[tokio::test]

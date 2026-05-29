@@ -121,6 +121,13 @@ pub struct AccessToken {
     /// 認証コンテキスト（Step-up Authentication Challenge / RFC 9470 で RS が評価）。
     pub acr: Option<String>,
     pub auth_time: Option<u64>,
+    /// RFC 9396 authorization_details の JSON 配列を文字列で保持。
+    /// CIBA で承認された mandate を運ぶ。RS は /introspection 経由で受け取り、
+    /// リクエスト本体と照合する（MandatePolicy）。
+    pub authorization_details: Option<String>,
+    /// mandate の単回消費フラグ。/mandate/consume で false→true を CAS する。
+    /// RS は実行前に消費を試み、false なら mandate.already_consumed で弾く。
+    pub mandate_consumed: bool,
 }
 
 /// リフレッシュトークン。使用時にローテーション（消費して新規発行）する。
@@ -155,4 +162,7 @@ pub struct TokenResponse {
     pub id_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+    /// RFC 9396: 発行したトークンに紐づく authorization_details（JSON 配列をそのまま）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_details: Option<serde_json::Value>,
 }
