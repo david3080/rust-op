@@ -17,7 +17,6 @@ h1{font-size:1.3rem;font-weight:500;margin:18px 0 28px}
 <path d="M12 11v4a7 7 0 0 0 1.4 4.3"/><path d="M12 19v.01"/></svg>
 <h1>Passkey でサインイン</h1>
 <button class="filled" onclick="start()">サインイン</button>
-<p class="hint">テスト用固定ログイン: __USER__ / __PASS__</p>
 <script>
 const ISSUER="__ISSUER__";
 function b64url(buf){return btoa(String.fromCharCode.apply(null,new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
@@ -37,11 +36,7 @@ async function start(){
   location.href=u.toString();
 }
 </script></body></html>"##;
-    Html(
-        page.replace("__ISSUER__", &p.issuer)
-            .replace("__USER__", &p.demo_user)
-            .replace("__PASS__", &p.demo_pass),
-    )
+    Html(page.replace("__ISSUER__", &p.issuer))
 }
 
 pub(super) async fn demo_callback(State(p): State<Arc<Provider>>) -> Html<String> {

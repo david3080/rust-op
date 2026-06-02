@@ -66,6 +66,8 @@ async fn issue_access_and_id(
             mandate_consumed: false,
         })
         .await;
+    // 監査イベント（Cloud Logging metric/alert 用）。
+    tracing::info!(event = "token_issued", client_id = %client_id, sub = %account_id, scope = %scope);
 
     let iat = now();
     let mut claims = serde_json::json!({
@@ -73,7 +75,7 @@ async fn issue_access_and_id(
         "sub": account_id,
         "aud": client_id,
         "iat": iat,
-        "exp": iat + 3600,
+        "exp": iat + 900,
         // at_hash (OIDC Core 3.1.3.6): ES256 は SHA-256 の左 128bit を base64url。
         "at_hash": at_hash(&access_token),
     });
@@ -86,7 +88,7 @@ async fn issue_access_and_id(
     if let Some(a) = acr {
         claims["acr"] = serde_json::json!(a);
     }
-    let id_token = p.signer_for(id_token_alg).sign(&claims);
+    let id_token = p.signer_for(id_token_alg).sign(&claims).await;
     (access_token, id_token)
 }
 
@@ -219,7 +221,7 @@ impl GrantHandler for AuthorizationCodeGrant {
         Ok(TokenResponse {
             access_token,
             token_type: token_type.into(),
-            expires_in: 3600,
+            expires_in: 900,
             scope: code.scope,
             id_token: Some(id_token),
             refresh_token,
@@ -282,7 +284,7 @@ impl GrantHandler for RefreshTokenGrant {
         Ok(TokenResponse {
             access_token,
             token_type: token_type.into(),
-            expires_in: 3600,
+            expires_in: 900,
             scope,
             id_token: Some(id_token),
             refresh_token,
@@ -355,7 +357,7 @@ impl GrantHandler for CibaGrant {
                 Ok(TokenResponse {
                     access_token,
                     token_type: token_type.into(),
-                    expires_in: 3600,
+                    expires_in: 900,
                     scope: req.scope,
                     id_token: Some(id_token),
                     refresh_token: None,

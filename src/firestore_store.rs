@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const INTERACTION_TTL: u64 = 3600;
 const SESSION_TTL: u64 = 7 * 24 * 3600;
-const ACCESS_TTL: u64 = 3600;
+const ACCESS_TTL: u64 = 900;
 const REFRESH_TTL: u64 = 14 * 24 * 3600;
 
 fn now() -> u64 {
@@ -125,7 +125,10 @@ impl Store for FirestoreStore {
     }
 
     async fn take_code(&self, code: &str) -> Option<AuthorizationCode> {
-        let f = self.fs.get_doc("authCodes", code).await.ok()??;
+        // updateTime CAS で単回消費を原子化する。get→write の間に別リクエストが消費した
+        // 場合は CAS が負け、二重発行を防ぐ（consume_mandate_if_unused / CIBA と同型）。
+        let (mut f, update_time) =
+            self.fs.get_doc_with_update_time("authCodes", code).await.ok()??;
         let used = f
             .get("used")
             .and_then(|v| v.get("booleanValue"))
@@ -141,8 +144,12 @@ impl Store for FirestoreStore {
             }
             return None;
         }
-        // 初回消費: 削除せず used=true をマーク（後続の link_issued_tokens で発行トークンを記録）。
-        let _ = self.fs.merge_doc("authCodes", code, json!({ "used": fs_h::b(true) })).await;
+        // 初回消費: used=true を CAS で書く。並行消費に負けたら（Ok(false)/Err）None を返す。
+        f["used"] = fs_h::b(true);
+        match self.fs.set_doc_if_unchanged("authCodes", code, f.clone(), &update_time).await {
+            Ok(true) => {}
+            _ => return None,
+        }
         // 期限チェックは grant 側（code.expires_at）。ここでは復元のみ。
         Some(AuthorizationCode {
             code: code.to_string(),

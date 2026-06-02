@@ -111,12 +111,19 @@ impl ClientAuthMethod for ClientSecretBasic {
 
 /// token_endpoint_auth_method = private_key_jwt（RFC 7523, ES256）。
 pub struct PrivateKeyJwt {
-    seen_jti: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    jti: crate::nonce::NonceStore,
 }
 
 impl Default for PrivateKeyJwt {
     fn default() -> Self {
-        Self { seen_jti: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        Self { jti: crate::nonce::NonceStore::memory() }
+    }
+}
+
+impl PrivateKeyJwt {
+    /// 本番: Firestore 連携で client_assertion の jti をインスタンス跨ぎ単回化。
+    pub fn with_store(fs: std::sync::Arc<crate::firestore::Firestore>) -> Self {
+        Self { jti: crate::nonce::NonceStore::firestore(fs) }
     }
 }
 
@@ -202,14 +209,8 @@ impl ClientAuthMethod for PrivateKeyJwt {
         if jti.is_empty() {
             return Err(bad("assertion jti missing"));
         }
-        {
-            let mut seen = self.seen_jti.lock().unwrap();
-            let inst = std::time::Instant::now();
-            seen.retain(|_, exp| *exp > inst);
-            if seen.contains_key(jti) {
-                return Err(bad("assertion jti replay"));
-            }
-            seen.insert(jti.to_string(), inst + std::time::Duration::from_secs(300));
+        if !self.jti.claim(&format!("cjwt:{jti}"), std::time::Duration::from_secs(300)).await {
+            return Err(bad("assertion jti replay"));
         }
 
         Ok(client)

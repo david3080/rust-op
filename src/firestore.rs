@@ -246,6 +246,32 @@ impl Firestore {
         Err(format!("cas {}", r.status()))
     }
 
+    /// ドキュメントが存在しないときだけ作成する（atomic な単回作成）。
+    /// 作成できたら Ok(true)、既に存在（ALREADY_EXISTS / FAILED_PRECONDITION）なら Ok(false)。
+    /// jti / nonce の分散リプレイ防止に使う（インスタンス跨ぎで単回を保証）。
+    pub async fn create_if_absent(&self, col: &str, id: &str, fields: Value) -> Result<bool, String> {
+        let tok = self.token().await?;
+        let r = self
+            .http
+            .patch(self.doc_url(col, id))
+            .query(&[("currentDocument.exists", "false")])
+            .bearer_auth(tok)
+            .json(&json!({ "fields": fields }))
+            .send()
+            .await
+            .map_err(|e| format!("create_if_absent: {e}"))?;
+        if r.status().is_success() {
+            return Ok(true);
+        }
+        if r.status() == reqwest::StatusCode::BAD_REQUEST
+            || r.status() == reqwest::StatusCode::CONFLICT
+            || r.status() == reqwest::StatusCode::PRECONDITION_FAILED
+        {
+            return Ok(false);
+        }
+        Err(format!("create_if_absent {}", r.status()))
+    }
+
     /// updateTime が一致するときだけ削除する（compare-and-set 削除）。
     /// 削除できたら Ok(true)、他者が先に更新/削除（FAILED_PRECONDITION / NOT_FOUND）なら Ok(false)。
     /// CIBA poll の「承認の単回消費」を原子的に行うために使う。

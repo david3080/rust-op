@@ -34,13 +34,32 @@ pub(super) struct RegisterForm {
 /// メール確認チャレンジを作り確認メールを送る。Web フォーム/ネイティブ JSON 共通。
 /// 列挙対策で既登録/未登録に関わらず例外を出さない。メール URL は custom scheme
 /// 経由でアプリにも着地できる /r?t= 形式（PC では /r が HTML を返す）。
+/// X-Forwarded-For の先頭 IP（Cloud Run の前段が付与）。無ければ "unknown"。
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 async fn issue_register_email(
     p: &Provider,
     fs: &crate::firestore::Firestore,
     email: &str,
+    ip: &str,
 ) -> Result<(), String> {
     if !email.contains('@') || email.len() > 254 {
         return Err("invalid email".into());
+    }
+    // レート制限: 同一アドレスへの連発・同一 IP からの大量送信を抑止
+    // （メール爆撃 / 正規ドメイン発フィッシング / 送信枠浪費の対策）。
+    if !p.register_rate.check_and_record("email", email)
+        || !p.register_rate.check_and_record("ip", ip)
+    {
+        return Err("rate_limited".into());
     }
     match crate::registration::account_exists(fs, email).await? {
         true => {
@@ -59,6 +78,7 @@ async fn issue_register_email(
 
 pub(super) async fn register_submit(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     Form(form): Form<RegisterForm>,
 ) -> Response {
     let email = form.email.trim().to_lowercase();
@@ -66,13 +86,16 @@ pub(super) async fn register_submit(
         Some(fs) => fs,
         None => return plain_error("registration not available (no Firestore)"),
     };
-    match issue_register_email(&p, fs, &email).await {
+    match issue_register_email(&p, fs, &email, &client_ip(&headers)).await {
         Ok(()) => page(
             "送信しました",
             "<h1>確認メールを送信しました</h1><p>メール内のリンクから passkey を作成して登録を完了してください（有効期限15分）。</p>",
         )
         .into_response(),
         Err(e) if e == "invalid email" => plain_error("invalid email"),
+        Err(e) if e == "rate_limited" => {
+            (StatusCode::TOO_MANY_REQUESTS, "rate limited; please retry later").into_response()
+        }
         Err(e) => {
             tracing::error!("register_submit: {e}");
             plain_error("internal error")
@@ -89,6 +112,7 @@ pub(super) struct EmailChallengeReq {
 
 pub(super) async fn register_email_challenge(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     Json(req): Json<EmailChallengeReq>,
 ) -> Response {
     let email = req.email.trim().to_lowercase();
@@ -96,9 +120,12 @@ pub(super) async fn register_email_challenge(
         Some(fs) => fs,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    match issue_register_email(&p, fs, &email).await {
+    match issue_register_email(&p, fs, &email, &client_ip(&headers)).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) if e == "invalid email" => (StatusCode::BAD_REQUEST, "invalid email").into_response(),
+        Err(e) if e == "rate_limited" => {
+            (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
+        }
         Err(e) => {
             tracing::error!("email-challenge: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
