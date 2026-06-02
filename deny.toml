@@ -1,0 +1,43 @@
+# cargo-deny 設定（サプライチェーン: 脆弱性 / ライセンス / 重複 / 出所）。
+# ローカル: `cargo deny check`  / CI: .github/workflows/ci.yml の audit ジョブ。
+
+[advisories]
+version = 2
+# RustSec advisory DB の CVE をすべて検知。修正不能な既知 1 件のみ理由付きで除外する。
+ignore = [
+    # rsa 0.9.x: Marvin Attack（timing sidechannel, RUSTSEC-2023-0071, medium, 修正版なし）。
+    # 用途は RS256 id_token 署名のみ（既定は ES256）。P1-1（署名鍵の Cloud KMS 移行）で
+    # ローカル rsa 秘密鍵操作を撤廃して恒久解消する。それまで追跡として ignore。
+    "RUSTSEC-2023-0071",
+]
+
+[bans]
+# 同一クレートの複数版（例: getrandom 0.2/0.4）は警告（依存更新で解消を促す。即 fail にはしない）。
+multiple-versions = "warn"
+wildcards = "warn"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# 非公開バイナリ（rust-op 自身など license フィールド無しのワークスペースcrate）は対象外。
+private = { ignore = true }
+# 許可ライセンス（permissive のみ）。新規依存が想定外ライセンスを持ち込んだら CI で検知する。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+[sources]
+# 想定外のレジストリ / git 依存はブロック（タイポスクワット・出所不明の混入防止）。
+unknown-registry = "deny"
+unknown-git = "deny"

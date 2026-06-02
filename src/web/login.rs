@@ -26,11 +26,9 @@ details input{font-size:14px;padding:8px;margin-top:8px}</style>
 <input id="email" placeholder="メールアドレス（任意）" autocomplete="off">
 <button class="filled" onclick="pkLogin()">サインイン</button>
 <button class="outlined" onclick="location.href='__REGISTER__'">新規登録 (メアドで)</button>
+<button class="outlined" onclick="location.href='__CANCEL__'">キャンセル</button>
 <p id="msg"></p>
-<details><summary>パスワード (テスト用)</summary>
-<form method="post" action="__LOGIN__">
-<input name="username" placeholder="email"><input name="password" type="password" placeholder="password">
-<button class="filled" type="submit" style="margin-top:8px">ログイン</button></form></details>
+__PWFORM__
 <script>
 __WEBAUTHN_JS__
 const OPT="__OPT__",VER="__VER__";
@@ -64,11 +62,24 @@ async function pkLogin(){
  }
 }
 </script></body></html>"##;
+    // パスワードフォームはテスト/コンフォーマンス時のみ表示（本番は passkey のみ）。
+    let pwform = if super::password_login_enabled() {
+        format!(
+            r##"<details><summary>パスワード (テスト用)</summary>
+<form method="post" action="{login}">
+<input name="username" placeholder="email"><input name="password" type="password" placeholder="password">
+<button class="filled" type="submit" style="margin-top:8px">ログイン</button></form></details>"##,
+            login = p.path(&format!("/interaction/{uid}/login")),
+        )
+    } else {
+        String::new()
+    };
     Html(
         body.replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
             .replace("__OPT__", &p.path(&format!("/interaction/{uid}/passkey/options")))
             .replace("__VER__", &p.path(&format!("/interaction/{uid}/passkey/verify")))
-            .replace("__LOGIN__", &p.path(&format!("/interaction/{uid}/login")))
+            .replace("__PWFORM__", &pwform)
+            .replace("__CANCEL__", &p.path(&format!("/interaction/{uid}/cancel")))
             .replace("__REGISTER__", &p.path("/register")),
     )
 }
@@ -85,9 +96,14 @@ pub(super) async fn login_submit(
     Path(uid): Path<String>,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    // 多層防御: ルート未登録（本番）でも万一到達したら拒否する。
+    if !super::password_login_enabled() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
     // conformance/demo 用の固定資格情報バイパス（a/a）。実ユーザーは passkey を使う。
     let raw = form.username.trim();
     if !(raw == p.demo_user && form.password == p.demo_pass) {
+        tracing::warn!(event = "login_failed", method = "password");
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
     let interaction = match p.store.get_interaction(&uid).await {
@@ -110,6 +126,7 @@ async fn finalize_login(
     let uid = interaction.uid.clone();
     interaction.account_id = Some(account_sub.clone());
     interaction.auth_time = Some(auth_time);
+    tracing::info!(event = "login_success", sub = %account_sub);
     p.store.save_interaction(interaction).await;
     let sid = uuid::Uuid::new_v4().to_string();
     p.store
@@ -236,7 +253,7 @@ pub(super) async fn login_passkey_verify(
             let _ = crate::registration::update_sign_count(fs, &email, new_count).await;
         }
         Err(e) => {
-            tracing::warn!("webauthn auth failed: {e}");
+            tracing::warn!(event = "login_failed", method = "passkey", "webauthn auth failed: {e}");
             return (StatusCode::UNAUTHORIZED, format!("passkey verify failed: {e}")).into_response();
         }
     }

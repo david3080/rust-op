@@ -13,8 +13,10 @@ mod firestore_store;
 mod grants;
 mod interaction_policy;
 mod jws;
+mod kms;
 mod mailer;
 mod model;
+mod nonce;
 mod par;
 mod provider;
 mod registration;
@@ -31,18 +33,27 @@ use provider::Provider;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // ログ: Cloud Run では構造化 JSON（Cloud Logging がフィールド解析→log-based metric/alert）。
+    // ローカルは人間可読のまま。
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    if std::env::var("K_SERVICE").is_ok() {
+        tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     // ORIGIN = スキーム+ホスト（例 https://oidc.sonrisa.co.jp）。
     // BASE_PATH = Hosting rewrite のパス接頭辞（例 /roidc）。issuer = ORIGIN + BASE_PATH。
     let origin = std::env::var("ORIGIN").unwrap_or_else(|_| "http://localhost:8080".into());
     let base_path = std::env::var("BASE_PATH").unwrap_or_default();
     let issuer = format!("{origin}{base_path}");
+
+    // 静的 conformance クライアントのシークレットは env から注入する（ソースに平文を残さない）。
+    // 未設定時は起動毎のランダム値にフォールバックし、既知シークレットを世に晒さない
+    // （= env 未設定の本番では当該クライアントは事実上利用不能になる）。
+    let secret_from_env =
+        |key: &str| std::env::var(key).unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
 
     // demo-rp: public client + PKCE。redirect_uri は内蔵コールバックページ。
     let demo_rp = Client {
@@ -102,7 +113,7 @@ async fn main() {
         redirect_uris: vec![],
         post_logout_redirect_uris: vec![],
         token_endpoint_auth_method: "client_secret_basic".into(),
-        client_secret: Some("ciba-rp-secret".into()),
+        client_secret: Some(secret_from_env("CIBA_RP_SECRET")),
         grant_types: vec!["urn:openid:params:grant-type:ciba".into()],
         dpop_bound: false,
         jwks: vec![],
@@ -155,26 +166,36 @@ async fn main() {
         id_token_signed_response_alg: None,
     };
 
+    // demo-rp / mobile-rp は実アプリ用（public + PKCE, シークレット無し）で常時登録。
     let mut provider = Provider::new(issuer.clone())
         .with_base_path(base_path.clone())
         .with_client(demo_rp)
-        .with_client(mobile_rp)
-        .with_client(ciba_rp)
-        .with_client(oidf_client("oidf-basic-1", "oidf-basic-secret-1"))
-        .with_client(oidf_client("oidf-basic-2", "oidf-basic-secret-2"))
-        .with_client(fapi_client(
-            "fapi-1",
-            std::env::var("FAPI1_KID").as_deref().unwrap_or("fapi-1-key"),
-            &std::env::var("FAPI1_X").unwrap_or_default(),
-            &std::env::var("FAPI1_Y").unwrap_or_default(),
-        ))
-        .with_client(fapi_client(
-            "fapi-2",
-            std::env::var("FAPI2_KID").as_deref().unwrap_or("fapi-2-key"),
-            &std::env::var("FAPI2_X").unwrap_or_default(),
-            &std::env::var("FAPI2_Y").unwrap_or_default(),
-        ))
-        .with_client(fapi_ciba);
+        .with_client(mobile_rp);
+    // OIDF/FAPI conformance 用の静的クライアント（既知 id・シークレット保持）は
+    // CONFORMANCE_CLIENTS_ENABLED のときだけ登録する。実ユーザー機では既定で出さない
+    // （= test クライアントの攻撃面を本番から排除）。
+    let conformance_clients = std::env::var("CONFORMANCE_CLIENTS_ENABLED")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if conformance_clients {
+        provider = provider
+            .with_client(ciba_rp)
+            .with_client(oidf_client("oidf-basic-1", &secret_from_env("OIDF_BASIC_SECRET_1")))
+            .with_client(oidf_client("oidf-basic-2", &secret_from_env("OIDF_BASIC_SECRET_2")))
+            .with_client(fapi_client(
+                "fapi-1",
+                std::env::var("FAPI1_KID").as_deref().unwrap_or("fapi-1-key"),
+                &std::env::var("FAPI1_X").unwrap_or_default(),
+                &std::env::var("FAPI1_Y").unwrap_or_default(),
+            ))
+            .with_client(fapi_client(
+                "fapi-2",
+                std::env::var("FAPI2_KID").as_deref().unwrap_or("fapi-2-key"),
+                &std::env::var("FAPI2_X").unwrap_or_default(),
+                &std::env::var("FAPI2_Y").unwrap_or_default(),
+            ))
+            .with_client(fapi_ciba);
+    }
 
     // Cloud Run 上 (K_SERVICE あり) では Firestore + Resend を有効化。
     // ローカルは metadata 不達なので無効（LogMailer のまま）。
@@ -183,37 +204,77 @@ async fn main() {
             .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
             .unwrap_or_else(|_| "fido2-8b943".into());
         let fs = std::sync::Arc::new(firestore::Firestore::new(project));
-        // 署名鍵を Secret Manager から固定（無ければ起動ごとの一時鍵にフォールバック）。
-        // インスタンス跨ぎ・再起動で kid を保つために必須。
-        match fs.access_secret("oidc-signing-key-es256").await {
-            Ok(Some(scalar)) => match jws::Es256Signer::from_scalar_b64(&scalar) {
-                Ok(signer) => {
-                    tracing::info!("loaded ES256 signing key from Secret Manager");
-                    provider = provider.with_signer(std::sync::Arc::new(signer));
+        // 署名鍵 ES256: KMS_ES256_KEY があれば Cloud KMS で署名（秘密鍵をプロセスに展開しない）。
+        // 無ければ Secret Manager の固定鍵、それも無ければ起動ごとの一時鍵にフォールバック。
+        let es_kms: Option<std::sync::Arc<dyn jws::JwsSigner>> = match std::env::var("KMS_ES256_KEY") {
+            Ok(key) => match kms::KmsSigner::es256(fs.clone(), &key).await {
+                Ok(s) => {
+                    tracing::info!("ES256 signing via Cloud KMS");
+                    Some(std::sync::Arc::new(s))
                 }
                 Err(e) => {
-                    tracing::error!("signing key from secret invalid ({e}); using ephemeral key")
+                    tracing::error!("KMS ES256 init failed ({e}); falling back to Secret Manager");
+                    None
                 }
             },
-            Ok(None) => tracing::warn!("signing key secret not found; using ephemeral key"),
-            Err(e) => tracing::error!("secret access failed ({e}); using ephemeral key"),
-        }
-        // RS256 署名鍵（OIDC Core §15.1 で必須）を Secret Manager から固定ロード。
-        // 無ければ起動ごとの一時鍵（jwks がインスタンス毎に変わる点に注意）。
-        match fs.access_secret("oidc-signing-key-rs256").await {
-            Ok(Some(pem)) => match jws::Rs256Signer::from_pkcs8_pem(&pem) {
-                Ok(signer) => {
-                    tracing::info!("loaded RS256 signing key from Secret Manager");
-                    provider = provider.add_signer(std::sync::Arc::new(signer));
-                }
-                Err(e) => tracing::error!("RS256 key from secret invalid ({e}); skipping RS256"),
-            },
-            Ok(None) => {
-                tracing::warn!("RS256 key secret not found; generating ephemeral RS256 key");
-                provider = provider.add_signer(std::sync::Arc::new(jws::Rs256Signer::generate()));
+            Err(_) => None,
+        };
+        if let Some(s) = es_kms {
+            provider = provider.with_signer(s);
+        } else {
+            match fs.access_secret("oidc-signing-key-es256").await {
+                Ok(Some(scalar)) => match jws::Es256Signer::from_scalar_b64(&scalar) {
+                    Ok(signer) => {
+                        tracing::info!("loaded ES256 signing key from Secret Manager");
+                        provider = provider.with_signer(std::sync::Arc::new(signer));
+                    }
+                    Err(e) => {
+                        tracing::error!("signing key from secret invalid ({e}); using ephemeral key")
+                    }
+                },
+                Ok(None) => tracing::warn!("signing key secret not found; using ephemeral key"),
+                Err(e) => tracing::error!("secret access failed ({e}); using ephemeral key"),
             }
-            Err(e) => tracing::error!("RS256 secret access failed ({e}); skipping RS256"),
         }
+        // RS256（OIDC Core §15.1 必須）: KMS_RS256_KEY 優先、無ければ Secret Manager。
+        let rs_kms: Option<std::sync::Arc<dyn jws::JwsSigner>> = match std::env::var("KMS_RS256_KEY") {
+            Ok(key) => match kms::KmsSigner::rs256(fs.clone(), &key).await {
+                Ok(s) => {
+                    tracing::info!("RS256 signing via Cloud KMS");
+                    Some(std::sync::Arc::new(s))
+                }
+                Err(e) => {
+                    tracing::error!("KMS RS256 init failed ({e}); falling back to Secret Manager");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        if let Some(s) = rs_kms {
+            provider = provider.add_signer(s);
+        } else {
+            match fs.access_secret("oidc-signing-key-rs256").await {
+                Ok(Some(pem)) => match jws::Rs256Signer::from_pkcs8_pem(&pem) {
+                    Ok(signer) => {
+                        tracing::info!("loaded RS256 signing key from Secret Manager");
+                        provider = provider.add_signer(std::sync::Arc::new(signer));
+                    }
+                    Err(e) => tracing::error!("RS256 key from secret invalid ({e}); skipping RS256"),
+                },
+                Ok(None) => {
+                    tracing::warn!("RS256 key secret not found; generating ephemeral RS256 key");
+                    provider = provider.add_signer(std::sync::Arc::new(jws::Rs256Signer::generate()));
+                }
+                Err(e) => tracing::error!("RS256 secret access failed ({e}); skipping RS256"),
+            }
+        }
+        // jti リプレイ防止を Firestore に分散化（インスタンス跨ぎで単回を保証）。
+        provider =
+            provider.with_dpop(std::sync::Arc::new(dpop::Es256Dpop::with_store(fs.clone())));
+        provider.client_auth.insert(
+            "private_key_jwt".into(),
+            std::sync::Arc::new(client_auth::PrivateKeyJwt::with_store(fs.clone())),
+        );
         // セッション/コード/トークンも Firestore に永続化（インスタンス跨ぎ）。
         provider = provider
             .with_store(std::sync::Arc::new(firestore_store::FirestoreStore::new(fs.clone())))

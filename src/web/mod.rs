@@ -29,6 +29,15 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+/// パスワードログイン（固定資格 a/a）を有効化するか。テスト/コンフォーマンス専用。
+/// 本番（環境変数未設定）では無効化し、passkey/CIBA のみでログインさせる（バックドア非露出）。
+fn password_login_enabled() -> bool {
+    matches!(
+        std::env::var("PASSWORD_LOGIN_ENABLED").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 pub fn router(provider: Provider) -> Router {
     let base_path = provider.base_path.clone();
     // FIDO2 Conformance 用エンドポイントは base_path に依らずトップレベル /fido/* に置く。
@@ -40,7 +49,7 @@ pub fn router(provider: Provider) -> Router {
         .route("/authorize", get(oidc::authorize))
         .route("/authorize/resume", get(oidc::authorize_resume))
         .route("/interaction/{uid}", get(login::login_form))
-        .route("/interaction/{uid}/login", post(login::login_submit))
+        .route("/interaction/{uid}/cancel", get(oidc::authorize_cancel))
         .route("/interaction/{uid}/passkey/options", post(login::login_passkey_options))
         .route("/interaction/{uid}/passkey/verify", post(login::login_passkey_verify))
         .route("/token", post(oidc::token))
@@ -69,6 +78,12 @@ pub fn router(provider: Provider) -> Router {
         // ブラウザで完結する RP デモ。
         .route("/", get(pages::demo_start))
         .route("/callback", get(pages::demo_callback));
+
+    // パスワードログイン（固定資格 a/a）はテスト/コンフォーマンス専用。
+    // 本番では PASSWORD_LOGIN_ENABLED 未設定で無効化し、passkey/CIBA のみにする。
+    if password_login_enabled() {
+        inner = inner.route("/interaction/{uid}/login", post(login::login_submit));
+    }
 
     // CIBA Consumption デモ（Web だけで CIBA を体験）。無認証で FCM push を誘発でき、
     // 承認後に email/profile を無認証ポーラへ返すため、本番では既定で無効。
@@ -205,7 +220,10 @@ async fn authenticate_client(
         .client_auth
         .get(method)
         .ok_or_else(|| OAuthError::InvalidClient("unsupported auth method".into()).into_response())?;
-    auth.authenticate(p, &input).await.map_err(|e| e.into_response())
+    auth.authenticate(p, &input).await.map_err(|e| {
+        tracing::warn!(event = "client_auth_failed", method = method);
+        e.into_response()
+    })
 }
 
 /* ===== userinfo ===== */
@@ -264,7 +282,7 @@ async fn authenticate_token(
         };
         let htu = format!("{}{}", p.issuer, path_suffix);
         let want_ath = crate::dpop::ath(&token);
-        match p.dpop.verify(&proof, method, &htu, Some(&want_ath)) {
+        match p.dpop.verify(&proof, method, &htu, Some(&want_ath)).await {
             Ok(got) if &got == jkt => {}
             Ok(_) => {
                 tracing::warn!("token auth failed [{path_suffix}]: DPoP jkt mismatch (token bound to different key)");

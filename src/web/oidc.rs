@@ -188,6 +188,33 @@ pub(super) async fn authorize_resume(
     issue_code(&p, &ctx).await
 }
 
+/// ユーザーがログイン画面で「キャンセル」した場合に、登録済み redirect_uri へ
+/// access_denied を返す（OIDC Core 3.1.2.6 / RFC 6749 §4.1.2.1）。
+pub(super) async fn authorize_cancel(
+    State(p): State<Arc<Provider>>,
+    Path(uid): Path<String>,
+) -> Response {
+    let interaction = match p.store.get_interaction(&uid).await {
+        Some(i) => i,
+        None => return plain_error("interaction not found"),
+    };
+    let params: AuthParams = match serde_urlencoded::from_str(&interaction.raw_query) {
+        Ok(p) => p,
+        Err(e) => return plain_error(&format!("invalid stored query: {e}")),
+    };
+    let mut ctx = AuthContext::new(params);
+    ctx.request_uri = interaction.request_uri.clone();
+    // redirect_uri を検証してから error redirect する（未登録 URI には返さない）。
+    if let Err(e) = run_checks(&p, &mut ctx).await {
+        return authorize_error(&p, &ctx, e);
+    }
+    authorize_error(
+        &p,
+        &ctx,
+        OAuthError::AccessDenied("end-user denied the request".into()),
+    )
+}
+
 async fn run_checks(p: &Provider, ctx: &mut AuthContext) -> Result<(), OAuthError> {
     for check in &p.checks {
         check.check(p, ctx).await?;
@@ -307,7 +334,7 @@ pub(super) async fn token(
     let dpop_jkt = match dpop_header(&headers) {
         Some(proof) => {
             let htu = format!("{}/token", p.issuer);
-            match p.dpop.verify(&proof, "POST", &htu, None) {
+            match p.dpop.verify(&proof, "POST", &htu, None).await {
                 Ok(jkt) => Some(jkt),
                 Err(e) => return OAuthError::InvalidDpopProof(e).into_response(),
             }
@@ -571,7 +598,7 @@ pub(super) async fn par(State(p): State<Arc<Provider>>, headers: HeaderMap, body
     // jkt を dpop_jkt として注入し、token endpoint で束縛を強制する。
     let body = if let Some(proof) = dpop_header(&headers) {
         let htu = format!("{}/par", p.issuer);
-        let jkt = match p.dpop.verify(&proof, "POST", &htu, None) {
+        let jkt = match p.dpop.verify(&proof, "POST", &htu, None).await {
             Ok(j) => j,
             Err(e) => return OAuthError::InvalidDpopProof(e).into_response(),
         };

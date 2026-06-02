@@ -34,6 +34,8 @@ pub struct Provider {
     pub ciba: Arc<dyn CibaStore>,
     /// CIBA の (client_id, account) ごとレート制限。push スパム抑止のバックストップ。
     pub ciba_rate: Arc<CibaRateLimiter>,
+    /// 登録メール送信のレート制限（email / IP ごと）。無認証メール乱用のバックストップ。
+    pub register_rate: Arc<CibaRateLimiter>,
     pub mailer: Arc<dyn Mailer>,
     pub dpop: Arc<dyn DpopVerifier>,
     pub clients: HashMap<String, Client>,
@@ -81,6 +83,8 @@ impl Provider {
             mailer: Arc::new(LogMailer),
             ciba: Arc::new(MemoryCibaStore::default()),
             ciba_rate: Arc::new(CibaRateLimiter::default()),
+            // 1 時間に 5 通まで（同一 email / 同一 IP）。正常な登録では超えない。
+            register_rate: Arc::new(CibaRateLimiter::new(std::time::Duration::from_secs(3600), 5)),
             dpop: Arc::new(Es256Dpop::default()),
             clients: HashMap::new(),
             checks,
@@ -112,6 +116,12 @@ impl Provider {
 
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = store;
+        self
+    }
+
+    /// DPoP 検証器を差し替える（本番は Firestore 連携で jti を分散単回化）。
+    pub fn with_dpop(mut self, dpop: Arc<dyn DpopVerifier>) -> Self {
+        self.dpop = dpop;
         self
     }
 
