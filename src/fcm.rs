@@ -41,24 +41,30 @@ pub async fn send_ciba_request(
     scope: &str,
     binding: &str,
     auth_req_id: &str,
+    authorization_details: Option<&str>,
 ) -> Result<(), String> {
     let token = match get_token(fs, email).await? {
         Some(t) => t,
         None => return Ok(()),
     };
+    // FCM data は string-only。authorization_details は JSON 文字列をそのまま渡す。
+    // fido2demo 側で jsonDecode してから構造化表示する（Mandate を端末で確認できる）。
+    let mut data = serde_json::Map::new();
+    data.insert("type".into(), json!("ciba_request"));
+    data.insert("auth_req_id".into(), json!(auth_req_id));
+    data.insert("client_name".into(), json!(client_id));
+    data.insert("scope".into(), json!(scope));
+    data.insert("binding_message".into(), json!(binding));
+    if let Some(ad) = authorization_details {
+        data.insert("authorization_details".into(), json!(ad));
+    }
     let message = json!({
         "token": token,
         "notification": {
             "title": "ログインの承認",
             "body": format!("{client_id} からのログイン要求があります"),
         },
-        "data": {
-            "type": "ciba_request",
-            "auth_req_id": auth_req_id,
-            "client_name": client_id,
-            "scope": scope,
-            "binding_message": binding,
-        },
+        "data": data,
         "apns": { "payload": { "aps": { "sound": "default", "mutable-content": 1 } } },
     });
     send(fs, message).await

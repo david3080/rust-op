@@ -25,10 +25,19 @@ pub trait Store: Send + Sync {
 
     async fn save_access_token(&self, t: AccessToken);
     async fn get_access_token(&self, token: &str) -> Option<AccessToken>;
+    /// アクセストークンを失効（削除）する（RFC 7009）。未知でも no-op。
+    async fn revoke_access_token(&self, token: &str);
+    /// mandate の単回消費。`mandate_consumed: false → true` を CAS で 1 回だけ成功させる。
+    /// 成功: Ok(true)、既消費/無効トークン: Ok(false)。
+    async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String>;
 
     async fn save_refresh_token(&self, t: RefreshToken);
     /// リフレッシュトークンは使用時にローテーション（取得と同時に削除）。
     async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken>;
+    /// 消費せず参照する（失効時の所有者確認用）。
+    async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken>;
+    /// リフレッシュトークンを失効（削除）する（RFC 7009）。未知でも no-op。
+    async fn revoke_refresh_token(&self, token: &str);
 
     /// sub からアカウントを解決。未登録なら自動生成する（PoC 用）。
     async fn find_account(&self, sub: &str) -> Account;
@@ -109,11 +118,30 @@ impl Store for MemoryStore {
     async fn get_access_token(&self, token: &str) -> Option<AccessToken> {
         self.access_tokens.lock().unwrap().get(token).cloned()
     }
+    async fn revoke_access_token(&self, token: &str) {
+        self.access_tokens.lock().unwrap().remove(token);
+    }
+    async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String> {
+        let mut map = self.access_tokens.lock().unwrap();
+        match map.get_mut(token) {
+            Some(at) if !at.mandate_consumed => {
+                at.mandate_consumed = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
     async fn save_refresh_token(&self, t: RefreshToken) {
         self.refresh_tokens.lock().unwrap().insert(t.token.clone(), t);
     }
     async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken> {
         self.refresh_tokens.lock().unwrap().remove(token)
+    }
+    async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken> {
+        self.refresh_tokens.lock().unwrap().get(token).cloned()
+    }
+    async fn revoke_refresh_token(&self, token: &str) {
+        self.refresh_tokens.lock().unwrap().remove(token);
     }
     async fn find_account(&self, sub: &str) -> Account {
         account_for(sub)
@@ -184,12 +212,26 @@ mod tests {
             auth_time: 0,
             acr: None,
             dpop_jkt: None,
+            resource: None,
             expires_at: u64::MAX,
         }
     }
 
     fn at(t: &str) -> AccessToken {
-        AccessToken { token: t.into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), jkt: None }
+        AccessToken { token: t.into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), jkt: None, aud: None, acr: None, auth_time: None, authorization_details: None, mandate_consumed: false }
+    }
+
+    #[tokio::test]
+    async fn consume_mandate_is_single_use() {
+        let s = MemoryStore::default();
+        s.save_access_token(at("AT1")).await;
+        // 初回成功、2 回目以降は失敗（先勝ち）。
+        assert!(s.consume_mandate_if_unused("AT1").await.unwrap());
+        assert!(!s.consume_mandate_if_unused("AT1").await.unwrap());
+        // 未知トークンも false。
+        assert!(!s.consume_mandate_if_unused("UNKNOWN").await.unwrap());
+        // 消費フラグが永続化されている。
+        assert!(s.get_access_token("AT1").await.unwrap().mandate_consumed);
     }
 
     #[tokio::test]
@@ -197,7 +239,7 @@ mod tests {
         let s = MemoryStore::default();
         s.save_code(code("C1")).await;
         s.save_access_token(at("AT1")).await;
-        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into() }).await;
+        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, acr: None, auth_time: None }).await;
         s.link_issued_tokens("C1", "AT1", Some("RT1")).await;
 
         // 初回消費は成功し、発行トークンは生きている。
@@ -214,5 +256,28 @@ mod tests {
     async fn unknown_code_returns_none() {
         let s = MemoryStore::default();
         assert!(s.take_code("nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn revoke_access_token_removes_it() {
+        let s = MemoryStore::default();
+        s.save_access_token(at("AT1")).await;
+        assert!(s.get_access_token("AT1").await.is_some());
+        s.revoke_access_token("AT1").await;
+        assert!(s.get_access_token("AT1").await.is_none());
+        // 未知トークンの失効は no-op（パニックしない）。
+        s.revoke_access_token("nope").await;
+    }
+
+    #[tokio::test]
+    async fn get_refresh_token_peeks_without_consuming() {
+        let s = MemoryStore::default();
+        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, acr: None, auth_time: None }).await;
+        // peek は消費しない。
+        assert!(s.get_refresh_token("RT1").await.is_some());
+        assert!(s.get_refresh_token("RT1").await.is_some());
+        // revoke で消える。
+        s.revoke_refresh_token("RT1").await;
+        assert!(s.get_refresh_token("RT1").await.is_none());
     }
 }

@@ -1,6 +1,7 @@
 //! JWS 署名の概念トレイトと、ES256(P-256) のピュア Rust 実装。
 //! 後で RS256/PS256/EdDSA を足す時はこのトレイトに impl を増やすだけ。
 
+use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -11,10 +12,12 @@ pub fn b64url(bytes: impl AsRef<[u8]>) -> String {
 }
 
 /// 署名鍵の概念。alg / 署名 / 公開 JWK を提供する。
+/// sign は async（Cloud KMS 実装がネットワーク署名するため）。ローカル鍵実装は即時 return。
+#[async_trait]
 pub trait JwsSigner: Send + Sync {
     fn alg(&self) -> &str;
     /// claims を JWS Compact Serialization (header.payload.signature) で署名する。
-    fn sign(&self, claims: &serde_json::Value) -> String;
+    async fn sign(&self, claims: &serde_json::Value) -> String;
     /// /jwks で公開する 1 鍵分の JWK。
     fn public_jwk(&self) -> serde_json::Value;
 }
@@ -57,11 +60,12 @@ fn thumbprint(x: &str, y: &str) -> String {
     crate::es256::jwk_thumbprint_p256(x, y)
 }
 
+#[async_trait]
 impl JwsSigner for Es256Signer {
     fn alg(&self) -> &str {
         "ES256"
     }
-    fn sign(&self, claims: &serde_json::Value) -> String {
+    async fn sign(&self, claims: &serde_json::Value) -> String {
         let header = serde_json::json!({ "alg": "ES256", "typ": "JWT", "kid": self.kid });
         let header_b64 = b64url(header.to_string());
         let payload_b64 = b64url(claims.to_string());
@@ -116,11 +120,12 @@ impl Rs256Signer {
     }
 }
 
+#[async_trait]
 impl JwsSigner for Rs256Signer {
     fn alg(&self) -> &str {
         "RS256"
     }
-    fn sign(&self, claims: &serde_json::Value) -> String {
+    async fn sign(&self, claims: &serde_json::Value) -> String {
         use sha2::Digest;
         let header = serde_json::json!({ "alg": "RS256", "typ": "JWT", "kid": self.kid });
         let signing_input = format!("{}.{}", b64url(header.to_string()), b64url(claims.to_string()));
@@ -160,11 +165,11 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn sign_produces_verifiable_compact_jws() {
+    #[tokio::test]
+    async fn sign_produces_verifiable_compact_jws() {
         let signer = Es256Signer::generate();
         let claims = serde_json::json!({"sub": "alice", "iss": "https://op.example"});
-        let jwt = signer.sign(&claims);
+        let jwt = signer.sign(&claims).await;
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
 
@@ -185,10 +190,10 @@ mod tests {
         assert!(vk.verify(signing_input.as_bytes(), &sig).is_ok());
     }
 
-    #[test]
-    fn tampered_payload_fails_verification() {
+    #[tokio::test]
+    async fn tampered_payload_fails_verification() {
         let signer = Es256Signer::generate();
-        let jwt = signer.sign(&serde_json::json!({"sub": "alice"}));
+        let jwt = signer.sign(&serde_json::json!({"sub": "alice"})).await;
         let parts: Vec<&str> = jwt.split('.').collect();
         // payload を別物に差し替えると signing_input が変わり検証が落ちる。
         let forged_payload = b64url(serde_json::json!({"sub": "attacker"}).to_string());
@@ -219,13 +224,13 @@ mod tests {
         assert_eq!(signer.kid, crate::es256::jwk_thumbprint_p256(&signer.x, &signer.y));
     }
 
-    #[test]
-    fn rs256_sign_produces_verifiable_jws() {
+    #[tokio::test]
+    async fn rs256_sign_produces_verifiable_jws() {
         use rsa::traits::PublicKeyParts;
         use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
         use sha2::Digest;
         let signer = Rs256Signer::generate();
-        let jwt = signer.sign(&serde_json::json!({"sub": "alice"}));
+        let jwt = signer.sign(&serde_json::json!({"sub": "alice"})).await;
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
         let header: serde_json::Value = serde_json::from_slice(&b64d(parts[0])).unwrap();

@@ -31,6 +31,11 @@ pub fn field_u64(fields: &Value, name: &str) -> Option<u64> {
     fields.get(name)?.get("integerValue")?.as_str()?.parse().ok()
 }
 
+/// fields から bool。未存在は None（呼び出し側が unwrap_or(false) する）。
+pub fn field_bool(fields: &Value, name: &str) -> Option<bool> {
+    fields.get(name)?.get("booleanValue")?.as_bool()
+}
+
 /// fields から timestampValue を epoch 秒で。
 pub fn field_ts_secs(fields: &Value, name: &str) -> Option<u64> {
     Some(parse_rfc3339_secs(
@@ -180,6 +185,122 @@ impl Firestore {
         }
         let j: Value = r.json().await.map_err(|e| format!("get json: {e}"))?;
         Ok(j.get("fields").cloned())
+    }
+
+    /// fields と updateTime を返す（楽観ロック用）。
+    pub async fn get_doc_with_update_time(
+        &self,
+        col: &str,
+        id: &str,
+    ) -> Result<Option<(Value, String)>, String> {
+        let tok = self.token().await?;
+        let r = self
+            .http
+            .get(self.doc_url(col, id))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .map_err(|e| format!("get: {e}"))?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !r.status().is_success() {
+            return Err(format!("get {}", r.status()));
+        }
+        let j: Value = r.json().await.map_err(|e| format!("get json: {e}"))?;
+        let fields = j.get("fields").cloned().unwrap_or(Value::Null);
+        let update_time = j.get("updateTime").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Ok(Some((fields, update_time)))
+    }
+
+    /// updateTime が一致するときだけ全体置換する（compare-and-set）。
+    /// 一致＝成功で Ok(true)、別の書き込みで更新済み（FAILED_PRECONDITION）なら Ok(false)。
+    /// CIBA の「先勝ち」状態遷移に使う。
+    pub async fn set_doc_if_unchanged(
+        &self,
+        col: &str,
+        id: &str,
+        fields: Value,
+        update_time: &str,
+    ) -> Result<bool, String> {
+        let tok = self.token().await?;
+        let r = self
+            .http
+            .patch(self.doc_url(col, id))
+            .query(&[("currentDocument.updateTime", update_time)])
+            .bearer_auth(tok)
+            .json(&json!({ "fields": fields }))
+            .send()
+            .await
+            .map_err(|e| format!("cas: {e}"))?;
+        if r.status().is_success() {
+            return Ok(true);
+        }
+        // updateTime 不一致（他者が先に更新）は FAILED_PRECONDITION（400/409）。レースに負けた。
+        if r.status() == reqwest::StatusCode::BAD_REQUEST
+            || r.status() == reqwest::StatusCode::CONFLICT
+            || r.status() == reqwest::StatusCode::PRECONDITION_FAILED
+        {
+            return Ok(false);
+        }
+        Err(format!("cas {}", r.status()))
+    }
+
+    /// ドキュメントが存在しないときだけ作成する（atomic な単回作成）。
+    /// 作成できたら Ok(true)、既に存在（ALREADY_EXISTS / FAILED_PRECONDITION）なら Ok(false)。
+    /// jti / nonce の分散リプレイ防止に使う（インスタンス跨ぎで単回を保証）。
+    pub async fn create_if_absent(&self, col: &str, id: &str, fields: Value) -> Result<bool, String> {
+        let tok = self.token().await?;
+        let r = self
+            .http
+            .patch(self.doc_url(col, id))
+            .query(&[("currentDocument.exists", "false")])
+            .bearer_auth(tok)
+            .json(&json!({ "fields": fields }))
+            .send()
+            .await
+            .map_err(|e| format!("create_if_absent: {e}"))?;
+        if r.status().is_success() {
+            return Ok(true);
+        }
+        if r.status() == reqwest::StatusCode::BAD_REQUEST
+            || r.status() == reqwest::StatusCode::CONFLICT
+            || r.status() == reqwest::StatusCode::PRECONDITION_FAILED
+        {
+            return Ok(false);
+        }
+        Err(format!("create_if_absent {}", r.status()))
+    }
+
+    /// updateTime が一致するときだけ削除する（compare-and-set 削除）。
+    /// 削除できたら Ok(true)、他者が先に更新/削除（FAILED_PRECONDITION / NOT_FOUND）なら Ok(false)。
+    /// CIBA poll の「承認の単回消費」を原子的に行うために使う。
+    pub async fn delete_doc_if_unchanged(
+        &self,
+        col: &str,
+        id: &str,
+        update_time: &str,
+    ) -> Result<bool, String> {
+        let tok = self.token().await?;
+        let r = self
+            .http
+            .delete(self.doc_url(col, id))
+            .query(&[("currentDocument.updateTime", update_time)])
+            .bearer_auth(tok)
+            .send()
+            .await
+            .map_err(|e| format!("cas delete: {e}"))?;
+        if r.status().is_success() {
+            return Ok(true);
+        }
+        if r.status() == reqwest::StatusCode::BAD_REQUEST
+            || r.status() == reqwest::StatusCode::CONFLICT
+            || r.status() == reqwest::StatusCode::PRECONDITION_FAILED
+            || r.status() == reqwest::StatusCode::NOT_FOUND
+        {
+            return Ok(false);
+        }
+        Err(format!("cas delete {}", r.status()))
     }
 
     /// 単一フィールド完全一致のクエリ。各ドキュメントの (id, fields) を返す。

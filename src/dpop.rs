@@ -2,20 +2,22 @@
 //! proof は JWS Compact（ES256, 署名は raw r||s 64byte）。WebAuthn の DER とは別。
 
 use crate::es256;
+use crate::nonce::NonceStore;
+use async_trait::async_trait;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::Signature;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 const IAT_SKEW_SECS: i64 = 60;
 const JTI_TTL: Duration = Duration::from_secs(300);
 
+#[async_trait]
 pub trait DpopVerifier: Send + Sync {
     /// proof を検証し、成功時に jkt (JWK SHA-256 Thumbprint) を返す。
     /// expected_ath は resource(userinfo) 検証時のみ Some。
-    fn verify(
+    async fn verify(
         &self,
         proof: &str,
         htm: &str,
@@ -43,17 +45,25 @@ fn strip_query_fragment(u: &str) -> &str {
 }
 
 pub struct Es256Dpop {
-    seen_jti: Mutex<HashMap<String, Instant>>,
+    jti: NonceStore,
 }
 
 impl Default for Es256Dpop {
     fn default() -> Self {
-        Self { seen_jti: Mutex::new(HashMap::new()) }
+        Self { jti: NonceStore::memory() }
     }
 }
 
+impl Es256Dpop {
+    /// 本番: Firestore 連携で jti をインスタンス跨ぎで単回化する。
+    pub fn with_store(fs: Arc<crate::firestore::Firestore>) -> Self {
+        Self { jti: NonceStore::firestore(fs) }
+    }
+}
+
+#[async_trait]
 impl DpopVerifier for Es256Dpop {
-    fn verify(
+    async fn verify(
         &self,
         proof: &str,
         htm: &str,
@@ -113,14 +123,9 @@ impl DpopVerifier for Es256Dpop {
             }
         }
         let jti = payload.get("jti").and_then(|v| v.as_str()).ok_or("jti missing")?;
-        {
-            let mut seen = self.seen_jti.lock().unwrap();
-            let now = Instant::now();
-            seen.retain(|_, exp| *exp > now);
-            if seen.contains_key(jti) {
-                return Err("jti replay".into());
-            }
-            seen.insert(jti.to_string(), now + JTI_TTL);
+        // DPoP と client_assertion で名前空間を分け、jti 文字列の偶発衝突を避ける。
+        if !self.jti.claim(&format!("dpop:{jti}"), JTI_TTL).await {
+            return Err("jti replay".into());
         }
 
         Ok(es256::jwk_thumbprint_p256(x, y))
@@ -164,113 +169,113 @@ mod tests {
     const HTM: &str = "POST";
     const HTU: &str = "https://op.example/token";
 
-    #[test]
-    fn valid_proof_returns_jkt() {
+    #[tokio::test]
+    async fn valid_proof_returns_jkt() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let proof = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs()));
-        let jkt = v.verify(&proof, HTM, HTU, None).unwrap();
+        let jkt = v.verify(&proof, HTM, HTU, None).await.unwrap();
         // 返る jkt は埋め込み鍵の thumbprint。
         let pj = pub_jwk(&key);
         assert_eq!(jkt, es256::jwk_thumbprint_p256(pj["x"].as_str().unwrap(), pj["y"].as_str().unwrap()));
     }
 
-    #[test]
-    fn rejects_non_compact() {
+    #[tokio::test]
+    async fn rejects_non_compact() {
         let v = Es256Dpop::default();
-        assert!(v.verify("only.two", HTM, HTU, None).is_err());
+        assert!(v.verify("only.two", HTM, HTU, None).await.is_err());
     }
 
-    #[test]
-    fn rejects_wrong_typ() {
+    #[tokio::test]
+    async fn rejects_wrong_typ() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let mut h = header(&key);
         h["typ"] = json!("jwt");
         let proof = make_proof(&key, &h, &payload(HTM, HTU, now_secs()));
-        assert!(v.verify(&proof, HTM, HTU, None).is_err());
+        assert!(v.verify(&proof, HTM, HTU, None).await.is_err());
     }
 
-    #[test]
-    fn rejects_wrong_alg() {
+    #[tokio::test]
+    async fn rejects_wrong_alg() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let mut h = header(&key);
         h["alg"] = json!("RS256");
         let proof = make_proof(&key, &h, &payload(HTM, HTU, now_secs()));
-        assert!(v.verify(&proof, HTM, HTU, None).is_err());
+        assert!(v.verify(&proof, HTM, HTU, None).await.is_err());
     }
 
-    #[test]
-    fn rejects_jwk_containing_private_key() {
+    #[tokio::test]
+    async fn rejects_jwk_containing_private_key() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let mut h = header(&key);
         h["jwk"]["d"] = json!("c29tZS1wcml2YXRl"); // 秘密成分混入
         let proof = make_proof(&key, &h, &payload(HTM, HTU, now_secs()));
-        assert!(v.verify(&proof, HTM, HTU, None).is_err());
+        assert!(v.verify(&proof, HTM, HTU, None).await.is_err());
     }
 
-    #[test]
-    fn rejects_htm_and_htu_mismatch() {
+    #[tokio::test]
+    async fn rejects_htm_and_htu_mismatch() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let proof = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs()));
-        assert!(v.verify(&proof, "GET", HTU, None).is_err()); // htm 不一致
+        assert!(v.verify(&proof, "GET", HTU, None).await.is_err()); // htm 不一致
         let proof2 = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs()));
-        assert!(v.verify(&proof2, HTM, "https://evil.example/token", None).is_err()); // htu 不一致
+        assert!(v.verify(&proof2, HTM, "https://evil.example/token", None).await.is_err()); // htu 不一致
     }
 
-    #[test]
-    fn rejects_iat_out_of_window() {
+    #[tokio::test]
+    async fn rejects_iat_out_of_window() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         // 過去側
         let past = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs() - 600));
-        assert!(v.verify(&past, HTM, HTU, None).is_err());
+        assert!(v.verify(&past, HTM, HTU, None).await.is_err());
         // 未来側（.abs() の両側を踏む）
         let future = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs() + 600));
-        assert!(v.verify(&future, HTM, HTU, None).is_err());
+        assert!(v.verify(&future, HTM, HTU, None).await.is_err());
     }
 
-    #[test]
-    fn htu_ignores_query_and_fragment() {
+    #[tokio::test]
+    async fn htu_ignores_query_and_fragment() {
         // RFC 9449 §4.3: proof の htu に query/fragment があっても、サーバ側 htu と
         // path まで一致すれば受理する。
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let htu_with_extra = format!("{HTU}?foo=bar#frag");
         let proof = make_proof(&key, &header(&key), &payload(HTM, &htu_with_extra, now_secs()));
-        assert!(v.verify(&proof, HTM, HTU, None).is_ok());
+        assert!(v.verify(&proof, HTM, HTU, None).await.is_ok());
     }
 
-    #[test]
-    fn ath_checked_when_expected() {
+    #[tokio::test]
+    async fn ath_checked_when_expected() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let token = "an-access-token";
         let mut pl = payload(HTM, HTU, now_secs());
         pl["ath"] = json!(ath(token));
         let proof = make_proof(&key, &header(&key), &pl);
-        assert!(v.verify(&proof, HTM, HTU, Some(&ath(token))).is_ok());
+        assert!(v.verify(&proof, HTM, HTU, Some(&ath(token))).await.is_ok());
         // ath を要求するのに proof に無い → 失敗。
         let proof2 = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs()));
-        assert!(v.verify(&proof2, HTM, HTU, Some(&ath(token))).is_err());
+        assert!(v.verify(&proof2, HTM, HTU, Some(&ath(token))).await.is_err());
     }
 
-    #[test]
-    fn rejects_jti_replay() {
+    #[tokio::test]
+    async fn rejects_jti_replay() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let pl = payload(HTM, HTU, now_secs()); // 同一 jti
         let proof = make_proof(&key, &header(&key), &pl);
-        assert!(v.verify(&proof, HTM, HTU, None).is_ok());
+        assert!(v.verify(&proof, HTM, HTU, None).await.is_ok());
         let proof_same = make_proof(&key, &header(&key), &pl);
-        assert!(v.verify(&proof_same, HTM, HTU, None).is_err()); // リプレイ
+        assert!(v.verify(&proof_same, HTM, HTU, None).await.is_err()); // リプレイ
     }
 
-    #[test]
-    fn rejects_tampered_signature() {
+    #[tokio::test]
+    async fn rejects_tampered_signature() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
         let proof = make_proof(&key, &header(&key), &payload(HTM, HTU, now_secs()));
@@ -278,11 +283,11 @@ mod tests {
         let parts: Vec<&str> = proof.split('.').collect();
         let forged_payload = es256::b64url_encode(payload(HTM, "https://evil.example/x", now_secs()).to_string());
         let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
-        assert!(v.verify(&forged, HTM, "https://evil.example/x", None).is_err());
+        assert!(v.verify(&forged, HTM, "https://evil.example/x", None).await.is_err());
     }
 
-    #[test]
-    fn rejects_proof_signed_by_different_key_than_embedded_jwk() {
+    #[tokio::test]
+    async fn rejects_proof_signed_by_different_key_than_embedded_jwk() {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let other = SigningKey::random(&mut rand_core::OsRng);
         let v = Es256Dpop::default();
@@ -294,6 +299,6 @@ mod tests {
         let signing_input = format!("{hh}.{pp}");
         let sig: Signature = other.sign(signing_input.as_bytes());
         let proof = format!("{signing_input}.{}", es256::b64url_encode(sig.to_bytes()));
-        assert!(v.verify(&proof, HTM, HTU, None).is_err());
+        assert!(v.verify(&proof, HTM, HTU, None).await.is_err());
     }
 }

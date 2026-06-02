@@ -60,6 +60,8 @@ pub struct AuthParams {
     pub code_challenge_method: Option<String>,
     /// DPoP key binding (RFC 9449 §10): 認可コード/トークンを特定 jkt に束縛する要求。
     pub dpop_jkt: Option<String>,
+    /// Resource Indicators (RFC 8707): トークンの対象リソース(API)。aud に束縛する。
+    pub resource: Option<String>,
 }
 
 /// ログイン待ちの認可リクエスト。node-oidc-provider の Interaction 相当。
@@ -99,6 +101,8 @@ pub struct AuthorizationCode {
     pub acr: Option<String>,
     /// DPoP key binding: PAR/authorize で dpop_jkt 指定時、token の proof jkt と一致必須。
     pub dpop_jkt: Option<String>,
+    /// Resource Indicators (RFC 8707): 発行されるトークンの aud に束縛するリソース。
+    pub resource: Option<String>,
     /// FAPI: 認可コードは短命。epoch 秒。
     pub expires_at: u64,
 }
@@ -112,6 +116,18 @@ pub struct AccessToken {
     pub scope: String,
     /// DPoP 束縛時の JWK Thumbprint（cnf.jkt）。
     pub jkt: Option<String>,
+    /// Resource Indicators (RFC 8707): トークンの aud（対象リソース）。
+    pub aud: Option<String>,
+    /// 認証コンテキスト（Step-up Authentication Challenge / RFC 9470 で RS が評価）。
+    pub acr: Option<String>,
+    pub auth_time: Option<u64>,
+    /// RFC 9396 authorization_details の JSON 配列を文字列で保持。
+    /// CIBA で承認された mandate を運ぶ。RS は /introspection 経由で受け取り、
+    /// リクエスト本体と照合する（MandatePolicy）。
+    pub authorization_details: Option<String>,
+    /// mandate の単回消費フラグ。/mandate/consume で false→true を CAS する。
+    /// RS は実行前に消費を試み、false なら mandate.already_consumed で弾く。
+    pub mandate_consumed: bool,
 }
 
 /// リフレッシュトークン。使用時にローテーション（消費して新規発行）する。
@@ -121,6 +137,11 @@ pub struct RefreshToken {
     pub client_id: String,
     pub account_id: String,
     pub scope: String,
+    /// Resource Indicators (RFC 8707): リフレッシュ後のトークンに引き継ぐ aud。
+    pub resource: Option<String>,
+    /// 認証コンテキスト。リフレッシュは再認証しないので元の値を引き継ぐ（auth_time は不変）。
+    pub acr: Option<String>,
+    pub auth_time: Option<u64>,
 }
 
 /// ユーザーアカウント。claims は OIDC の claim マップ。
@@ -141,4 +162,7 @@ pub struct TokenResponse {
     pub id_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+    /// RFC 9396: 発行したトークンに紐づく authorization_details（JSON 配列をそのまま）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_details: Option<serde_json::Value>,
 }

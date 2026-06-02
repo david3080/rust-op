@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const INTERACTION_TTL: u64 = 3600;
 const SESSION_TTL: u64 = 7 * 24 * 3600;
-const ACCESS_TTL: u64 = 3600;
+const ACCESS_TTL: u64 = 900;
 const REFRESH_TTL: u64 = 14 * 24 * 3600;
 
 fn now() -> u64 {
@@ -118,11 +118,17 @@ impl Store for FirestoreStore {
         if let Some(v) = &c.dpop_jkt {
             f["dpopJkt"] = fs_h::s(v);
         }
+        if let Some(v) = &c.resource {
+            f["resource"] = fs_h::s(v);
+        }
         let _ = self.fs.set_doc("authCodes", &c.code, f).await;
     }
 
     async fn take_code(&self, code: &str) -> Option<AuthorizationCode> {
-        let f = self.fs.get_doc("authCodes", code).await.ok()??;
+        // updateTime CAS で単回消費を原子化する。get→write の間に別リクエストが消費した
+        // 場合は CAS が負け、二重発行を防ぐ（consume_mandate_if_unused / CIBA と同型）。
+        let (mut f, update_time) =
+            self.fs.get_doc_with_update_time("authCodes", code).await.ok()??;
         let used = f
             .get("used")
             .and_then(|v| v.get("booleanValue"))
@@ -138,8 +144,12 @@ impl Store for FirestoreStore {
             }
             return None;
         }
-        // 初回消費: 削除せず used=true をマーク（後続の link_issued_tokens で発行トークンを記録）。
-        let _ = self.fs.merge_doc("authCodes", code, json!({ "used": fs_h::b(true) })).await;
+        // 初回消費: used=true を CAS で書く。並行消費に負けたら（Ok(false)/Err）None を返す。
+        f["used"] = fs_h::b(true);
+        match self.fs.set_doc_if_unchanged("authCodes", code, f.clone(), &update_time).await {
+            Ok(true) => {}
+            _ => return None,
+        }
         // 期限チェックは grant 側（code.expires_at）。ここでは復元のみ。
         Some(AuthorizationCode {
             code: code.to_string(),
@@ -153,6 +163,7 @@ impl Store for FirestoreStore {
             auth_time: fs_h::field_u64(&f, "authTime").unwrap_or(0),
             acr: fs_h::field_str(&f, "acr").map(str::to_string),
             dpop_jkt: fs_h::field_str(&f, "dpopJkt").map(str::to_string),
+            resource: fs_h::field_str(&f, "resource").map(str::to_string),
             expires_at: fs_h::field_ts_secs(&f, "expiresAt").unwrap_or(0),
         })
     }
@@ -175,6 +186,21 @@ impl Store for FirestoreStore {
         if let Some(jkt) = &t.jkt {
             f["jkt"] = fs_h::s(jkt);
         }
+        if let Some(aud) = &t.aud {
+            f["aud"] = fs_h::s(aud);
+        }
+        if let Some(acr) = &t.acr {
+            f["acr"] = fs_h::s(acr);
+        }
+        if let Some(at) = t.auth_time {
+            f["authTime"] = fs_h::int(at);
+        }
+        if let Some(ad) = &t.authorization_details {
+            f["authorizationDetails"] = fs_h::s(ad);
+        }
+        if t.mandate_consumed {
+            f["mandateConsumed"] = fs_h::b(true);
+        }
         let _ = self.fs.set_doc("accessTokens", &t.token, f).await;
     }
 
@@ -189,16 +215,58 @@ impl Store for FirestoreStore {
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
             jkt: fs_h::field_str(&f, "jkt").map(str::to_string),
+            aud: fs_h::field_str(&f, "aud").map(str::to_string),
+            acr: fs_h::field_str(&f, "acr").map(str::to_string),
+            auth_time: fs_h::field_u64(&f, "authTime"),
+            authorization_details: fs_h::field_str(&f, "authorizationDetails")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            mandate_consumed: fs_h::field_bool(&f, "mandateConsumed").unwrap_or(false),
         })
     }
 
+    async fn revoke_access_token(&self, token: &str) {
+        let _ = self.fs.delete_doc("accessTokens", token).await;
+    }
+
+    /// updateTime CAS で mandate_consumed: false → true を 1 回だけ成功させる。
+    async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String> {
+        let (mut f, update_time) = match self
+            .fs
+            .get_doc_with_update_time("accessTokens", token)
+            .await?
+        {
+            Some(x) => x,
+            None => return Ok(false),
+        };
+        if doc_expired(&f) {
+            return Ok(false);
+        }
+        if fs_h::field_bool(&f, "mandateConsumed").unwrap_or(false) {
+            return Ok(false);
+        }
+        f["mandateConsumed"] = fs_h::b(true);
+        self.fs
+            .set_doc_if_unchanged("accessTokens", token, f, &update_time)
+            .await
+    }
+
     async fn save_refresh_token(&self, t: RefreshToken) {
-        let f = json!({
+        let mut f = json!({
             "clientId": fs_h::s(&t.client_id),
             "accountId": fs_h::s(&t.account_id),
             "scope": fs_h::s(&t.scope),
             "expiresAt": fs_h::ts(&fs_h::rfc3339(now() + REFRESH_TTL)),
         });
+        if let Some(r) = &t.resource {
+            f["resource"] = fs_h::s(r);
+        }
+        if let Some(acr) = &t.acr {
+            f["acr"] = fs_h::s(acr);
+        }
+        if let Some(at) = t.auth_time {
+            f["authTime"] = fs_h::int(at);
+        }
         let _ = self.fs.set_doc("refreshTokens", &t.token, f).await;
     }
 
@@ -213,7 +281,30 @@ impl Store for FirestoreStore {
             client_id: fs_h::field_str(&f, "clientId").unwrap_or("").to_string(),
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
+            resource: fs_h::field_str(&f, "resource").map(str::to_string),
+            acr: fs_h::field_str(&f, "acr").map(str::to_string),
+            auth_time: fs_h::field_u64(&f, "authTime"),
         })
+    }
+
+    async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken> {
+        let f = self.fs.get_doc("refreshTokens", token).await.ok()??;
+        if doc_expired(&f) {
+            return None;
+        }
+        Some(RefreshToken {
+            token: token.to_string(),
+            client_id: fs_h::field_str(&f, "clientId").unwrap_or("").to_string(),
+            account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
+            scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
+            resource: fs_h::field_str(&f, "resource").map(str::to_string),
+            acr: fs_h::field_str(&f, "acr").map(str::to_string),
+            auth_time: fs_h::field_u64(&f, "authTime"),
+        })
+    }
+
+    async fn revoke_refresh_token(&self, token: &str) {
+        let _ = self.fs.delete_doc("refreshTokens", token).await;
     }
 
     async fn find_account(&self, sub: &str) -> Account {

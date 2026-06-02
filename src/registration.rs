@@ -1,5 +1,5 @@
 //! メール確認つき passkey 登録の永続化。Firestore を使う。
-//! - emailChallenges/{token}: メール所有確認待ち（email, expiresAt）。15分・単回。
+//! - emailChallenges/{token}: メール所有確認待ち（email, expiresAt）。30分・単回。
 //! - webauthnChallenges/{challenge}: passkey セレモニーのチャレンジ（email, kind, uid, expiresAt）。5分・単回。
 //! - accounts/{email}: 確認済みユーザー + passkey（credentialId, pubX, pubY, signCount, ...）。
 
@@ -10,7 +10,9 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const EMAIL_TTL_SECS: u64 = 15 * 60;
+// メール送信 → アプリ起動 → verify-email → options → Face ID → verify までを許容できる
+// 余裕のある TTL。短すぎると passkey 作成中にトークン失効で 400 になる。
+const EMAIL_TTL_SECS: u64 = 30 * 60;
 const CEREMONY_TTL_SECS: u64 = 5 * 60;
 
 fn now() -> u64 {
