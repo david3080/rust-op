@@ -27,8 +27,9 @@ impl NonceStore {
 
     /// `key` を単回で claim する。初出（fresh）なら true、既出（replay）なら false。
     /// `ttl` は in-memory の保持期間 / Firestore の expiresAt 算出に使う。
-    /// Firestore エラー時は **fail-open（true=許可）**：可用性を優先し、in-memory 相当の
-    /// 防御（= iat 窓 60 秒）にデグレードさせる（リプレイ防止は best-effort のハードニング）。
+    /// Firestore エラー時は **fail-closed（false=拒否）**：単回性を確認できない以上、
+    /// リプレイの可能性を排除できないため拒否する（#3 署名鍵 fail-closed と同じ方針）。
+    /// 不変量: claim が true を返したなら、ストアが健全な限りその key は初出である。
     pub async fn claim(&self, key: &str, ttl: Duration) -> bool {
         match self {
             NonceStore::Memory(m) => {
@@ -48,8 +49,11 @@ impl NonceStore {
                 match fs.create_if_absent("nonces", key, fields).await {
                     Ok(created) => created, // created=true は初出、false は既存=replay
                     Err(e) => {
-                        tracing::warn!("nonce store error ({e}); fail-open");
-                        true
+                        // fail-closed: ストアに問い合わせできない＝単回性を確認できない以上、
+                        // リプレイの可能性を排除できないので拒否する。true(fail-open)だと
+                        // Firestore 障害中にリプレイ防止がサイレント無効化される。#3 と同方針。
+                        tracing::error!("nonce store error ({e}); fail-closed (rejecting)");
+                        false
                     }
                 }
             }
