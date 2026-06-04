@@ -8,6 +8,10 @@ use crate::provider::Provider;
 use async_trait::async_trait;
 use subtle::ConstantTimeEq;
 
+/// client_assertion の最大有効期間（秒）。これを超える exp は拒否し、jti をこの上限まで
+/// 覚えればリプレイ窓を塞げる（FAPI2 は短命な client_assertion を推奨）。request_object と同値。
+const MAX_ASSERTION_LIFETIME_SECS: i64 = 3600;
+
 /// client_secret の定数時間比較（タイミング攻撃対策）。
 fn secret_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
@@ -193,9 +197,14 @@ impl ClientAuthMethod for PrivateKeyJwt {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        match payload.get("exp").and_then(|v| v.as_i64()) {
-            Some(exp) if exp > now => {}
+        let exp = match payload.get("exp").and_then(|v| v.as_i64()) {
+            Some(exp) if exp > now => exp,
             _ => return Err(bad("assertion expired")),
+        };
+        // exp に上限を課す。上限が無いと、長命な assertion を jti 失効(後述)後〜exp の窓で
+        // リプレイでき、また jti を exp まで覚える際の保持期間も無制限になる。
+        if exp > now + MAX_ASSERTION_LIFETIME_SECS {
+            return Err(bad("assertion exp is too far in the future"));
         }
         // nbf 検証: 大きく未来の nbf は拒否（FAPI2: 60 秒超の clock skew は不可）。
         if let Some(nbf) = payload.get("nbf").and_then(|v| v.as_i64()) {
@@ -209,7 +218,10 @@ impl ClientAuthMethod for PrivateKeyJwt {
         if jti.is_empty() {
             return Err(bad("assertion jti missing"));
         }
-        if !self.jti.claim(&format!("cjwt:{jti}"), std::time::Duration::from_secs(300)).await {
+        // jti を assertion の有効期間いっぱい（exp まで）覚える。固定 300s だと exp > now+300 の
+        // とき、jti 失効後〜exp の窓で同一 assertion をリプレイできていた。上限は exp 検証で担保。
+        let jti_ttl = std::time::Duration::from_secs((exp - now).max(0) as u64);
+        if !self.jti.claim(&format!("cjwt:{jti}"), jti_ttl).await {
             return Err(bad("assertion jti replay"));
         }
 
@@ -362,6 +374,22 @@ mod tests {
         c2["exp"] = serde_json::json!(1000);
         let expired = assertion(&key, "k1", "ES256", c2);
         assert!(auth.authenticate(&p, &input(Some(&expired), None, None)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pkjwt_rejects_exp_too_far_in_future() {
+        // exp が上限(60分)を超える assertion は拒否する（#6 回帰）。
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let p = provider().with_client(pkjwt_client("rp", &key, "k1"));
+        let auth = PrivateKeyJwt::default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut c = good_claims("rp", "far");
+        c["exp"] = serde_json::json!(now + 7200); // 2h > 上限1h
+        let far = assertion(&key, "k1", "ES256", c);
+        assert!(auth.authenticate(&p, &input(Some(&far), None, None)).await.is_err());
     }
 
     #[tokio::test]
