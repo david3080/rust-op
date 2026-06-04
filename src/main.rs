@@ -204,8 +204,9 @@ async fn main() {
             .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
             .unwrap_or_else(|_| "fido2-8b943".into());
         let fs = std::sync::Arc::new(firestore::Firestore::new(project));
-        // 署名鍵 ES256: KMS_ES256_KEY があれば Cloud KMS で署名（秘密鍵をプロセスに展開しない）。
-        // 無ければ Secret Manager の固定鍵、それも無ければ起動ごとの一時鍵にフォールバック。
+        // 署名鍵 ES256: KMS_ES256_KEY があれば Cloud KMS（秘密鍵をプロセスに展開しない）、
+        // 無ければ Secret Manager の固定鍵。本番(K_SERVICE)ではどちらからも正規鍵を
+        // ロードできなければ起動を中止する（起動ごとの一時鍵での縮退運用を禁止）。
         let es_kms: Option<std::sync::Arc<dyn jws::JwsSigner>> = match std::env::var("KMS_ES256_KEY") {
             Ok(key) => match kms::KmsSigner::es256(fs.clone(), &key).await {
                 Ok(s) => {
@@ -219,24 +220,40 @@ async fn main() {
             },
             Err(_) => None,
         };
-        if let Some(s) = es_kms {
+        let es_loaded = if let Some(s) = es_kms {
             provider = provider.with_signer(s);
+            true
         } else {
             match fs.access_secret("oidc-signing-key-es256").await {
                 Ok(Some(scalar)) => match jws::Es256Signer::from_scalar_b64(&scalar) {
                     Ok(signer) => {
                         tracing::info!("loaded ES256 signing key from Secret Manager");
                         provider = provider.with_signer(std::sync::Arc::new(signer));
+                        true
                     }
                     Err(e) => {
-                        tracing::error!("signing key from secret invalid ({e}); using ephemeral key")
+                        tracing::error!("ES256 key from Secret Manager invalid: {e}");
+                        false
                     }
                 },
-                Ok(None) => tracing::warn!("signing key secret not found; using ephemeral key"),
-                Err(e) => tracing::error!("secret access failed ({e}); using ephemeral key"),
+                Ok(None) => {
+                    tracing::error!("ES256 signing key not found in KMS or Secret Manager");
+                    false
+                }
+                Err(e) => {
+                    tracing::error!("ES256 secret access failed: {e}");
+                    false
+                }
             }
+        };
+        if !es_loaded {
+            tracing::error!(
+                "FATAL: no production ES256 signing key available; refusing to start with an ephemeral key"
+            );
+            std::process::exit(1);
         }
         // RS256（OIDC Core §15.1 必須）: KMS_RS256_KEY 優先、無ければ Secret Manager。
+        // ES256 と同じく、本番では正規鍵をロードできなければ起動を中止する。
         let rs_kms: Option<std::sync::Arc<dyn jws::JwsSigner>> = match std::env::var("KMS_RS256_KEY") {
             Ok(key) => match kms::KmsSigner::rs256(fs.clone(), &key).await {
                 Ok(s) => {
@@ -250,23 +267,37 @@ async fn main() {
             },
             Err(_) => None,
         };
-        if let Some(s) = rs_kms {
+        let rs_loaded = if let Some(s) = rs_kms {
             provider = provider.add_signer(s);
+            true
         } else {
             match fs.access_secret("oidc-signing-key-rs256").await {
                 Ok(Some(pem)) => match jws::Rs256Signer::from_pkcs8_pem(&pem) {
                     Ok(signer) => {
                         tracing::info!("loaded RS256 signing key from Secret Manager");
                         provider = provider.add_signer(std::sync::Arc::new(signer));
+                        true
                     }
-                    Err(e) => tracing::error!("RS256 key from secret invalid ({e}); skipping RS256"),
+                    Err(e) => {
+                        tracing::error!("RS256 key from Secret Manager invalid: {e}");
+                        false
+                    }
                 },
                 Ok(None) => {
-                    tracing::warn!("RS256 key secret not found; generating ephemeral RS256 key");
-                    provider = provider.add_signer(std::sync::Arc::new(jws::Rs256Signer::generate()));
+                    tracing::error!("RS256 signing key not found in KMS or Secret Manager");
+                    false
                 }
-                Err(e) => tracing::error!("RS256 secret access failed ({e}); skipping RS256"),
+                Err(e) => {
+                    tracing::error!("RS256 secret access failed: {e}");
+                    false
+                }
             }
+        };
+        if !rs_loaded {
+            tracing::error!(
+                "FATAL: no production RS256 signing key available; refusing to start with an ephemeral key"
+            );
+            std::process::exit(1);
         }
         // jti リプレイ防止を Firestore に分散化（インスタンス跨ぎで単回を保証）。
         provider =

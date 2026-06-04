@@ -96,6 +96,8 @@ pub struct Rs256Signer {
 }
 
 impl Rs256Signer {
+    /// テスト専用の一時鍵生成。本番経路から参照できないよう cfg(test) で隔離する。
+    #[cfg(test)]
     pub fn generate() -> Self {
         let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
         Self::from_key(key)
