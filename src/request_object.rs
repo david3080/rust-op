@@ -92,15 +92,27 @@ pub fn verify(client: &Client, jwt: &str, issuer: &str) -> Result<HashMap<String
         return Err(bad("request object missing jti"));
     }
 
-    // 文字列クレームを認可パラメータとして取り出す（envelope は除く）。
+    // クレームを認可パラメータとして取り出す（envelope は除く）。
+    // 文字列はそのまま。authorization_details(RAR=JSON配列) や claims(JSONオブジェクト) 等の
+    // 非文字列は JSON 文字列へシリアライズして保持する。as_str だけだと黙って欠落し、FAPI
+    // クライアントの mandate(authorization_details) が署名経路で失われていた。非署名(フォーム)
+    // 経路でもこれらは JSON 文字列で渡るため、ダウンストリームの扱いと整合する。
     let obj = payload.as_object().ok_or_else(|| bad("request object payload not an object"))?;
     let mut params = HashMap::new();
     for (k, v) in obj {
         if ENVELOPE_CLAIMS.contains(&k.as_str()) {
             continue;
         }
-        if let Some(s) = v.as_str() {
-            params.insert(k.clone(), s.to_string());
+        match v {
+            serde_json::Value::String(s) => {
+                params.insert(k.clone(), s.clone());
+            }
+            serde_json::Value::Null => {}
+            other => {
+                if let Ok(s) = serde_json::to_string(other) {
+                    params.insert(k.clone(), s);
+                }
+            }
         }
     }
     // client_id は必ず含める（claim に無くても解決済みの値で補完）。
@@ -174,6 +186,31 @@ mod tests {
         assert_eq!(p.get("state").map(String::as_str), Some("s1"));
         // envelope claims は含まれない。
         assert!(!p.contains_key("iss") && !p.contains_key("aud") && !p.contains_key("exp"));
+    }
+
+    #[test]
+    fn preserves_non_string_claims_as_json() {
+        // authorization_details(RAR=配列) / claims(オブジェクト) / max_age(数値) が
+        // 署名経路でも欠落せず、JSON 文字列として保持されることを確認する（#5 回帰）。
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let c = client_with_key(&key);
+        let mut pl = good_payload();
+        pl["authorization_details"] = json!([{"type": "payment_initiation", "amount": 100}]);
+        pl["claims"] = json!({"userinfo": {"email": null}});
+        pl["max_age"] = json!(300);
+        let p = verify(&c, &sign(&key, &good_header(), &pl), ISS).unwrap();
+        // authorization_details は JSON 文字列として保持され、配列へパースし直せる。
+        let ad: Value =
+            serde_json::from_str(p.get("authorization_details").expect("authz_details preserved")).unwrap();
+        assert_eq!(ad[0]["type"], "payment_initiation");
+        assert_eq!(ad[0]["amount"], 100);
+        // claims(オブジェクト)も保持される。
+        let claims: Value = serde_json::from_str(p.get("claims").expect("claims preserved")).unwrap();
+        assert!(claims["userinfo"].is_object());
+        // 数値(max_age)も保持される。
+        assert_eq!(p.get("max_age").map(String::as_str), Some("300"));
+        // 文字列クレームは従来どおり。
+        assert_eq!(p.get("scope").map(String::as_str), Some("openid"));
     }
 
     #[test]
