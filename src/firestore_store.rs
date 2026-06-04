@@ -271,8 +271,19 @@ impl Store for FirestoreStore {
     }
 
     async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken> {
-        let f = self.fs.get_doc("refreshTokens", token).await.ok()??;
-        let _ = self.fs.delete_doc("refreshTokens", token).await;
+        // updateTime CAS で単回消費を原子化する。get_doc + 無条件 delete だと、同一 RT の
+        // 並行リクエストが両方 get→delete に成功して両方 Some を返し、1 本の RT から
+        // トークンが二重発行される（ローテーションの破れ）。take_code / CIBA と同型に、
+        // 削除に成功した呼び出しだけが消費者になる（負け=Ok(false)/Err は None でフェイルクローズ）。
+        // 不変量: 同一 token への take_refresh_token が Some を返すのは高々 1 回。
+        let (f, update_time) =
+            self.fs.get_doc_with_update_time("refreshTokens", token).await.ok()??;
+        if !matches!(
+            self.fs.delete_doc_if_unchanged("refreshTokens", token, &update_time).await,
+            Ok(true)
+        ) {
+            return None;
+        }
         if doc_expired(&f) {
             return None;
         }
