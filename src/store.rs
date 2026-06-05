@@ -10,6 +10,9 @@ use std::sync::Mutex;
 pub trait Store: Send + Sync {
     async fn save_interaction(&self, i: Interaction);
     async fn get_interaction(&self, uid: &str) -> Option<Interaction>;
+    /// interaction を単回消費（削除）する。削除に成功（=この呼び出しが初回）したら true、
+    /// 既に無い（消費済み/未存在）なら false。authorize_resume で「1認証=1コード」を保証する。
+    async fn consume_interaction(&self, uid: &str) -> bool;
 
     async fn save_session(&self, s: Session);
     async fn get_session(&self, sid: &str) -> Option<Session>;
@@ -67,6 +70,9 @@ impl Store for MemoryStore {
     }
     async fn get_interaction(&self, uid: &str) -> Option<Interaction> {
         self.interactions.lock().unwrap().get(uid).cloned()
+    }
+    async fn consume_interaction(&self, uid: &str) -> bool {
+        self.interactions.lock().unwrap().remove(uid).is_some()
     }
     async fn save_session(&self, s: Session) {
         self.sessions.lock().unwrap().insert(s.sid.clone(), s);
@@ -279,5 +285,21 @@ mod tests {
         // revoke で消える。
         s.revoke_refresh_token("RT1").await;
         assert!(s.get_refresh_token("RT1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn consume_interaction_is_single_use() {
+        let s = MemoryStore::default();
+        s.save_interaction(Interaction {
+            uid: "U1".into(),
+            raw_query: String::new(),
+            account_id: Some("a".into()),
+            auth_time: None,
+            request_uri: None,
+        })
+        .await;
+        assert!(s.consume_interaction("U1").await); // 初回: 消費成功
+        assert!(!s.consume_interaction("U1").await); // 2回目: 既に無い（リプレイ拒否）
+        assert!(!s.consume_interaction("nope").await); // 未知も false
     }
 }
