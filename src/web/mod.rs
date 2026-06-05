@@ -38,10 +38,26 @@ fn password_login_enabled() -> bool {
     )
 }
 
+/// FIDO2 Conformance 用の /fido/* エンドポイントを公開するか。テスト専用。
+/// 本番（環境変数未設定）では無効化し、攻撃面（本番の実フローに非接続なテスト面）を排除する。
+/// FIDO2 Conformance を回すときだけ FIDO_CONFORMANCE_ENABLED=1 で有効化する。
+fn fido_conformance_enabled() -> bool {
+    matches!(
+        std::env::var("FIDO_CONFORMANCE_ENABLED").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 pub fn router(provider: Provider) -> Router {
     let base_path = provider.base_path.clone();
     // FIDO2 Conformance 用エンドポイントは base_path に依らずトップレベル /fido/* に置く。
-    let fido = crate::fido::router(Arc::new(crate::fido::FidoState::from_env()));
+    // テスト専用面（本番の実 passkey フローは /register・/interaction・/ciba 側）なので、
+    // 本番（FIDO_CONFORMANCE_ENABLED 未設定）では空 Router にしてマウントしない＝攻撃面を排除。
+    let fido = if fido_conformance_enabled() {
+        crate::fido::router(Arc::new(crate::fido::FidoState::from_env()))
+    } else {
+        Router::new()
+    };
     let shared = Arc::new(provider);
     let mut inner = Router::new()
         .route("/.well-known/openid-configuration", get(oidc::discovery))
