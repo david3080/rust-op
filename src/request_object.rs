@@ -6,6 +6,7 @@
 
 use crate::error::OAuthError;
 use crate::model::Client;
+use crate::nonce::NonceStore;
 use std::collections::HashMap;
 
 /// JWT envelope クレーム（パラメータとして扱わない）。
@@ -19,7 +20,13 @@ fn now() -> i64 {
 }
 
 /// signed request object(JWT, ES256) を検証し、認可パラメータの文字列マップを返す。
-pub fn verify(client: &Client, jwt: &str, issuer: &str) -> Result<HashMap<String, String>, OAuthError> {
+/// jti は単回（リプレイ防止）: jti_store で claim し、有効期間(exp まで)覚える。
+pub async fn verify(
+    client: &Client,
+    jwt: &str,
+    issuer: &str,
+    jti_store: &NonceStore,
+) -> Result<HashMap<String, String>, OAuthError> {
     let bad = |m: &str| OAuthError::InvalidRequest(m.to_string());
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
@@ -88,8 +95,16 @@ pub fn verify(client: &Client, jwt: &str, issuer: &str) -> Result<HashMap<String
     if payload.get("iat").and_then(|v| v.as_i64()).is_none() {
         return Err(bad("request object missing iat"));
     }
-    if payload.get("jti").and_then(|v| v.as_str()).map(str::is_empty).unwrap_or(true) {
+    let jti = payload.get("jti").and_then(|v| v.as_str()).unwrap_or("");
+    if jti.is_empty() {
         return Err(bad("request object missing jti"));
+    }
+    // jti 単回（リプレイ防止）。有効期間(exp まで)覚える。これが無いと署名済み request object を
+    // exp までの窓でリプレイできる（PAR 経由なら request_uri 単回で緩和されるが、直接 JAR 経路は
+    // ここでしか防げない）。jti TTL は exp 検証(<= now+3600)で上限が担保される。
+    let jti_ttl = std::time::Duration::from_secs((exp - now).max(0) as u64);
+    if !jti_store.claim(&format!("jar:{jti}"), jti_ttl).await {
+        return Err(bad("request object jti replay"));
     }
 
     // クレームを認可パラメータとして取り出す（envelope は除く）。
@@ -163,6 +178,15 @@ mod tests {
         super::now()
     }
 
+    /// テスト用: 毎回新しい memory jti ストアで verify を同期実行するラッパ。
+    fn verify_t(c: &Client, jwt: &str, issuer: &str) -> Result<HashMap<String, String>, OAuthError> {
+        let store = NonceStore::memory();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(verify(c, jwt, issuer, &store))
+    }
+
     fn good_payload() -> Value {
         json!({
             "iss": "cli-1", "aud": ISS, "exp": now() + 300, "nbf": now() - 5,
@@ -180,7 +204,7 @@ mod tests {
         let key = SigningKey::random(&mut rand_core::OsRng);
         let c = client_with_key(&key);
         let jwt = sign(&key, &good_header(), &good_payload());
-        let p = verify(&c, &jwt, ISS).unwrap();
+        let p = verify_t(&c, &jwt, ISS).unwrap();
         assert_eq!(p.get("response_type").map(String::as_str), Some("code"));
         assert_eq!(p.get("scope").map(String::as_str), Some("openid"));
         assert_eq!(p.get("state").map(String::as_str), Some("s1"));
@@ -198,7 +222,7 @@ mod tests {
         pl["authorization_details"] = json!([{"type": "payment_initiation", "amount": 100}]);
         pl["claims"] = json!({"userinfo": {"email": null}});
         pl["max_age"] = json!(300);
-        let p = verify(&c, &sign(&key, &good_header(), &pl), ISS).unwrap();
+        let p = verify_t(&c, &sign(&key, &good_header(), &pl), ISS).unwrap();
         // authorization_details は JSON 文字列として保持され、配列へパースし直せる。
         let ad: Value =
             serde_json::from_str(p.get("authorization_details").expect("authz_details preserved")).unwrap();
@@ -213,6 +237,18 @@ mod tests {
         assert_eq!(p.get("scope").map(String::as_str), Some("openid"));
     }
 
+    #[tokio::test]
+    async fn rejects_jti_replay() {
+        // 同一 jti の request object を同じストアで2回検証 → 2回目はリプレイ拒否（#7 回帰）。
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let c = client_with_key(&key);
+        let store = NonceStore::memory();
+        let jwt = sign(&key, &good_header(), &good_payload());
+        assert!(verify(&c, &jwt, ISS, &store).await.is_ok());
+        let jwt2 = sign(&key, &good_header(), &good_payload()); // 同じ jti "jti-1"
+        assert!(verify(&c, &jwt2, ISS, &store).await.is_err());
+    }
+
     #[test]
     fn rejects_alg_none() {
         let key = SigningKey::random(&mut rand_core::OsRng);
@@ -220,7 +256,7 @@ mod tests {
         let mut h = good_header();
         h["alg"] = json!("none");
         let jwt = sign(&key, &h, &good_payload());
-        assert!(verify(&c, &jwt, ISS).is_err());
+        assert!(verify_t(&c, &jwt, ISS).is_err());
     }
 
     #[test]
@@ -231,7 +267,7 @@ mod tests {
         let parts: Vec<&str> = jwt.split('.').collect();
         let forged = b64e(json!({"iss":"cli-1","aud":ISS,"exp":now()+300,"scope":"openid admin"}).to_string());
         let tampered = format!("{}.{}.{}", parts[0], forged, parts[2]);
-        assert!(verify(&c, &tampered, ISS).is_err());
+        assert!(verify_t(&c, &tampered, ISS).is_err());
     }
 
     #[test]
@@ -240,7 +276,7 @@ mod tests {
         let c = client_with_key(&key);
         let mut pl = good_payload();
         pl["iss"] = json!("other-client");
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
     }
 
     #[test]
@@ -249,7 +285,7 @@ mod tests {
         let c = client_with_key(&key);
         let mut pl = good_payload();
         pl["aud"] = json!("https://evil.example");
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
     }
 
     #[test]
@@ -258,7 +294,7 @@ mod tests {
         let c = client_with_key(&key);
         let mut pl = good_payload();
         pl["exp"] = json!(now() - 10);
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
     }
 
     #[test]
@@ -267,7 +303,7 @@ mod tests {
         let c = client_with_key(&key);
         let mut pl = good_payload();
         pl["exp"] = json!(now() + 3700); // > 60分
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
     }
 
     #[test]
@@ -277,15 +313,15 @@ mod tests {
         // 欠落
         let mut pl = good_payload();
         pl.as_object_mut().unwrap().remove("nbf");
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
         // 未来
         let mut pl = good_payload();
         pl["nbf"] = json!(now() + 600);
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
         // 60分超過去
         let mut pl = good_payload();
         pl["nbf"] = json!(now() - 4000);
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
     }
 
     #[test]
@@ -294,10 +330,10 @@ mod tests {
         let c = client_with_key(&key);
         let mut pl = good_payload();
         pl.as_object_mut().unwrap().remove("iat");
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
         let mut pl = good_payload();
         pl.as_object_mut().unwrap().remove("jti");
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_err());
     }
 
     #[test]
@@ -306,7 +342,7 @@ mod tests {
         let c = client_with_key(&key);
         let mut pl = good_payload();
         pl["aud"] = json!(["https://other", ISS]);
-        assert!(verify(&c, &sign(&key, &good_header(), &pl), ISS).is_ok());
+        assert!(verify_t(&c, &sign(&key, &good_header(), &pl), ISS).is_ok());
     }
 
     #[test]
@@ -315,7 +351,7 @@ mod tests {
         let c = client_with_key(&key);
         let mut h = good_header();
         h["kid"] = json!("unknown");
-        assert!(verify(&c, &sign(&key, &h, &good_payload()), ISS).is_err());
+        assert!(verify_t(&c, &sign(&key, &h, &good_payload()), ISS).is_err());
     }
 
     #[test]
@@ -324,6 +360,6 @@ mod tests {
         let other = SigningKey::random(&mut rand_core::OsRng);
         let c = client_with_key(&key);
         // 署名は other 鍵、kid は登録鍵 k1 → 検証失敗。
-        assert!(verify(&c, &sign(&other, &good_header(), &good_payload()), ISS).is_err());
+        assert!(verify_t(&c, &sign(&other, &good_header(), &good_payload()), ISS).is_err());
     }
 }

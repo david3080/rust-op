@@ -84,7 +84,7 @@ pub(super) async fn backchannel_auth(
     // JAR (FAPI-CIBA): signed request object を検証し以後のパラメータをその claims から取る。
     // private_key_jwt クライアントは signed request 必須（FAPI-CIBA）。
     let form = match form.get("request").cloned() {
-        Some(req) => match crate::request_object::verify(&client, &req, &p.issuer) {
+        Some(req) => match crate::request_object::verify(&client, &req, &p.issuer, &p.jar_jti).await {
             Ok(m) => m,
             Err(e) => return e.into_response(),
         },
