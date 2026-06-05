@@ -185,6 +185,11 @@ pub(super) async fn authorize_resume(
     }
     ctx.account_id = Some(account_id);
     ctx.auth_time = interaction.auth_time;
+    // 完了済み interaction を単回消費してからコード発行。失敗（既に消費＝リプレイ/二重投入）なら
+    // 再発行しない（1認証=1コード、PAR request_uri の単回化も保つ）。
+    if !p.store.consume_interaction(uid).await {
+        return plain_error("interaction already used");
+    }
     issue_code(&p, &ctx).await
 }
 

@@ -67,6 +67,19 @@ impl Store for FirestoreStore {
         })
     }
 
+    async fn consume_interaction(&self, uid: &str) -> bool {
+        // updateTime CAS で単回削除する。並行 resume / リプレイで高々 1 回だけ true を返す
+        // （take_code / CIBA と同型）。
+        let update_time = match self.fs.get_doc_with_update_time("interactions", uid).await {
+            Ok(Some((_, t))) => t,
+            _ => return false,
+        };
+        matches!(
+            self.fs.delete_doc_if_unchanged("interactions", uid, &update_time).await,
+            Ok(true)
+        )
+    }
+
     async fn save_session(&self, s: Session) {
         let f = json!({
             "accountId": fs_h::s(&s.account_id),
