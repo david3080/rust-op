@@ -38,6 +38,8 @@ pub struct Provider {
     pub register_rate: Arc<CibaRateLimiter>,
     pub mailer: Arc<dyn Mailer>,
     pub dpop: Arc<dyn DpopVerifier>,
+    /// JAR (request object) の jti 単回ストア。本番は Firestore（with_firestore で注入）。
+    pub jar_jti: crate::nonce::NonceStore,
     pub clients: HashMap<String, Client>,
     /// 順序が意味を持つので Vec。
     pub checks: Vec<Arc<dyn AuthorizationCheck>>,
@@ -86,6 +88,7 @@ impl Provider {
             // 1 時間に 5 通まで（同一 email / 同一 IP）。正常な登録では超えない。
             register_rate: Arc::new(CibaRateLimiter::new(std::time::Duration::from_secs(3600), 5)),
             dpop: Arc::new(Es256Dpop::default()),
+            jar_jti: crate::nonce::NonceStore::memory(),
             clients: HashMap::new(),
             checks,
             grants,
@@ -105,6 +108,8 @@ impl Provider {
     }
 
     pub fn with_firestore(mut self, fs: Arc<Firestore>) -> Self {
+        // JAR jti もインスタンス跨ぎで単回化する（DPoP / client_assertion と同様）。
+        self.jar_jti = crate::nonce::NonceStore::firestore(fs.clone());
         self.firestore = Some(fs);
         self
     }

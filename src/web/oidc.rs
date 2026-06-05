@@ -68,7 +68,7 @@ pub(super) async fn authorize(
             Some(c) => c,
             None => return plain_error("unknown client for request object"),
         };
-        match crate::request_object::verify(client, req, &p.issuer) {
+        match crate::request_object::verify(client, req, &p.issuer, &p.jar_jti).await {
             Ok(params) => serde_urlencoded::to_string(&params).unwrap_or_default(),
             Err(e) => return plain_error(&format!("invalid request object: {}", e.description())),
         }
@@ -579,7 +579,7 @@ pub(super) async fn par(State(p): State<Arc<Provider>>, headers: HeaderMap, body
     // JAR (RFC 9101): request object があれば検証し、保存パラメータをその claims で
     // 置き換える（以後の処理・/authorize は検証済みパラメータを使う）。
     let body = if let Some(req) = form.get("request") {
-        match crate::request_object::verify(&client, req, &p.issuer) {
+        match crate::request_object::verify(&client, req, &p.issuer, &p.jar_jti).await {
             Ok(params) => serde_urlencoded::to_string(&params).unwrap_or_default(),
             Err(e) => return e.into_response(),
         }
