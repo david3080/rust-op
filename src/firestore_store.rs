@@ -32,6 +32,17 @@ impl FirestoreStore {
     pub fn new(fs: Arc<Firestore>) -> Self {
         Self { fs }
     }
+
+    /// updateTime CAS で単回削除する。削除に成功（=この呼び出しが初回）したら削除直前の
+    /// fields を返す。並行リクエスト/リプレイでは高々 1 回だけ Some を返す（未存在/負け/Err は
+    /// None）。単回消費（RT ローテーション / interaction 消費）の唯一の原始操作。
+    async fn cas_take(&self, col: &str, id: &str) -> Option<Value> {
+        let (f, update_time) = self.fs.get_doc_with_update_time(col, id).await.ok()??;
+        match self.fs.delete_doc_if_unchanged(col, id, &update_time).await {
+            Ok(true) => Some(f),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
@@ -68,16 +79,8 @@ impl Store for FirestoreStore {
     }
 
     async fn consume_interaction(&self, uid: &str) -> bool {
-        // updateTime CAS で単回削除する。並行 resume / リプレイで高々 1 回だけ true を返す
-        // （take_code / CIBA と同型）。
-        let update_time = match self.fs.get_doc_with_update_time("interactions", uid).await {
-            Ok(Some((_, t))) => t,
-            _ => return false,
-        };
-        matches!(
-            self.fs.delete_doc_if_unchanged("interactions", uid, &update_time).await,
-            Ok(true)
-        )
+        // updateTime CAS で単回削除（並行 resume / リプレイで高々 1 回だけ成功）。
+        self.cas_take("interactions", uid).await.is_some()
     }
 
     async fn save_session(&self, s: Session) {
@@ -284,19 +287,10 @@ impl Store for FirestoreStore {
     }
 
     async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken> {
-        // updateTime CAS で単回消費を原子化する。get_doc + 無条件 delete だと、同一 RT の
-        // 並行リクエストが両方 get→delete に成功して両方 Some を返し、1 本の RT から
-        // トークンが二重発行される（ローテーションの破れ）。take_code / CIBA と同型に、
-        // 削除に成功した呼び出しだけが消費者になる（負け=Ok(false)/Err は None でフェイルクローズ）。
+        // 使用時ローテーション = CAS で単回消費。get_doc + 無条件 delete だと同一 RT の並行
+        // リクエストが両方 Some を得て二重発行する（cas_take が単回性を保証）。
         // 不変量: 同一 token への take_refresh_token が Some を返すのは高々 1 回。
-        let (f, update_time) =
-            self.fs.get_doc_with_update_time("refreshTokens", token).await.ok()??;
-        if !matches!(
-            self.fs.delete_doc_if_unchanged("refreshTokens", token, &update_time).await,
-            Ok(true)
-        ) {
-            return None;
-        }
+        let f = self.cas_take("refreshTokens", token).await?;
         if doc_expired(&f) {
             return None;
         }
