@@ -48,9 +48,8 @@ impl ClientAuthMethod for NoneAuth {
             .as_deref()
             .ok_or_else(|| OAuthError::InvalidClient("client_id required".into()))?;
         let client = p
-            .clients
-            .get(id)
-            .cloned()
+            .resolve_client(id)
+            .await
             .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
         if !client.is_public() {
             return Err(OAuthError::InvalidClient(
@@ -78,9 +77,8 @@ impl ClientAuthMethod for ClientSecretPost {
             .as_deref()
             .ok_or_else(|| OAuthError::InvalidClient("client_secret required".into()))?;
         let client = p
-            .clients
-            .get(id)
-            .cloned()
+            .resolve_client(id)
+            .await
             .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
         match &client.client_secret {
             Some(s) if secret_eq(s, secret) => Ok(client),
@@ -102,9 +100,8 @@ impl ClientAuthMethod for ClientSecretBasic {
             .as_ref()
             .ok_or_else(|| OAuthError::InvalidClient("Basic credentials required".into()))?;
         let client = p
-            .clients
-            .get(id)
-            .cloned()
+            .resolve_client(id)
+            .await
             .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
         match &client.client_secret {
             Some(s) if secret_eq(s, secret) => Ok(client),
@@ -162,7 +159,7 @@ impl ClientAuthMethod for PrivateKeyJwt {
         if sub.is_empty() || sub != iss {
             return Err(bad("assertion iss/sub mismatch"));
         }
-        let client = p.clients.get(sub).cloned().ok_or_else(|| bad("unknown client"))?;
+        let client = p.resolve_client(sub).await.ok_or_else(|| bad("unknown client"))?;
         if client.token_endpoint_auth_method != "private_key_jwt" {
             return Err(bad("client is not private_key_jwt"));
         }

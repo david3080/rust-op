@@ -102,6 +102,20 @@ impl Provider {
         self
     }
 
+    /// client_id を解決する。静的登録(HashMap)を先に見て、無ければ Firestore の
+    /// DCR 登録クライアントへフォールバックする。未知なら None。
+    ///
+    /// 注意: 静的クライアントは HashMap で即解決されるが、未知 id は Firestore への
+    /// 1 read を引く。/authorize・/end_session など無認証面でも引かれるため、
+    /// 未知 id の point-read 増は許容する前提（攻撃面メモは PR 説明参照）。
+    pub async fn resolve_client(&self, id: &str) -> Option<Client> {
+        if let Some(c) = self.clients.get(id) {
+            return Some(c.clone());
+        }
+        let fs = self.firestore.as_ref()?;
+        crate::dcr_store::load_client(fs, id).await
+    }
+
     pub fn with_base_path(mut self, base_path: impl Into<String>) -> Self {
         self.base_path = base_path.into();
         self

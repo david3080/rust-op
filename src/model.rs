@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// クライアントの公開鍵（private_key_jwt 検証用、ES256/P-256）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JwkPub {
     pub kid: String,
     pub x: String,
@@ -12,7 +12,8 @@ pub struct JwkPub {
 }
 
 /// 登録済みクライアント。node-oidc-provider の `models/client.js` 相当の最小版。
-#[derive(Clone, Debug)]
+/// Serialize/Deserialize は制御つき DCR の Firestore 永続化（JSON ブロブ）に使う。
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Client {
     pub client_id: String,
     pub redirect_uris: Vec<String>,
