@@ -69,18 +69,18 @@ async function pkLogin(){
 <form method="post" action="{login}">
 <input name="username" placeholder="email"><input name="password" type="password" placeholder="password">
 <button class="filled" type="submit" style="margin-top:8px">ログイン</button></form></details>"##,
-            login = p.path(&format!("/interaction/{uid}/login")),
+            login = p.path(&format!("/login/{uid}/password")),
         )
     } else {
         String::new()
     };
     Html(
         body.replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
-            .replace("__OPT__", &p.path(&format!("/interaction/{uid}/passkey/options")))
-            .replace("__VER__", &p.path(&format!("/interaction/{uid}/passkey/verify")))
+            .replace("__OPT__", &p.path(&format!("/login/{uid}/passkey/options")))
+            .replace("__VER__", &p.path(&format!("/login/{uid}/passkey/verify")))
             .replace("__PWFORM__", &pwform)
-            .replace("__CANCEL__", &p.path(&format!("/interaction/{uid}/cancel")))
-            .replace("__REGISTER__", &p.path("/register")),
+            .replace("__CANCEL__", &p.path(&format!("/login/{uid}/cancel")))
+            .replace("__REGISTER__", &p.path("/signup")),
     )
 }
 

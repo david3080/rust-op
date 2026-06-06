@@ -125,7 +125,7 @@ pub struct AccessToken {
     /// CIBA で承認された mandate を運ぶ。RS は /introspection 経由で受け取り、
     /// リクエスト本体と照合する（MandatePolicy）。
     pub authorization_details: Option<String>,
-    /// mandate の単回消費フラグ。/mandate/consume で false→true を CAS する。
+    /// mandate の単回消費フラグ。/oauth/mandate/consume で false→true を CAS する。
     /// RS は実行前に消費を試み、false なら mandate.already_consumed で弾く。
     pub mandate_consumed: bool,
 }
