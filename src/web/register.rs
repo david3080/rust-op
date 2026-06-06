@@ -14,7 +14,7 @@ button{{width:100%;padding:12px;font-size:16px;background:#3367d6;color:#fff;bor
 }
 
 pub(super) async fn register_form(State(p): State<Arc<Provider>>) -> Html<String> {
-    let action = p.path("/register");
+    let action = p.path("/signup");
     page(
         "登録",
         &format!(
@@ -161,7 +161,7 @@ pub(super) async fn register_verify_email(
     }
 }
 
-/// passkey 作成（ブラウザ）ページ。メールリンク /r と /register/verify で共用。
+/// passkey 作成（ブラウザ）ページ。メールリンク /r と /signup/verify で共用。
 /// iPhone は AASA(Universal Link)でアプリが横取りするため通常この HTML は出ず、
 /// PC/Mac やアプリ未対応端末ではこのページでブラウザ passkey 登録を完結できる。
 fn passkey_register_page(p: &Provider, token: &str) -> Html<String> {
@@ -227,8 +227,8 @@ async function reg(){
     Html(
         body.replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
             .replace("__TOKEN__", &token)
-            .replace("__OPT__", &p.path("/register/passkey/options"))
-            .replace("__VER__", &p.path("/register/passkey/verify"))
+            .replace("__OPT__", &p.path("/signup/passkey/options"))
+            .replace("__VER__", &p.path("/signup/passkey/verify"))
             .replace("__LOGIN__", &p.path("/")),
     )
 }
@@ -258,7 +258,7 @@ pub(super) struct VerifyQuery {
     token: String,
 }
 
-/// Web フォーム経由（/register/verify?token=）の着地点。
+/// Web フォーム経由（/signup/verify?token=）の着地点。
 pub(super) async fn verify_form(State(p): State<Arc<Provider>>, Query(q): Query<VerifyQuery>) -> Html<String> {
     passkey_register_page(&p, &q.token)
 }

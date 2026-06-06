@@ -36,7 +36,25 @@ pub(super) async fn discovery(State(p): State<Arc<Provider>>) -> Json<serde_json
         "backchannel_authentication_endpoint": format!("{i}/backchannel-authentication"),
         "backchannel_token_delivery_modes_supported": ["poll"],
         "backchannel_user_code_parameter_supported": false,
+        // 独自エンドポイント（OIDC 標準外）。RP/アプリはここから URL を引き、
+        // パスをハードコードしない（OP 側の改名にアプリ無改修で追従できる）。
+        // 標準名前空間を汚さないようベンダー名前空間にまとめる。
+        "sonrisa_endpoints": sonrisa_endpoints(i),
     }))
+}
+
+/// 独自エンドポイント（OIDC 標準外）の URL 群。アプリはここから引く。
+/// アプリ側の期待キー/パスとの契約なので、各値は対応する route と一致させること。
+fn sonrisa_endpoints(i: &str) -> serde_json::Value {
+    serde_json::json!({
+        "signup_email_challenge": format!("{i}/signup/email-challenge"),
+        "signup_verify_email": format!("{i}/signup/verify-email"),
+        "signup_passkey_options": format!("{i}/signup/passkey/options"),
+        "signup_passkey_verify": format!("{i}/signup/passkey/verify"),
+        "profile": format!("{i}/me/profile"),
+        "fcm_token": format!("{i}/ciba/fcm-tokens"),
+        "mandate_consume": format!("{i}/oauth/mandate/consume"),
+    })
 }
 
 pub(super) async fn jwks(State(p): State<Arc<Provider>>) -> Json<serde_json::Value> {
@@ -154,7 +172,7 @@ pub(super) async fn authorize(
             request_uri: par_request_uri,
         })
         .await;
-    Redirect::to(&p.path(&format!("/interaction/{uid}"))).into_response()
+    Redirect::to(&p.path(&format!("/login/{uid}"))).into_response()
 }
 
 pub(super) async fn authorize_resume(
@@ -665,7 +683,7 @@ fn profile_view(sub: &str, profile: &HashMap<String, String>) -> serde_json::Val
 }
 
 pub(super) async fn profile_get(State(p): State<Arc<Provider>>, headers: HeaderMap) -> Response {
-    let at = match authenticate_token(&p, &headers, "GET", "/profile", None).await {
+    let at = match authenticate_token(&p, &headers, "GET", "/me/profile", None).await {
         Ok(at) => at,
         Err(r) => return r,
     };
@@ -679,7 +697,7 @@ pub(super) async fn profile_get(State(p): State<Arc<Provider>>, headers: HeaderM
 }
 
 pub(super) async fn profile_put(State(p): State<Arc<Provider>>, headers: HeaderMap, body: String) -> Response {
-    let at = match authenticate_token(&p, &headers, "PUT", "/profile", None).await {
+    let at = match authenticate_token(&p, &headers, "PUT", "/me/profile", None).await {
         Ok(at) => at,
         Err(r) => return r,
     };
@@ -716,6 +734,20 @@ pub(super) async fn userinfo_post(State(p): State<Arc<Provider>>, headers: Heade
 mod tests {
     use super::*;
     use crate::model::AccessToken;
+
+    /// discovery で発行する独自エンドポイント＝アプリ(fido2demo)が読むキー/パスの契約。
+    /// route を改名したらここも一致させる（clean-cut 運用での divergence を検出する）。
+    #[test]
+    fn sonrisa_endpoints_contract() {
+        let v = sonrisa_endpoints("https://op.example/oidc");
+        assert_eq!(v["signup_email_challenge"], "https://op.example/oidc/signup/email-challenge");
+        assert_eq!(v["signup_verify_email"], "https://op.example/oidc/signup/verify-email");
+        assert_eq!(v["signup_passkey_options"], "https://op.example/oidc/signup/passkey/options");
+        assert_eq!(v["signup_passkey_verify"], "https://op.example/oidc/signup/passkey/verify");
+        assert_eq!(v["profile"], "https://op.example/oidc/me/profile");
+        assert_eq!(v["fcm_token"], "https://op.example/oidc/ciba/fcm-tokens");
+        assert_eq!(v["mandate_consume"], "https://op.example/oidc/oauth/mandate/consume");
+    }
 
     fn at(jkt: Option<&str>) -> AccessToken {
         AccessToken {

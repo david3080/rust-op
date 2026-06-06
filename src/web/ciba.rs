@@ -45,7 +45,7 @@ pub(super) async fn fcm_token_register(
     headers: HeaderMap,
     Json(req): Json<FcmTokenReq>,
 ) -> Response {
-    let at = match authenticate_token(&p, &headers, "POST", "/me/fcm-tokens", None).await {
+    let at = match authenticate_token(&p, &headers, "POST", "/ciba/fcm-tokens", None).await {
         Ok(at) => at,
         Err(r) => return r,
     };

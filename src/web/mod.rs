@@ -51,7 +51,7 @@ fn fido_conformance_enabled() -> bool {
 pub fn router(provider: Provider) -> Router {
     let base_path = provider.base_path.clone();
     // FIDO2 Conformance 用エンドポイントは base_path に依らずトップレベル /fido/* に置く。
-    // テスト専用面（本番の実 passkey フローは /register・/interaction・/ciba 側）なので、
+    // テスト専用面（本番の実 passkey フローは /signup・/login・/ciba 側）なので、
     // 本番（FIDO_CONFORMANCE_ENABLED 未設定）では空 Router にしてマウントしない＝攻撃面を排除。
     let fido = if fido_conformance_enabled() {
         crate::fido::router(Arc::new(crate::fido::FidoState::from_env()))
@@ -64,33 +64,34 @@ pub fn router(provider: Provider) -> Router {
         .route("/jwks", get(oidc::jwks))
         .route("/authorize", get(oidc::authorize))
         .route("/authorize/resume", get(oidc::authorize_resume))
-        .route("/interaction/{uid}", get(login::login_form))
-        .route("/interaction/{uid}/cancel", get(oidc::authorize_cancel))
-        .route("/interaction/{uid}/passkey/options", post(login::login_passkey_options))
-        .route("/interaction/{uid}/passkey/verify", post(login::login_passkey_verify))
+        .route("/login/{uid}", get(login::login_form))
+        .route("/login/{uid}/cancel", get(oidc::authorize_cancel))
+        .route("/login/{uid}/passkey/options", post(login::login_passkey_options))
+        .route("/login/{uid}/passkey/verify", post(login::login_passkey_verify))
         .route("/token", post(oidc::token))
         .route("/introspect", post(oidc::introspect))
-        .route("/mandate/consume", post(oidc::mandate_consume))
+        .route("/oauth/mandate/consume", post(oidc::mandate_consume))
         .route("/revoke", post(oidc::revoke))
         .route("/end-session", get(oidc::end_session))
         .route("/par", post(oidc::par))
         .route("/userinfo", get(oidc::userinfo_get).post(oidc::userinfo_post))
-        .route("/profile", get(oidc::profile_get).put(oidc::profile_put))
+        .route("/me/profile", get(oidc::profile_get).put(oidc::profile_put))
         // CIBA
         .route("/backchannel-authentication", post(ciba::backchannel_auth))
         .route("/ciba", get(ciba::ciba_pending))
         .route("/ciba/pending", get(ciba::ciba_pending_list))
-        .route("/me/fcm-tokens", post(ciba::fcm_token_register))
+        .route("/ciba/fcm-tokens", post(ciba::fcm_token_register))
         .route("/ciba/{auth_req_id}/passkey-options", post(ciba::ciba_approve_options))
         .route("/ciba/{auth_req_id}/approve", post(ciba::ciba_approve))
         .route("/ciba/{auth_req_id}/reject", post(ciba::ciba_reject))
         // メール確認つきユーザー登録（Web HTML フロー + ネイティブ JSON API）。
-        .route("/register", get(register::register_form).post(register::register_submit))
-        .route("/register/verify", get(register::verify_form))
-        .route("/register/email-challenge", post(register::register_email_challenge))
-        .route("/register/verify-email", post(register::register_verify_email))
-        .route("/register/passkey/options", post(register::register_passkey_options))
-        .route("/register/passkey/verify", post(register::register_passkey_verify))
+        // OAuth の「クライアント登録(DCR)」と区別するため /signup/* に置く。
+        .route("/signup", get(register::register_form).post(register::register_submit))
+        .route("/signup/verify", get(register::verify_form))
+        .route("/signup/email-challenge", post(register::register_email_challenge))
+        .route("/signup/verify-email", post(register::register_verify_email))
+        .route("/signup/passkey/options", post(register::register_passkey_options))
+        .route("/signup/passkey/verify", post(register::register_passkey_verify))
         // ブラウザで完結する RP デモ。
         .route("/", get(pages::demo_start))
         .route("/callback", get(pages::demo_callback));
@@ -98,7 +99,7 @@ pub fn router(provider: Provider) -> Router {
     // パスワードログイン（固定資格 a/a）はテスト/コンフォーマンス専用。
     // 本番では PASSWORD_LOGIN_ENABLED 未設定で無効化し、passkey/CIBA のみにする。
     if password_login_enabled() {
-        inner = inner.route("/interaction/{uid}/login", post(login::login_submit));
+        inner = inner.route("/login/{uid}/password", post(login::login_submit));
     }
 
     // CIBA Consumption デモ（Web だけで CIBA を体験）。無認証で FCM push を誘発でき、
@@ -259,7 +260,7 @@ fn auth_scheme_token(headers: &HeaderMap) -> Option<(String, String)> {
 }
 
 /// Bearer/DPoP の access token を検証して返す。失敗時はエラー Response。
-/// path_suffix は DPoP htu 構築用（例 "/userinfo", "/profile"）。
+/// path_suffix は DPoP htu 構築用（例 "/userinfo", "/me/profile"）。
 async fn authenticate_token(
     p: &Provider,
     headers: &HeaderMap,

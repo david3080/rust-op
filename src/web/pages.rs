@@ -91,8 +91,8 @@ const EDITABLE=['name','nickname','gender','birthdate','zoneinfo','locale'];
 async function fetchProfile(){
   const t=getTokens();if(!t)return {profile:{}};
   const ath=await sha256u(t.access_token);
-  const proof=await dpopProof('GET',ISSUER+'/profile',ath);
-  const r=await fetch(ISSUER+'/profile',{headers:{'Authorization':'DPoP '+t.access_token,'DPoP':proof}});
+  const proof=await dpopProof('GET',ISSUER+'/me/profile',ath);
+  const r=await fetch(ISSUER+'/me/profile',{headers:{'Authorization':'DPoP '+t.access_token,'DPoP':proof}});
   if(!r.ok)return {profile:{}};
   return await r.json();
 }
@@ -100,8 +100,8 @@ async function saveProfile(){
   const t=getTokens();if(!t){fail('セッションが切れました');return;}
   const body={};EDITABLE.forEach(k=>{body[k]=document.getElementById('f_'+k).value;});
   const ath=await sha256u(t.access_token);
-  const proof=await dpopProof('PUT',ISSUER+'/profile',ath);
-  const r=await fetch(ISSUER+'/profile',{method:'PUT',headers:{'Authorization':'DPoP '+t.access_token,'DPoP':proof,'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const proof=await dpopProof('PUT',ISSUER+'/me/profile',ath);
+  const r=await fetch(ISSUER+'/me/profile',{method:'PUT',headers:{'Authorization':'DPoP '+t.access_token,'DPoP':proof,'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(!r.ok){fail('保存に失敗しました ('+r.status+')');return;}
   // PUT は更新後 profile を返すのでそれで再描画。
   const prof=await r.json();
