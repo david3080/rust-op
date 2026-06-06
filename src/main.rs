@@ -71,28 +71,6 @@ async fn main() {
         id_token_signed_response_alg: None,
     };
 
-    // OIDF Conformance Suite (Basic OP) 用の静的クライアント 2 つ。
-    // client_secret_basic。redirect_uri は alias=rustop-basic の suite callback
-    // と、一部テストが使う dummy クエリ付きの 2 種を登録する。
-    let oidf_alias = "rustop-basic";
-    let oidf_redirects = vec![
-        format!("https://www.certification.openid.net/test/a/{oidf_alias}/callback"),
-        format!("https://www.certification.openid.net/test/a/{oidf_alias}/callback?dummy1=lorem&dummy2=ipsum"),
-    ];
-    let oidf_client = |id: &str, secret: &str| Client {
-        client_id: id.into(),
-        redirect_uris: oidf_redirects.clone(),
-        post_logout_redirect_uris: vec![],
-        token_endpoint_auth_method: "client_secret_basic".into(),
-        client_secret: Some(secret.into()),
-        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
-        dpop_bound: false,
-        jwks: vec![],
-        require_par: false,
-        require_pkce: false,
-        id_token_signed_response_alg: None,
-    };
-
     // Flutter ネイティブアプリ fido2demo（public + PKCE, custom scheme, DPoP）。
     let mobile_rp = Client {
         client_id: "mobile-rp".into(),
@@ -167,22 +145,21 @@ async fn main() {
         id_token_signed_response_alg: None,
     };
 
-    // demo-rp / mobile-rp は実アプリ用（public + PKCE, シークレット無し）で常時登録。
+    // demo-rp / mobile-rp / ciba-rp は実アプリ用で常時登録。
+    // ciba-rp は実 CIBA バックエンド（client_secret_basic, DPoP 任意）。conformance とは別。
     let mut provider = Provider::new(issuer.clone())
         .with_base_path(base_path.clone())
         .with_client(demo_rp)
-        .with_client(mobile_rp);
-    // OIDF/FAPI conformance 用の静的クライアント（既知 id・シークレット保持）は
+        .with_client(mobile_rp)
+        .with_client(ciba_rp);
+    // FAPI conformance 用の静的クライアント（既知 id・鍵保持）は
     // CONFORMANCE_CLIENTS_ENABLED のときだけ登録する。実ユーザー機では既定で出さない
-    // （= test クライアントの攻撃面を本番から排除）。
+    // （= test クライアントの攻撃面を本番から排除）。認定時のみ一時的に有効化する。
     let conformance_clients = std::env::var("CONFORMANCE_CLIENTS_ENABLED")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     if conformance_clients {
         provider = provider
-            .with_client(ciba_rp)
-            .with_client(oidf_client("oidf-basic-1", &secret_from_env("OIDF_BASIC_SECRET_1")))
-            .with_client(oidf_client("oidf-basic-2", &secret_from_env("OIDF_BASIC_SECRET_2")))
             .with_client(fapi_client(
                 "fapi-1",
                 std::env::var("FAPI1_KID").as_deref().unwrap_or("fapi-1-key"),
