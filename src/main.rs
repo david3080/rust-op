@@ -3,6 +3,7 @@ mod ciba;
 mod claims;
 mod client_auth;
 mod context;
+mod dcr;
 mod dpop;
 mod error;
 mod es256;
