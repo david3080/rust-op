@@ -31,6 +31,7 @@ pub(super) async fn discovery(State(p): State<Arc<Provider>>) -> Json<serde_json
         "request_object_signing_alg_values_supported": ["ES256"],
         "backchannel_authentication_request_signing_alg_values_supported": ["ES256"],
         "pushed_authorization_request_endpoint": format!("{i}/par"),
+        "registration_endpoint": format!("{i}/oauth/register"),
         "end_session_endpoint": format!("{i}/end-session"),
         "authorization_response_iss_parameter_supported": true,
         "backchannel_authentication_endpoint": format!("{i}/backchannel-authentication"),
@@ -730,6 +731,146 @@ pub(super) async fn userinfo_post(State(p): State<Arc<Provider>>, headers: Heade
         .ok()
         .and_then(|m| m.get("access_token").cloned());
     userinfo_respond(&p, &headers, "POST", body_token).await
+}
+
+/* ===== Dynamic Client Registration (RFC 7591, IAT 制御つき) ===== */
+
+/// POST /oauth/register。Initial Access Token(Bearer) を単回消費し、制約内の
+/// private_key_jwt クライアントを Firestore に登録する。
+///
+/// 消費順序: peek(削除しない) → 期限 → validate → consume_iat(CAS 削除=単回) →
+/// save_client。検証失敗では IAT を消費しないので RP はメタデータを直して再試行できる。
+/// 生 IAT・Authorization ヘッダはログに出さない（相関はハッシュ先頭のみ）。
+pub(super) async fn register(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let fs = match &p.firestore {
+        Some(f) => f,
+        None => {
+            return dcr_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "registration unavailable (no Firestore)",
+            )
+        }
+    };
+    let raw_iat = match auth_scheme_token(&headers) {
+        Some((scheme, tok)) if scheme == "Bearer" => tok,
+        _ => {
+            return dcr_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "initial access token required",
+            )
+        }
+    };
+    let hash = crate::dcr::hash_token(&raw_iat);
+    let tag = &hash[..8]; // 相関用の安全なハンドル（生トークンは出さない）。
+
+    let (constraints, expires_at, update_time) = match crate::dcr_store::peek_iat(fs, &hash).await {
+        Ok(Some(x)) => x,
+        Ok(None) => {
+            return dcr_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "unknown initial access token",
+            )
+        }
+        Err(e) => {
+            tracing::error!("dcr peek_iat [{tag}]: {e}");
+            return dcr_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "registration failed");
+        }
+    };
+    if now() >= expires_at {
+        return dcr_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "initial access token expired",
+        );
+    }
+
+    let v: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return dcr_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                "request body is not valid JSON",
+            )
+        }
+    };
+    let req = crate::dcr::RegistrationRequest {
+        redirect_uris: json_string_array(&v, "redirect_uris"),
+        grant_types: json_string_array(&v, "grant_types"),
+        jwks: crate::dcr::jwks_from_jwk_set(v.get("jwks")),
+    };
+
+    let client_id = format!("dcr-{}", uuid::Uuid::new_v4().simple());
+    let client = match crate::dcr::validate_registration(&client_id, &req, &constraints) {
+        Ok(c) => c,
+        // 検証失敗では IAT を消費しない（メタデータ修正後に再試行可能）。
+        Err(e) => return dcr_error(StatusCode::BAD_REQUEST, e.code(), &e.description()),
+    };
+
+    // 単回消費: 検証成功後にだけ CAS 削除する。負け＝並行/再利用なので拒否。
+    match crate::dcr_store::consume_iat(fs, &hash, &update_time).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return dcr_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_token",
+                "initial access token already used",
+            )
+        }
+        Err(e) => {
+            tracing::error!("dcr consume_iat [{tag}]: {e}");
+            return dcr_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "registration failed");
+        }
+    }
+
+    if let Err(e) = crate::dcr_store::save_client(fs, &client).await {
+        // CAS には勝ったが保存に失敗。IAT は焼かれた（管理者が再発行）。fail-closed。
+        tracing::error!("dcr save_client [{tag}] {}: {e}", client.client_id);
+        return dcr_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "registration failed");
+    }
+    tracing::info!(event = "dcr_client_registered", client_id = %client.client_id);
+
+    (
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(register_response(&client)),
+    )
+        .into_response()
+}
+
+fn dcr_error(status: StatusCode, error: &str, desc: &str) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "error": error, "error_description": desc })),
+    )
+        .into_response()
+}
+
+fn json_string_array(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// RFC 7591 §3.2.1 client information response（登録済みメタデータをエコー）。
+fn register_response(c: &crate::model::Client) -> serde_json::Value {
+    serde_json::json!({
+        "client_id": c.client_id,
+        "client_id_issued_at": now(),
+        "token_endpoint_auth_method": c.token_endpoint_auth_method,
+        "grant_types": c.grant_types,
+        "redirect_uris": c.redirect_uris,
+        "require_pushed_authorization_requests": c.require_par,
+    })
 }
 
 #[cfg(test)]

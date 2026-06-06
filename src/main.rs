@@ -35,6 +35,13 @@ use provider::Provider;
 
 #[tokio::main]
 async fn main() {
+    // 管理者用 IAT 発行サブコマンド（out-of-band）。サーバ起動前に分岐する。
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("mint") {
+        mint_iat(&argv[2..]).await;
+        return;
+    }
+
     // ログ: Cloud Run では構造化 JSON（Cloud Logging がフィールド解析→log-based metric/alert）。
     // ローカルは人間可読のまま。
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -327,4 +334,71 @@ async fn main() {
             }
         }
     }
+}
+
+/// 管理者用 Initial Access Token 発行（制御つき DCR）。
+///
+/// `rust-op mint --redirect-host <host> [--redirect-host ...] [--grant <gt> ...] [--ttl-hours N]`
+///
+/// Firestore へは Cloud Run のメタデータ SA で書くため **GCP 内（Cloud Run job 等）での実行を前提**
+/// にする。生 IAT は stdout に一度だけ出すが、**この出力は実行ジョブのログ(Cloud Logging)に残る**。
+/// 安全性は「Log Viewer 権限 + 短い TTL + 単回利用」に依存する（生は DB にはハッシュしか残さない）。
+async fn mint_iat(args: &[String]) {
+    let mut hosts: Vec<String> = vec![];
+    let mut grants: Vec<String> = vec![];
+    let mut ttl_hours: u64 = 24;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--redirect-host" => match it.next() {
+                Some(v) => hosts.push(v.clone()),
+                None => fail("--redirect-host needs a value"),
+            },
+            "--grant" => match it.next() {
+                Some(v) => grants.push(v.clone()),
+                None => fail("--grant needs a value"),
+            },
+            "--ttl-hours" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(n) => ttl_hours = n,
+                None => fail("--ttl-hours needs a positive integer"),
+            },
+            other => fail(&format!("unknown arg {other}")),
+        }
+    }
+    if hosts.is_empty() {
+        fail("--redirect-host <host> を最低 1 つ指定してください");
+    }
+    if grants.is_empty() {
+        grants = vec!["authorization_code".into(), "refresh_token".into()];
+    }
+
+    let project = std::env::var("GCLOUD_PROJECT")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .unwrap_or_else(|_| "fido2-8b943".into());
+    let fs = firestore::Firestore::new(project);
+    let constraints = dcr::IatConstraints {
+        allowed_redirect_hosts: hosts.clone(),
+        allowed_grant_types: grants.clone(),
+    };
+    let (raw, hash) = dcr::gen_initial_access_token();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expires_at = now + ttl_hours * 3600;
+    if let Err(e) = dcr_store::put_iat(&fs, &hash, &constraints, expires_at).await {
+        eprintln!("mint: IAT 保存に失敗: {e}");
+        std::process::exit(1);
+    }
+    println!("initial_access_token:   {raw}");
+    println!("token_hash:             {hash}");
+    println!("allowed_redirect_hosts: {}", hosts.join(", "));
+    println!("allowed_grant_types:    {}", grants.join(", "));
+    println!("expires_at:             {expires_at} (epoch, +{ttl_hours}h)");
+    eprintln!("注意: 生トークンの表示は一度だけ。この出力は Cloud Logging に残ります。");
+}
+
+fn fail(msg: &str) -> ! {
+    eprintln!("mint: {msg}");
+    std::process::exit(2);
 }
