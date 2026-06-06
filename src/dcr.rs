@@ -10,12 +10,13 @@
 //! - 登録クライアントは **private_key_jwt（jwks 必須・client_secret なし）** 既定。
 //!   → OP は公開鍵しか持たず「クライアント秘密の漏洩」というカテゴリ自体を消す。
 //! - redirect_uri は **https＋許可ホスト**（DCR 最大の攻撃面＝コード窃取の足場を塞ぐ）。
-#![allow(dead_code)] // エンドポイント/ストアからの利用は後続 PR で配線する。
 
 use crate::model::{Client, JwkPub};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// IAT の制約（発行時に埋め込み、登録時に強制する）。
+#[derive(Serialize, Deserialize)]
 pub struct IatConstraints {
     /// 登録を許す redirect_uri のホスト名（完全一致）。
     pub allowed_redirect_hosts: Vec<String>,
@@ -25,7 +26,6 @@ pub struct IatConstraints {
 
 /// RP が提示する登録メタデータ（RFC 7591 の部分集合）。
 pub struct RegistrationRequest {
-    pub client_name: Option<String>,
     pub redirect_uris: Vec<String>,
     pub grant_types: Vec<String>,
     pub jwks: Vec<JwkPub>,
@@ -50,6 +50,55 @@ impl DcrError {
             DcrError::MissingJwks | DcrError::GrantTypeNotAllowed(_) => "invalid_client_metadata",
         }
     }
+
+    /// error_description 用の人間可読メッセージ。
+    pub fn description(&self) -> String {
+        match self {
+            DcrError::NoRedirectUris => "at least one redirect_uri is required".into(),
+            DcrError::InsecureRedirectUri(u) => {
+                format!("redirect_uri must be https without fragment or userinfo: {u}")
+            }
+            DcrError::RedirectHostNotAllowed(h) => {
+                format!("redirect_uri host not allowed by the initial access token: {h}")
+            }
+            DcrError::MissingJwks => "a jwks with at least one EC P-256 key is required".into(),
+            DcrError::GrantTypeNotAllowed(g) => {
+                format!("grant_type not allowed by the initial access token: {g}")
+            }
+        }
+    }
+}
+
+/// RFC 7517 JWK Set から ES256(EC P-256) 公開鍵だけを抽出する。
+///
+/// 登録境界での鍵検証も兼ねる: x/y が base64url として復号でき、かつ有効な P-256 点を
+/// 成すものだけ受理する。これで「登録成功(201) = private_key_jwt が動くクライアント」を
+/// 保証し、壊れた鍵が登録を通過してから token endpoint で無言失敗する事故を防ぐ。
+/// kty!=EC / crv!=P-256 / kid 空 / 復号不能な鍵は捨てる（残り 0 個なら
+/// validate_registration が MissingJwks で弾く）。
+pub fn jwks_from_jwk_set(jwks: Option<&serde_json::Value>) -> Vec<JwkPub> {
+    let keys = match jwks.and_then(|v| v.get("keys")).and_then(|v| v.as_array()) {
+        Some(k) => k,
+        None => return vec![],
+    };
+    keys.iter()
+        .filter_map(|k| {
+            if k.get("kty")?.as_str()? != "EC" || k.get("crv")?.as_str()? != "P-256" {
+                return None;
+            }
+            let kid = k.get("kid")?.as_str()?;
+            if kid.is_empty() {
+                return None;
+            }
+            let x = k.get("x")?.as_str()?;
+            let y = k.get("y")?.as_str()?;
+            // 登録時に x/y が有効な P-256 点を成すか検証する（壊れた鍵を 201 にしない）。
+            let xb = crate::es256::b64url_decode(x).ok()?;
+            let yb = crate::es256::b64url_decode(y).ok()?;
+            crate::es256::verifying_key_from_xy(&xb, &yb).ok()?;
+            Some(JwkPub { kid: kid.to_string(), x: x.to_string(), y: y.to_string() })
+        })
+        .collect()
 }
 
 /// CSPRNG で Initial Access Token を生成し、(生トークン, 保存用ハッシュ) を返す。
@@ -155,7 +204,6 @@ mod tests {
 
     fn req(redirect: &[&str], grants: &[&str], jwks: Vec<JwkPub>) -> RegistrationRequest {
         RegistrationRequest {
-            client_name: Some("My RP".into()),
             redirect_uris: redirect.iter().map(|s| s.to_string()).collect(),
             grant_types: grants.iter().map(|s| s.to_string()).collect(),
             jwks,
@@ -279,6 +327,60 @@ mod tests {
         con.allowed_redirect_hosts = vec!["rp.example.com".into()];
         let r = req(&["https://rp.example.com:8443/a/b/cb"], &[], vec![jwk()]);
         assert!(validate_registration("c", &r, &con).is_ok());
+    }
+
+    /// 有効な P-256 公開鍵の (x, y) を base64url で返す。
+    fn valid_ec_xy() -> (String, String) {
+        use crate::es256::b64url_encode;
+        use p256::ecdsa::SigningKey;
+        let key = SigningKey::random(&mut rand_core::OsRng);
+        let pt = key.verifying_key().to_encoded_point(false);
+        (b64url_encode(pt.x().unwrap()), b64url_encode(pt.y().unwrap()))
+    }
+
+    #[test]
+    fn jwks_extracts_valid_ec_p256_key() {
+        let (x, y) = valid_ec_xy();
+        let set = serde_json::json!({
+            "keys": [{ "kty": "EC", "crv": "P-256", "kid": "k1", "x": x, "y": y }]
+        });
+        let keys = jwks_from_jwk_set(Some(&set));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kid, "k1");
+    }
+
+    #[test]
+    fn jwks_rejects_non_ec_and_wrong_curve() {
+        let (x, y) = valid_ec_xy();
+        // RSA 鍵と P-384 鍵は捨てる。
+        let set = serde_json::json!({
+            "keys": [
+                { "kty": "RSA", "kid": "r", "n": "abc", "e": "AQAB" },
+                { "kty": "EC", "crv": "P-384", "kid": "p384", "x": x, "y": y },
+            ]
+        });
+        assert!(jwks_from_jwk_set(Some(&set)).is_empty());
+    }
+
+    #[test]
+    fn jwks_rejects_missing_kid_and_malformed_coords() {
+        let (x, y) = valid_ec_xy();
+        // kid 空。
+        let no_kid = serde_json::json!({
+            "keys": [{ "kty": "EC", "crv": "P-256", "kid": "", "x": x, "y": y }]
+        });
+        assert!(jwks_from_jwk_set(Some(&no_kid)).is_empty());
+        // x が不正な長さ（P-256 点を成さない）→ 登録時検証で落ちる。
+        let bad = serde_json::json!({
+            "keys": [{ "kty": "EC", "crv": "P-256", "kid": "k", "x": "AAAA", "y": "AAAA" }]
+        });
+        assert!(jwks_from_jwk_set(Some(&bad)).is_empty());
+    }
+
+    #[test]
+    fn jwks_handles_missing_jwks_field() {
+        assert!(jwks_from_jwk_set(None).is_empty());
+        assert!(jwks_from_jwk_set(Some(&serde_json::json!({}))).is_empty());
     }
 
     #[test]

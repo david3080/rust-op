@@ -4,10 +4,12 @@
 //! firestore.rules は全コレクションをサーバ SA 限定にしているので、`clients/` への
 //! 書き込みはこのサーバ経由のみ（クライアント直書き不可＝信頼境界が DB 側で閉じている）。
 
-use crate::firestore::{field_str, Firestore};
+use crate::dcr::IatConstraints;
+use crate::firestore::{self, field_str, field_u64, Firestore};
 use crate::model::Client;
 
 const CLIENTS: &str = "clients";
+const DCR_TOKENS: &str = "dcrTokens";
 
 /// DCR 登録クライアントを clients/{client_id} から読む。無ければ None。
 ///
@@ -31,4 +33,71 @@ pub async fn load_client(fs: &Firestore, client_id: &str) -> Option<Client> {
             None
         }
     }
+}
+
+/// DCR 登録クライアントを clients/{client_id} へ保存する。
+/// client_id は新規採番の一意値なので create_if_absent で既存を上書きしない
+/// （万一の衝突は false → エラーにして静かな破壊を防ぐ）。
+pub async fn save_client(fs: &Firestore, client: &Client) -> Result<(), String> {
+    let json = serde_json::to_string(client).map_err(|e| format!("serialize client: {e}"))?;
+    let created = fs
+        .create_if_absent(
+            CLIENTS,
+            &client.client_id,
+            serde_json::json!({ "json": firestore::s(&json) }),
+        )
+        .await?;
+    if created {
+        Ok(())
+    } else {
+        Err(format!("client {} already exists", client.client_id))
+    }
+}
+
+/// Initial Access Token を dcrTokens/{hash} へ保存する（保存は **ハッシュのみ**、生は持たない）。
+/// hash は単回採番なので create_if_absent。
+pub async fn put_iat(
+    fs: &Firestore,
+    hash: &str,
+    constraints: &IatConstraints,
+    expires_at: u64,
+) -> Result<(), String> {
+    let cj = serde_json::to_string(constraints).map_err(|e| format!("serialize constraints: {e}"))?;
+    let created = fs
+        .create_if_absent(
+            DCR_TOKENS,
+            hash,
+            serde_json::json!({
+                "constraints": firestore::s(&cj),
+                "expires_at": firestore::int(expires_at),
+            }),
+        )
+        .await?;
+    if created {
+        Ok(())
+    } else {
+        Err("initial access token already exists".into())
+    }
+}
+
+/// IAT を読むが消費はしない（制約・期限・updateTime を返す）。
+/// 単回消費は検証成功後に consume_iat(CAS 削除) で行う。
+pub async fn peek_iat(
+    fs: &Firestore,
+    hash: &str,
+) -> Result<Option<(IatConstraints, u64, String)>, String> {
+    let (fields, update_time) = match fs.get_doc_with_update_time(DCR_TOKENS, hash).await? {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    let cj = field_str(&fields, "constraints").ok_or("iat: missing constraints")?;
+    let constraints: IatConstraints =
+        serde_json::from_str(cj).map_err(|e| format!("iat constraints: {e}"))?;
+    let expires_at = field_u64(&fields, "expires_at").unwrap_or(0);
+    Ok(Some((constraints, expires_at, update_time)))
+}
+
+/// IAT を単回消費する（updateTime CAS 削除）。勝てば Ok(true)、並行消費・既消費は Ok(false)。
+pub async fn consume_iat(fs: &Firestore, hash: &str, update_time: &str) -> Result<bool, String> {
+    fs.delete_doc_if_unchanged(DCR_TOKENS, hash, update_time).await
 }

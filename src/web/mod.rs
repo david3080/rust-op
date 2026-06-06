@@ -71,6 +71,7 @@ pub fn router(provider: Provider) -> Router {
         .route("/token", post(oidc::token))
         .route("/introspect", post(oidc::introspect))
         .route("/oauth/mandate/consume", post(oidc::mandate_consume))
+        .route("/oauth/register", post(oidc::register))
         .route("/revoke", post(oidc::revoke))
         .route("/end-session", get(oidc::end_session))
         .route("/par", post(oidc::par))
