@@ -4,6 +4,7 @@ mod claims;
 mod client_auth;
 mod context;
 mod dcr;
+mod dcr_store;
 mod dpop;
 mod error;
 mod es256;

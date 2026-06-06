@@ -82,11 +82,11 @@ pub(super) async fn authorize(
     let raw = if let Some(req) = q0.get("request") {
         // JAR (RFC 9101): 直接の request object。client_id で client を引き署名検証する。
         let cid = q0.get("client_id").map(|s| s.as_str()).unwrap_or("");
-        let client = match p.clients.get(cid) {
+        let client = match p.resolve_client(cid).await {
             Some(c) => c,
             None => return plain_error("unknown client for request object"),
         };
-        match crate::request_object::verify(client, req, &p.issuer, &p.jar_jti).await {
+        match crate::request_object::verify(&client, req, &p.issuer, &p.jar_jti).await {
             Ok(params) => serde_urlencoded::to_string(&params).unwrap_or_default(),
             Err(e) => return plain_error(&format!("invalid request object: {}", e.description())),
         }
@@ -553,11 +553,13 @@ pub(super) async fn end_session(
         .or_else(|| q.id_token_hint.as_deref().and_then(jwt_aud));
 
     if let Some(uri) = &q.post_logout_redirect_uri {
-        let registered = client_id
-            .as_deref()
-            .and_then(|id| p.clients.get(id))
-            .map(|c| c.post_logout_redirect_uris.iter().any(|u| u == uri))
-            .unwrap_or(false);
+        let registered = match client_id.as_deref() {
+            Some(id) => match p.resolve_client(id).await {
+                Some(c) => c.post_logout_redirect_uris.iter().any(|u| u == uri),
+                None => false,
+            },
+            None => false,
+        };
         if !registered {
             return (jar, plain_error("post_logout_redirect_uri not registered")).into_response();
         }

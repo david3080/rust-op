@@ -23,9 +23,8 @@ impl AuthorizationCheck for CheckClient {
             .as_deref()
             .ok_or_else(|| OAuthError::InvalidRequest("client_id required".into()))?;
         let client = p
-            .clients
-            .get(id)
-            .cloned()
+            .resolve_client(id)
+            .await
             .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
         ctx.client = Some(client);
         Ok(())
