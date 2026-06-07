@@ -35,11 +35,18 @@ use provider::Provider;
 
 #[tokio::main]
 async fn main() {
-    // 管理者用 IAT 発行サブコマンド（out-of-band）。サーバ起動前に分岐する。
+    // 管理者用サブコマンド（out-of-band）。サーバ起動前に分岐する。
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(String::as_str) == Some("mint") {
-        mint_iat(&argv[2..]).await;
-        return;
+    match argv.get(1).map(String::as_str) {
+        Some("mint") => {
+            mint_iat(&argv[2..]).await;
+            return;
+        }
+        Some("revoke-client") => {
+            revoke_client(&argv[2..]).await;
+            return;
+        }
+        _ => {}
     }
 
     // ログ: Cloud Run では構造化 JSON（Cloud Logging がフィールド解析→log-based metric/alert）。
@@ -401,4 +408,35 @@ async fn mint_iat(args: &[String]) {
 fn fail(msg: &str) -> ! {
     eprintln!("mint: {msg}");
     std::process::exit(2);
+}
+
+/// 管理者用クライアント revoke（制御つき DCR）。
+///
+/// `rust-op revoke-client <client_id>`
+///
+/// clients/{client_id} を削除する。失効の意味論は [`dcr_store::revoke_client`] 参照
+/// （新規認可・refresh は即停止、発行済み AT は ≤15 分で自然失効）。mint 同様 GCP 内実行前提。
+async fn revoke_client(args: &[String]) {
+    let client_id = match args.first() {
+        Some(id) if !id.starts_with('-') => id.clone(),
+        _ => {
+            eprintln!("revoke-client: usage: rust-op revoke-client <client_id>");
+            std::process::exit(2);
+        }
+    };
+    let project = std::env::var("GCLOUD_PROJECT")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .unwrap_or_else(|_| "fido2-8b943".into());
+    let fs = firestore::Firestore::new(project);
+    match dcr_store::revoke_client(&fs, &client_id).await {
+        Ok(true) => println!("revoked: {client_id}（新規認可・refresh は即停止、発行済み AT は ≤15 分で失効）"),
+        Ok(false) => {
+            eprintln!("revoke-client: not found: {client_id}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("revoke-client: 失敗: {e}");
+            std::process::exit(1);
+        }
+    }
 }

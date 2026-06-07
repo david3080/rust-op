@@ -32,19 +32,6 @@ pub(super) struct RegisterForm {
 }
 
 /// メール確認チャレンジを作り確認メールを送る。Web フォーム/ネイティブ JSON 共通。
-/// 列挙対策で既登録/未登録に関わらず例外を出さない。メール URL は custom scheme
-/// 経由でアプリにも着地できる /r?t= 形式（PC では /r が HTML を返す）。
-/// X-Forwarded-For の先頭 IP（Cloud Run の前段が付与）。無ければ "unknown"。
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into())
-}
-
 async fn issue_register_email(
     p: &Provider,
     fs: &crate::firestore::Firestore,
