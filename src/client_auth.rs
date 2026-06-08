@@ -21,10 +21,8 @@ fn secret_eq(a: &str, b: &str) -> bool {
 pub struct ClientAuthInput {
     /// Authorization: Basic ... をデコードした (id, secret)。
     pub basic: Option<(String, String)>,
-    /// body の client_id（public client / client_secret_post）。
+    /// body の client_id（public client）。
     pub body_client_id: Option<String>,
-    /// body の client_secret（client_secret_post）。
-    pub body_client_secret: Option<String>,
     /// private_key_jwt の client_assertion(JWT)。
     pub client_assertion: Option<String>,
 }
@@ -57,33 +55,6 @@ impl ClientAuthMethod for NoneAuth {
             ));
         }
         Ok(client)
-    }
-}
-
-/// token_endpoint_auth_method = client_secret_post（client_id/secret を body で送る）。
-pub struct ClientSecretPost;
-#[async_trait]
-impl ClientAuthMethod for ClientSecretPost {
-    fn method(&self) -> &'static str {
-        "client_secret_post"
-    }
-    async fn authenticate(&self, p: &Provider, input: &ClientAuthInput) -> Result<Client, OAuthError> {
-        let id = input
-            .body_client_id
-            .as_deref()
-            .ok_or_else(|| OAuthError::InvalidClient("client_id required".into()))?;
-        let secret = input
-            .body_client_secret
-            .as_deref()
-            .ok_or_else(|| OAuthError::InvalidClient("client_secret required".into()))?;
-        let client = p
-            .resolve_client(id)
-            .await
-            .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
-        match &client.client_secret {
-            Some(s) if secret_eq(s, secret) => Ok(client),
-            _ => Err(OAuthError::InvalidClient("bad client secret".into())),
-        }
     }
 }
 
@@ -260,7 +231,6 @@ mod tests {
         ClientAuthInput {
             basic: basic.map(|(i, s)| (i.into(), s.into())),
             body_client_id: body.map(|(i, _)| i.into()),
-            body_client_secret: body.map(|(_, s)| s.into()),
             client_assertion: assertion.map(str::to_string),
         }
     }
@@ -270,19 +240,6 @@ mod tests {
         assert!(secret_eq("hunter2", "hunter2"));
         assert!(!secret_eq("hunter2", "hunter3"));
         assert!(!secret_eq("hunter2", "hunter2x")); // 長さ違い
-    }
-
-    #[tokio::test]
-    async fn secret_post_accepts_correct_rejects_wrong() {
-        let p = provider().with_client(secret_client("rp", "s3cret", "client_secret_post"));
-        assert!(ClientSecretPost
-            .authenticate(&p, &input(None, Some(("rp", "s3cret")), None))
-            .await
-            .is_ok());
-        assert!(ClientSecretPost
-            .authenticate(&p, &input(None, Some(("rp", "nope")), None))
-            .await
-            .is_err());
     }
 
     #[tokio::test]
@@ -296,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn none_auth_rejects_confidential_client() {
-        let p = provider().with_client(secret_client("rp", "s", "client_secret_post"));
+        let p = provider().with_client(secret_client("rp", "s", "client_secret_basic"));
         assert!(NoneAuth
             .authenticate(&p, &input(None, Some(("rp", "")), None))
             .await

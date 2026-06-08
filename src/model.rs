@@ -17,7 +17,7 @@ pub struct JwkPub {
 pub struct Client {
     pub client_id: String,
     pub redirect_uris: Vec<String>,
-    /// "none" | "client_secret_basic" | "client_secret_post" | "private_key_jwt"
+    /// "none" | "client_secret_basic" | "private_key_jwt"
     pub token_endpoint_auth_method: String,
     pub client_secret: Option<String>,
     pub grant_types: Vec<String>,

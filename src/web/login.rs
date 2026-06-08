@@ -28,7 +28,6 @@ details input{font-size:14px;padding:8px;margin-top:8px}</style>
 <button class="outlined" onclick="location.href='__REGISTER__'">新規登録 (メアドで)</button>
 <button class="outlined" onclick="location.href='__CANCEL__'">キャンセル</button>
 <p id="msg"></p>
-__PWFORM__
 <script>
 __WEBAUTHN_JS__
 const OPT="__OPT__",VER="__VER__";
@@ -62,57 +61,13 @@ async function pkLogin(){
  }
 }
 </script></body></html>"##;
-    // パスワードフォームはテスト/コンフォーマンス時のみ表示（本番は passkey のみ）。
-    let pwform = if super::password_login_enabled() {
-        format!(
-            r##"<details><summary>パスワード (テスト用)</summary>
-<form method="post" action="{login}">
-<input name="username" placeholder="email"><input name="password" type="password" placeholder="password">
-<button class="filled" type="submit" style="margin-top:8px">ログイン</button></form></details>"##,
-            login = p.path(&format!("/login/{uid}/password")),
-        )
-    } else {
-        String::new()
-    };
     Html(
         body.replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
             .replace("__OPT__", &p.path(&format!("/login/{uid}/passkey/options")))
             .replace("__VER__", &p.path(&format!("/login/{uid}/passkey/verify")))
-            .replace("__PWFORM__", &pwform)
             .replace("__CANCEL__", &p.path(&format!("/login/{uid}/cancel")))
             .replace("__REGISTER__", &p.path("/signup")),
     )
-}
-
-#[derive(serde::Deserialize)]
-pub(super) struct LoginForm {
-    username: String,
-    password: String,
-}
-
-pub(super) async fn login_submit(
-    State(p): State<Arc<Provider>>,
-    jar: CookieJar,
-    Path(uid): Path<String>,
-    Form(form): Form<LoginForm>,
-) -> Response {
-    // 多層防御: ルート未登録（本番）でも万一到達したら拒否する。
-    if !super::password_login_enabled() {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    // conformance/demo 用の固定資格情報バイパス（a/a）。実ユーザーは passkey を使う。
-    let raw = form.username.trim();
-    if !(raw == p.demo_user && form.password == p.demo_pass) {
-        tracing::warn!(event = "login_failed", method = "password");
-        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
-    }
-    let interaction = match p.store.get_interaction(&uid).await {
-        Some(i) => i,
-        None => return plain_error("interaction not found"),
-    };
-    let account = p.store.find_account(&p.demo_user).await;
-    let (jar, resume) = finalize_login(&p, jar, interaction, account.sub).await;
-    (jar, Redirect::to(&resume)).into_response()
 }
 
 /// ログイン確定: interaction にアカウントを書き、SSO セッション cookie を張り、resume パスを返す。
