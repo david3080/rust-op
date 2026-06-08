@@ -197,6 +197,19 @@ fn dpop_header(headers: &HeaderMap) -> Option<String> {
     first.to_str().ok().map(|s| s.to_string())
 }
 
+/// X-Forwarded-For の先頭 IP（Cloud Run の前段が付与）。無ければ "unknown"。
+/// 注意: 先頭値はクライアント申告で詐称可能。レート制限の弱いキーにしかならない
+/// （素朴な単一 IP からの連発を抑える backstop。詐称ローテーションには無力）。
+pub(super) fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn parse_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
     let h = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let b64 = h.strip_prefix("Basic ")?;

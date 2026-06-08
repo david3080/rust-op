@@ -101,3 +101,19 @@ pub async fn peek_iat(
 pub async fn consume_iat(fs: &Firestore, hash: &str, update_time: &str) -> Result<bool, String> {
     fs.delete_doc_if_unchanged(DCR_TOKENS, hash, update_time).await
 }
+
+/// 登録クライアントを revoke する（clients/{id} 削除）。存在したら Ok(true)、無ければ Ok(false)。
+///
+/// 失効の意味論（明示）: 削除後 resolve_client は None を返すため
+/// **新規認可（PAR/authorize/token）と refresh（token endpoint で private_key_jwt 再認証 →
+/// unknown_client）は即座に失敗**する。一方 **発行済みアクセストークンは TTL（≤900s/15分、
+/// ACCESS_TTL）まで有効**——userinfo/introspection のトークン検証はクライアント存在を
+/// 再解決しないため。即時に AT も殺すには AT doc の client_id クエリ削除が必要だが、
+/// 15 分窓は許容として v1 では client doc 削除に留める。
+pub async fn revoke_client(fs: &Firestore, client_id: &str) -> Result<bool, String> {
+    let existed = fs.get_doc(CLIENTS, client_id).await?.is_some();
+    if existed {
+        fs.delete_doc(CLIENTS, client_id).await?;
+    }
+    Ok(existed)
+}

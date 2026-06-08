@@ -769,6 +769,18 @@ pub(super) async fn register(
     let hash = crate::dcr::hash_token(&raw_iat);
     let tag = &hash[..8]; // 相関用の安全なハンドル（生トークンは出さない）。
 
+    // 素朴な単一 IP からの連発 backstop。Firestore read(peek_iat)を引く Bearer 付き要求だけを
+    // 数える（無 Bearer は I/O 前に 401 になる）。in-memory/インスタンス単位・先頭 X-F-F は
+    // 詐称可能なので増幅防御ではない——IAT 必須が本来の門。
+    let ip = client_ip(&headers);
+    if !p.register_rate.check_and_record("dcr-register", &ip) {
+        return dcr_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_requests",
+            "registration rate limit exceeded; retry later",
+        );
+    }
+
     let (constraints, expires_at, update_time) = match crate::dcr_store::peek_iat(fs, &hash).await {
         Ok(Some(x)) => x,
         Ok(None) => {
