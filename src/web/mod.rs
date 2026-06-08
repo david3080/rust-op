@@ -29,15 +29,6 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-/// パスワードログイン（固定資格 a/a）を有効化するか。テスト/コンフォーマンス専用。
-/// 本番（環境変数未設定）では無効化し、passkey/CIBA のみでログインさせる（バックドア非露出）。
-fn password_login_enabled() -> bool {
-    matches!(
-        std::env::var("PASSWORD_LOGIN_ENABLED").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
 /// FIDO2 Conformance 用の /fido/* エンドポイントを公開するか。テスト専用。
 /// 本番（環境変数未設定）では無効化し、攻撃面（本番の実フローに非接続なテスト面）を排除する。
 /// FIDO2 Conformance を回すときだけ FIDO_CONFORMANCE_ENABLED=1 で有効化する。
@@ -59,7 +50,7 @@ pub fn router(provider: Provider) -> Router {
         Router::new()
     };
     let shared = Arc::new(provider);
-    let mut inner = Router::new()
+    let inner = Router::new()
         .route("/.well-known/openid-configuration", get(oidc::discovery))
         .route("/jwks", get(oidc::jwks))
         .route("/authorize", get(oidc::authorize))
@@ -97,21 +88,6 @@ pub fn router(provider: Provider) -> Router {
         .route("/", get(pages::demo_start))
         .route("/callback", get(pages::demo_callback));
 
-    // パスワードログイン（固定資格 a/a）はテスト/コンフォーマンス専用。
-    // 本番では PASSWORD_LOGIN_ENABLED 未設定で無効化し、passkey/CIBA のみにする。
-    if password_login_enabled() {
-        inner = inner.route("/login/{uid}/password", post(login::login_submit));
-    }
-
-    // CIBA Consumption デモ（Web だけで CIBA を体験）。無認証で FCM push を誘発でき、
-    // 承認後に email/profile を無認証ポーラへ返すため、本番では既定で無効。
-    // デモ時のみ環境変数 CIBA_DEMO_ENABLED=1 で有効化する。
-    if std::env::var("CIBA_DEMO_ENABLED").map(|v| v == "1" || v == "true").unwrap_or(false) {
-        inner = inner
-            .route("/ciba-demo", get(ciba::ciba_demo_page))
-            .route("/ciba-demo/start", post(ciba::ciba_demo_start))
-            .route("/ciba-demo/poll", get(ciba::ciba_demo_poll));
-    }
     let inner = inner.with_state(shared.clone());
 
     // メールリンク /r はトップレベル（base_path 非依存、AASA の paths と一致）。
@@ -236,15 +212,12 @@ async fn authenticate_client(
         "private_key_jwt"
     } else if basic.is_some() {
         "client_secret_basic"
-    } else if form.contains_key("client_secret") {
-        "client_secret_post"
     } else {
         "none"
     };
     let input = ClientAuthInput {
         basic,
         body_client_id: form.get("client_id").cloned(),
-        body_client_secret: form.get("client_secret").cloned(),
         client_assertion: form.get("client_assertion").cloned(),
     };
     let auth = p

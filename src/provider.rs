@@ -20,9 +20,6 @@ pub struct Provider {
     /// 外部 URL のパス接頭辞（例 "/rust-oidc"）。Hosting rewrite はパスを保持して
     /// 転送するので、内部リダイレクトの Location もこの接頭辞を付ける必要がある。
     pub base_path: String,
-    /// 固定ログイン資格情報（PoC）。
-    pub demo_user: String,
-    pub demo_pass: String,
     pub store: Arc<dyn Store>,
     /// 既定の署名鍵（ES256）。client が alg を指定しない場合に使う。
     pub signer: Arc<dyn JwsSigner>,
@@ -66,7 +63,6 @@ impl Provider {
         let mut client_auth: HashMap<String, Arc<dyn ClientAuthMethod>> = HashMap::new();
         register_auth(&mut client_auth, Arc::new(NoneAuth));
         register_auth(&mut client_auth, Arc::new(ClientSecretBasic));
-        register_auth(&mut client_auth, Arc::new(ClientSecretPost));
         register_auth(&mut client_auth, Arc::new(PrivateKeyJwt::default()));
 
         let mut response_modes: HashMap<String, Arc<dyn ResponseMode>> = HashMap::new();
@@ -76,8 +72,6 @@ impl Provider {
         Self {
             issuer: issuer.into(),
             base_path: String::new(),
-            demo_user: "a".into(),
-            demo_pass: "a".into(),
             store: Arc::new(MemoryStore::default()),
             signer: Arc::new(Es256Signer::generate()),
             extra_signers: Vec::new(),
