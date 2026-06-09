@@ -260,10 +260,48 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
 
 ---
 
+## モデル #7: 合成（#3 CIBA 切り離し承認 × #3 RAR マンデート × #2 DPoP 送り主束縛）
+
+`composition_ciba_dpop_rar.spthy`。rust-op の CIBA ログイン（confidential client、トークンは DPoP 束縛、
+authorization_details = mandate）の end-to-end。#6（認可コード系の合成）と対になる **CIBA 系の合成**。
+
+### 検証する性質（lemma）
+- `comp_resource_secrecy`: 正規ユーザ U の保護リソースは、**DPoP 鍵もユーザ鍵も漏れない限り**攻撃者に漏れない。
+- `binding_integrity`: (arid, m) のトークン発行 ⇒ ユーザは**まさにその** (arid, m) を承認していた（表示すり替え不可）。
+- `mandate_single_use`: 同じ auth_req_id から2トークンは出ない（Pending が linear）。
+
+### 検証結果（Tamarin 1.12.0, 2026-06-09 実測）
+- `executable` verified (14 steps) / `comp_resource_secrecy` verified (12) / `binding_integrity` verified (8) /
+  `mandate_single_use` verified (12)。**一発で verified**（#6 で踏んだ payload 不整合バグを学習し `let` で両側統一）。
+- 必要性（NEG）:
+  - `composition_ciba_NEG_no_cnf.spthy`: RS の cnf.jkt 検査を外す → `comp_resource_secrecy` **falsified**（盗難トークンを
+    攻撃者の鍵で使用しリソース漏洩）＝**DPoP 送り主束縛が必要**。
+  - `composition_ciba_NEG_no_binding.spthy`: AS の「承認 mandate = 保存 mandate」検査を外す → `binding_integrity`
+    **falsified**（通知すり替えで承認 m′ ≠ 発行 m）＝**CIBA/RAR の mandate 束縛が必要**。
+
+### 表に出た前提 → rust-op の担保
+| 前提（抽象） | rust-op の担保（具体） |
+|---|---|
+| ユーザは**見た mandate に commit**して承認（passkey 署名） | CIBA 承認時の passkey 署名（`ciba.rs` / `webauthn.rs`） |
+| AS は **承認 mandate = backchannel 要求の mandate** を検査 | CIBA token endpoint の mandate 束縛（`ciba.rs`、authorization_details 照合） |
+| トークンは **cnf.jkt で送り主束縛**（盗まれても無効） | DPoP（`dpop.rs`、grants の `dpop_jkt` 一致） |
+| auth_req_id は **単回消費** | CIBA `consume_if_approved` の CAS 単回（前提 A1 に依存） |
+| クライアント認証（backchannel / poll 両方） | private_key_jwt（`client_auth.rs`） |
+
+### 攻撃者モデルと結論
+攻撃者は**ユーザ通知チャネルを操作可（表示すり替え）かつトークン窃取可**。それでも、cnf 束縛（盗難無効化）と
+mandate 束縛（すり替え無効化）が**重なって初めて** end-to-end のリソース秘匿が出る。どちらを外しても NEG が falsify する。
+
+### 限界
+- ID token(#5) の合成は別。public client（CIBA は通常 confidential なので該当は限定的）は対象外。
+
+---
+
 ## ロードマップ達成状況
-**#1 ✅ #2 ✅ #3 ✅ #4 ✅ #5 ✅ #6 ✅** — 全モデルが Tamarin 1.12.0 で verified、各前提の必要性も
+**#1 ✅ #2 ✅ #3 ✅ #4 ✅ #5 ✅ #6 ✅ #7 ✅** — 全モデルが Tamarin 1.12.0 で verified、各前提の必要性も
 NEG 変種の falsify で実証。各モデルが「防げる攻撃 ＋ 必要前提（→ rust-op の運用要件）」を1セット産んだ。
-合成(#6) は形式検証が隠れた前提（consent 束縛・redirect_uri 束縛）を炙り出した実例でもある。
+合成 #6（認可コード系）と #7（CIBA 系）は、複数防御が**重なって初めて**end-to-end の安全性が出ることを示す。
+#6 は形式検証が隠れた前提（consent 束縛・redirect_uri 束縛）を炙り出した実例でもある。
 
 ---
 

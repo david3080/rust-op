@@ -1,0 +1,112 @@
+theory CompositionCibaNegNoCnf
+begin
+
+/*
+  NEG 変種（cnf.jkt 検査を外す）: backlog #2 合成（CIBA×DPoP×RAR）で **RS の cnf.jkt 一致検査を外す**と、
+  盗まれたトークンを攻撃者が自分の鍵で使えてしまい、リソース秘匿が破れる（DPoP 送り主束縛の必要性）。
+  → comp_resource_secrecy が falsified するはず。
+
+  実行: tamarin-prover --prove --auto-sources formal/composition_ciba_NEG_no_cnf.spthy
+*/
+
+builtins: hashing, signing, asymmetric-encryption
+
+rule Setup_User:
+    [ Fr(~uk) ] --[ ]-> [ !UserKey($U, ~uk), !UserPub($U, pk(~uk)), Out(pk(~uk)) ]
+rule Reveal_User:
+    [ !UserKey($U, ~uk) ] --[ RevealUser($U) ]-> [ Out(~uk) ]
+
+rule Setup_Client:
+    [ Fr(~ck) ] --[ ]-> [ !ClientKey($Cl, ~ck), !ClientPub($Cl, pk(~ck)), Out(pk(~ck)) ]
+
+rule Setup_Resource:
+    [ Fr(~res) ] --[ Protected($U, ~res) ]-> [ !Resource($U, ~res) ]
+
+rule C_Backchannel:
+    [ !ClientKey($Cl, ~ck), Fr(~m) ]
+  --[ ClientRequest($Cl, $U, ~m) ]->
+    [ Out( <'backchannel', $Cl, $U, ~m, sign(<'backchannel', $Cl, $U, ~m>, ~ck)> ) ]
+
+rule AS_Backchannel:
+    [ In( <'backchannel', Cl, U, m, sig> ), !ClientPub(Cl, cpk), Fr(~arid) ]
+  --[ Eq(verify(sig, <'backchannel', Cl, U, m>, cpk), true)
+    , CreatePending(Cl, U, ~arid, m) ]->
+    [ Pending(~arid, Cl, U, m)
+    , Out( <'notify', ~arid, Cl, m> )
+    , Out( <'bcresp', Cl, ~arid> )
+    ]
+
+rule U_Approve:
+    [ !UserKey(U, ~uk), In( <'notify', arid, Cl, mseen> ) ]
+  --[ UserApproved(U, arid, mseen) ]->
+    [ Out( <'approval', arid, mseen, sign(<'approve', arid, mseen>, ~uk)> ) ]
+
+rule C_PollToken:
+    [ !ClientKey(Cl, ~ck), In( <'bcresp', Cl, arid> ), Fr(~dk) ]
+  --[ ]->
+    [ !CDk(Cl, ~dk)
+    , Out( <'tokenpoll', Cl, arid, pk(~dk),
+            sign(<'tokenpoll', Cl, arid, pk(~dk)>, ~ck)> )
+    ]
+
+rule Reveal_DPoP:
+    [ !CDk(Cl, ~dk) ] --[ RevealDPoP(Cl) ]-> [ Out(~dk) ]
+
+rule AS_IssueToken:
+    [ Pending(arid, Cl, U, m)
+    , !UserPub(U, upk)
+    , !ClientPub(Cl, cpk)
+    , In( <'approval', arid, mapproved, asig> )
+    , In( <'tokenpoll', Cl, arid, dppub, csig> )
+    , Fr(~at)
+    ]
+  --[ Eq(verify(asig, <'approve', arid, mapproved>, upk), true)
+    , Eq(mapproved, m)
+    , Eq(verify(csig, <'tokenpoll', Cl, arid, dppub>, cpk), true)
+    , IssueToken(Cl, U, arid, m, ~at, h(dppub)) ]->
+    [ !Bound(~at, h(dppub))
+    , !TokenUser(~at, U)
+    , Out(~at)
+    ]
+
+rule C_UseAT:
+    let payload = <'dpop', $M, $RU, ~jti, at>
+    in
+    [ !CDk(Cl, ~dk), In(at), Fr(~jti) ]
+  --[ ClientUsesAT(Cl, at) ]->
+    [ Out( <'rsreq', at, payload, sign(payload, ~dk), pk(~dk)> ) ]
+
+/* ★ NEG: cnf.jkt 一致検査（Eq(h(dppub), jkt)）を削除。proof 署名と jti 単回のみ。 */
+rule RS_Accept:
+    let payload = <'dpop', M, RU, jti, at>
+    in
+    [ !Bound(at, jkt), !TokenUser(at, U), !Resource(U, ~res)
+    , In( <'rsreq', at, payload, sig, dppub> )
+    ]
+  --[ Eq(verify(sig, payload, dppub), true)
+    , Once(jti)
+    , RS_Grant(at, U)
+    ]->
+    [ Out( aenc(~res, dppub) ) ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+restriction OnceJti:
+    "All x #i #j. Once(x) @ #i & Once(x) @ #j ==> #i = #j"
+
+lemma executable:
+  exists-trace
+    "Ex at U #g.
+        RS_Grant(at, U) @ #g
+      & not (Ex Cl #r. RevealDPoP(Cl) @ #r)
+      & not (Ex UU #r. RevealUser(UU) @ #r)"
+
+/* cnf を外したので、盗難トークンを攻撃者の鍵で使えて falsified するはず。 */
+lemma comp_resource_secrecy:
+    "All U res #i.
+        Protected(U, res) @ #i
+      & (not (Ex Cl #r. RevealDPoP(Cl) @ #r))
+      & (not (Ex UU #r. RevealUser(UU) @ #r))
+      ==> not (Ex #j. K(res) @ #j)"
+
+end
