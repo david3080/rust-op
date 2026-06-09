@@ -93,5 +93,9 @@ gcloud alpha monitoring policies create \
 
 - **done（コード, 本番稼働）**: アラート可能なセキュリティイベントの構造化 emit。request_id 相関（[Step3](./zero-trust-assessment.md)）。
 - **done（本書, config 定義）**: 期待ベースライン・閾値・log-based metric/アラートポリシーの定義と実行 snippet。
-- **残（ユーザ gate）**: 上記ポリシーの**実適用**（通知先選択が要る）。
+- **done（Cloud Monitoring に適用済 2026-06-09, project fido2-8b943）**:
+  - log-based metric 5本: `rust_op_kms_sign_failed` / `rust_op_client_auth_failed` / `rust_op_login_failed` / `rust_op_http_5xx` / `rust_op_dcr_registered`
+  - アラートポリシー 5本（上表の閾値: kms≥1, client_auth>10/5m, login_failed>20/5m, 5xx>5/5m, dcr>3/1h）
+  - 通知チャネル: email → `info@sonrisa.co.jp`
+- **残（ユーザの最終アクション）**: 通知チャネルは**未 verify**。`info@sonrisa.co.jp` に届く Google Cloud Monitoring の確認メールのリンクをクリックすると配信が有効化される（それまでポリシーは発火しても未配信）。
 - **残（Enterprise/Advanced, 対象外）**: 自動 first-pass triage・統計的異常検知・agentic SOAR・不変監査ログ。
