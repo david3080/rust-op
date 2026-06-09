@@ -115,3 +115,40 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
 ### 限界 / 次版
 - トークン発行は #1 から抽象化（**#6 合成**で #1×#2 を繋ぐ）。
 - htm/htu は payload に持たせる（厳密一致は部分モデル）。jti 単回は含むが「proof 非リプレイ」の個別 lemma は別途。
+
+---
+
+## モデル #3: CIBA（切り離し承認）+ RAR マンデート
+
+`ciba_rar.spthy` — rust-op 固有・学術的にも手薄。中心の脅威は**「ユーザが見たものと違う要求を承認させられる」**。
+登場人物: クライアント（消費デバイス = ciba-rp）/ AS / ユーザ（認証デバイス, passkey）。
+攻撃者は**ユーザへの通知チャネルを操作できる**（表示すり替えの脅威）。
+
+検証する性質: **binding 完全性**（(arid,m) のトークン発行 ⇒ ユーザは“まさにその”(arid,m) を承認していた）と
+**マンデート単回**（同じ auth_req_id から2トークンは出ない）。
+
+### 検証結果（Tamarin 1.12.0, 2026-06-09 実測）
+| モデル | 結果 |
+|---|---|
+| `ciba_rar.spthy` | `executable` / `binding_integrity` / `mandate_single_use` **verified** |
+| `ciba_NEG_no_binding.spthy`（承認の mandate 束縛を外す）| `binding_integrity` **falsified（表示すり替え攻撃トレース）** |
+| `ciba_NEG_no_singleuse.spthy`（Pending を persistent に）| `mandate_single_use` **falsified（リプレイ）** |
+
+→ **束縛検査が必要**（外すとユーザが承認した mandate と発行 mandate が食い違う＝CIBA 中心の脅威）。
+→ **マンデート単回が必要**（外すと同一 auth_req_id から複数トークン）。
+
+### 表に出た前提 → rust-op の担保
+| ID | 前提（抽象） | rust-op の担保 |
+|---|---|---|
+| P-BIND | ユーザ承認は**具体的 mandate に commit** し、AS は承認された mandate のみ発行 | binding_message + authorization_details を auth_req_id に紐付け表示・承認、token に approved mandate |
+| P-UREAD | **ユーザが binding_message を読む**（モデル外の人間前提） | UI で binding_message/mandate を提示（"見たものに commit" を前提） |
+| P-MSINGLE | マンデート(auth_req_id) は**単回消費** | `mandate_consumed` CAS（/oauth/mandate/consume）+ CIBA store の単回 |
+| P-CAUTH | backchannel と poll で**クライアント認証** | ciba-rp Basic（live e2e で実機確認済） |
+| P-UAUTH | 承認は**ユーザ認証**（passkey） | fido2demo アプリで passkey 承認 |
+| （反スパム） | 無認証トリガの**レート制限** | `ciba_rate`（**記号的検証の対象外**＝量的性質） |
+
+→ 導出された運用要件: **ユーザ承認を具体的 mandate に暗号的に束縛し、AS は承認された mandate のみ発行せよ**（外すと表示すり替え）。**マンデートは単回消費せよ**。
+
+### 限界
+- 「ユーザが読む」は記号的に捉えられない人間前提（P-UREAD）。モデルは「ユーザは見た m に commit する」までを表現。
+- 反スパム（量的）は Tamarin の対象外（rust-op は `ciba_rate` で対処）。
