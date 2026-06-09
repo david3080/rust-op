@@ -1,0 +1,102 @@
+theory DPoPBinding
+begin
+
+/*
+  ロードマップ #2: DPoP 送り主束縛（RFC 9449）
+  「盗まれた bearer アクセストークンは、DPoP 秘密鍵なしには使えない」を検証する。
+
+  焦点: トークンの **利用フェーズ（リソースサーバ RS での検証）**。
+        トークン発行は #1 から抽象化（AS は DPoP 鍵 thumbprint に束縛したトークンを発行する、とだけ置く）。
+
+  DPoP の核:
+    - 発行時: AS はアクセストークンに cnf.jkt = h(クライアントの DPoP 公開鍵) を埋める。
+    - 利用時: クライアントは token + DPoP proof（DPoP 鍵で署名、htm/htu/jti/ath を含む）を RS に提示。
+              RS は (a) proof の鍵 thumbprint = token の cnf.jkt、(b) proof 署名検証、(c) jti 単回 を確認。
+    - 結果: トークンを盗んでも DPoP 秘密鍵が無ければ proof を作れず使えない。
+
+  攻撃者: Dolev-Yao。トークン窃取（Steal_Token）も可能。
+  抽象: thumbprint(jkt) = h(pubkey)。htm/htu は payload に持たせる（厳密な一致は部分モデル）。
+
+  実行: tamarin-prover --prove --auto-sources formal/dpop_binding.spthy
+*/
+
+builtins: hashing, signing
+
+/* ---- クライアントの DPoP 鍵 ---- */
+rule Setup_Client:
+    [ Fr(~dk) ]
+  --[ ClientKey($C, ~dk) ]->
+    [ !DPoPKey($C, ~dk), !DPoPPub($C, pk(~dk)), Out(pk(~dk)) ]
+
+/* ---- 攻撃者が DPoP 秘密鍵を奪取できる（前提「DPoP 鍵秘匿」を表に出すため）---- */
+rule Reveal_DPoP_Key:
+    [ !DPoPKey($C, ~dk) ]
+  --[ RevealDPoP($C) ]->
+    [ Out(~dk) ]
+
+/* ---- AS: DPoP 束縛トークン発行（#1 から抽象化）。token に cnf.jkt = h(pub) を束縛 ---- */
+rule AS_IssueToken:
+    [ !DPoPPub($C, dpk), Fr(~token) ]
+  --[ IssueToken($C, ~token, h(dpk)) ]->
+    [ !Bound(~token, h(dpk))     // token の cnf.jkt = クライアント DPoP 公開鍵の thumbprint
+    , !ClientToken($C, ~token)   // クライアントがトークンを保持（再利用可なので persistent）
+    ]
+
+/* ---- トークン窃取: アクセストークンが攻撃者に漏れる（XSS / ログ / 中間者）---- */
+rule Steal_Token:
+    [ !ClientToken($C, token) ]
+  --[ StealToken(token) ]->
+    [ Out(token) ]
+
+/* ---- クライアント: トークン利用。token + 新鮮な DPoP proof（DPoP 鍵で署名）を RS へ ----
+   proof の payload は RS が読める（'dpop', htm=M, htu=U, jti, token(=ath 相当)）。 */
+rule C_UseToken:
+    let payload = <'dpop', $M, $U, ~jti, token>
+    in
+    [ !ClientToken($C, token), !DPoPKey($C, ~dk), Fr(~jti) ]
+  --[ ClientUses($C, token) ]->
+    [ Out( <'rsreq', token, payload, sign(payload, ~dk), pk(~dk)> ) ]
+
+/* ---- RS: 検証。cnf.jkt 一致 + proof 署名検証 + jti 単回 → アクセス許可 ----
+   クライアント認証ではなく「DPoP 鍵の所持証明」で送り主を束縛する。 */
+rule RS_Accept:
+    let payload = <'dpop', M, U, jti, token>
+    in
+    [ !Bound(token, jkt)
+    , In( <'rsreq', token, payload, sig, dppub> )
+    ]
+  --[ Eq(h(dppub), jkt)                          // cnf.jkt 一致: 提示鍵の thumbprint = token の jkt（送り主束縛の核）
+    , Eq(verify(sig, payload, dppub), true)       // DPoP proof 署名検証
+    , Once(jti)                                    // jti 単回（proof リプレイ防止）
+    , RS_Grant(token, dppub)
+    ]->
+    [ ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+restriction OnceJti:
+    "All x #i #j. Once(x) @ #i & Once(x) @ #j ==> #i = #j"
+
+/* ======================== 性質 ======================== */
+
+/* (0) 健全性: 正直なトークン利用が RS に通る。 */
+lemma executable:
+  exists-trace
+    "Ex C token dppub #c #g.
+        ClientUses(C, token) @ #c
+      & RS_Grant(token, dppub) @ #g
+      & not (Ex CC #r. RevealDPoP(CC) @ #r)"
+
+/* (1) 送り主束縛: honest client の DPoP 鍵に束縛されたトークンで RS がアクセスを許可するのは、
+       その honest client 自身が利用したときか、DPoP 秘密鍵が漏れたときに限る。
+       = 攻撃者がトークンを盗んでも（鍵が無ければ）RS を通せない。
+       成立を支える前提: P-DKEY（DPoP 鍵秘匿）・cnf.jkt 検査・proof 署名検証。 */
+lemma dpop_sender_constraining:
+    "All C token dk dppub #i #b #c.
+        RS_Grant(token, dppub) @ #i
+      & ClientKey(C, dk) @ #b
+      & IssueToken(C, token, h(pk(dk))) @ #c
+      ==> (Ex #u. ClientUses(C, token) @ #u) | (Ex #r. RevealDPoP(C) @ #r)"
+
+end
