@@ -39,7 +39,10 @@ pub fn ath(access_token: &str) -> String {
 }
 
 /// htu 正規化: query(?) と fragment(#) を除去（RFC 9449 §4.3）。
-fn strip_query_fragment(u: &str) -> &str {
+/// `str::find` は文字境界を返す契約ゆえ `end` は常に境界 → `&u[..end]` は panic しえない
+/// （安全イディオム）。kani_harness.rs でこの安全性をロックとして確認する（生 index 化等の
+/// 危険な refactor を検出）。記号 find が状態爆発するため代表的な境界ケースに有界化。
+pub(crate) fn strip_query_fragment(u: &str) -> &str {
     let end = u.find(['?', '#']).unwrap_or(u.len());
     &u[..end]
 }

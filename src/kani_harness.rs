@@ -59,3 +59,83 @@ fn jti_ttl_is_bounded() {
         assert!(ttl > 0 && ttl <= max, "jti TTL は (0, 3600] に有界");
     }
 }
+
+/// 長さ可変の実 UTF-8 文字列を `[u8; N]` の前方 len バイトから記号的に生成する。
+/// マルチバイト文字を含みうる入力空間にすること（ASCII 固定だと UTF-8 境界の検証が無意味になる）。
+fn any_utf8<const N: usize>(buf: &[u8; N]) -> &str {
+    let len: usize = kani::any();
+    kani::assume(len <= N);
+    let s = core::str::from_utf8(&buf[..len]);
+    kani::assume(s.is_ok());
+    s.unwrap()
+}
+
+/// 橋 #1（回帰ロック・恒真寄り）: redirect_uri 照合が **バイト完全一致** で、正規化・前方一致の
+/// 抜け道が無いこと。`redirect_uri_registered(a,[b]) ⟺ a==b`、空リストは決して一致しない。
+/// 将来の編集で正規化が紛れ込むと本ロックが破れる。バグ狩りではなく契約の固定。
+#[kani::proof]
+#[kani::unwind(6)]
+fn redirect_uri_match_is_exact() {
+    let ab: [u8; 5] = kani::any();
+    let bb: [u8; 5] = kani::any();
+    let a = any_utf8(&ab);
+    let b = any_utf8(&bb);
+
+    let registered = [b.to_string()];
+    assert_eq!(
+        crate::auth_checks::redirect_uri_registered(a, &registered),
+        a == b,
+        "単一登録値との一致は厳密にバイト等価（正規化なし）",
+    );
+    assert!(
+        !crate::auth_checks::redirect_uri_registered(a, &[]),
+        "空の登録リストは決して一致しない",
+    );
+}
+
+/// 橋 #2（回帰ロック）: PKCE の code_challenge_method は **厳密に S256 のみ受理**。
+/// method 省略(None→plain)・大小違い・末尾空白など S256 以外は全て拒否（ダウングレード不可）。
+/// `pkce_method_is_s256(m) ⟺ m == Some("S256")` を全 method 上で固定する。
+#[kani::proof]
+#[kani::unwind(6)]
+fn pkce_method_no_downgrade() {
+    let is_some: bool = kani::any();
+    let mb: [u8; 5] = kani::any();
+    let m: Option<&str> = if is_some { Some(any_utf8(&mb)) } else { None };
+
+    assert_eq!(
+        crate::auth_checks::pkce_method_is_s256(m),
+        m == Some("S256"),
+        "S256 ちょうどのみ受理（None/plain/大小違い等は拒否）",
+    );
+}
+
+/// 橋 #4（回帰ロック。当初「バグ狩り」と見積もったが過大評価だった）:
+/// `strip_query_fragment` は `end = u.find(['?','#'])..` を使い、`str::find` は**文字境界**を返す契約
+/// ゆえ `&u[..end]` は構造的に panic しえない（安全イディオム）。よって潜在バグは元から無く、本ハーネスは
+/// その安全性の**確認＝ロック**（生 index 化等の危険な refactor を検出）。`str::find` を使わず生バイト
+/// index 演算/`unsafe`/ビット操作をする変換コード（`b64url`/thumbprint）こそが Kani の本物のバグ狩り面。
+///
+/// 検証内容: 2 バイト文字 `é`(0xC3 0xA9) の直後に記号バイト 1 つ（ASCII 全域）を置いた `"é<tail>"` で、
+/// `tail` が `?`/`#` のとき `&u[..2]`（`é` 直後＝多バイト境界）で切れて panic しない＋結果は接頭辞。
+///
+/// `str::find` を**記号文字列**で走らせるとパターンマッチャの UTF-8 デコードが状態爆発する（この 8GB
+/// 環境では収束しない）。そこで**先頭文字を具体値に固定**しデコードを安くし、記号次元を「区切りの値」だけに絞る。
+/// **カバレッジ境界**: 任意先頭文字長・任意長の全証明ではない（上記契約より全入力で安全なので、ここは確認）。
+#[kani::proof]
+#[kani::unwind(5)]
+fn strip_query_fragment_safe() {
+    let tail: u8 = kani::any();
+    kani::assume(tail < 0x80); // ASCII は単独で妥当な UTF-8
+    let buf = [0xC3u8, 0xA9, tail]; // "é" + tail
+    let u = unsafe { core::str::from_utf8_unchecked(&buf) };
+
+    let r = crate::dpop::strip_query_fragment(u); // 到達＝多バイト境界スライス panic 無し
+    assert!(u.starts_with(r), "結果は入力の接頭辞");
+    if tail == b'?' || tail == b'#' {
+        assert_eq!(r.len(), 2, "区切りの直前＝多バイト境界(index 2)でちょうど切る");
+    } else {
+        assert_eq!(r.len(), 3, "区切りが無ければ全長を保つ");
+        assert!(!r.contains('?') && !r.contains('#'), "本当に区切りを含まない");
+    }
+}
