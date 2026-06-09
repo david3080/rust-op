@@ -66,8 +66,8 @@ async fn issue_access_and_id(
             mandate_consumed: false,
         })
         .await;
-    // 監査イベント（Cloud Logging metric/alert 用）。
-    tracing::info!(event = "token_issued", client_id = %client_id, sub = %account_id, scope = %scope);
+    // 監査イベント（Cloud Logging metric/alert 用）。sub は擬似化して平文 PII をログに残さない。
+    tracing::info!(event = "token_issued", client_id = %client_id, sub = %crate::web::pseudonymize_sub(account_id), scope = %scope);
 
     let iat = now();
     let mut claims = serde_json::json!({
