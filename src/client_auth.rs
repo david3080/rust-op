@@ -10,11 +10,18 @@ use subtle::ConstantTimeEq;
 
 /// client_assertion の最大有効期間（秒）。これを超える exp は拒否し、jti をこの上限まで
 /// 覚えればリプレイ窓を塞げる（FAPI2 は短命な client_assertion を推奨）。request_object と同値。
-const MAX_ASSERTION_LIFETIME_SECS: i64 = 3600;
+pub(crate) const MAX_ASSERTION_LIFETIME_SECS: i64 = 3600;
 
 /// client_secret の定数時間比較（タイミング攻撃対策）。
 fn secret_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// client_assertion / request object の exp が受理窓内か: `now < exp <= now + max_lifetime`。
+/// オーバーフロー安全（saturating_add）。純粋述語として切り出し Kani で検証する
+/// （Tamarin #1 の「assertion 新鮮性」前提を、実コードがこの述語で担保していることの橋）。
+pub(crate) fn exp_in_window(exp: i64, now: i64, max_lifetime: i64) -> bool {
+    exp > now && exp <= now.saturating_add(max_lifetime)
 }
 
 /// token endpoint から渡る認証材料。
@@ -166,17 +173,18 @@ impl ClientAuthMethod for PrivateKeyJwt {
             .unwrap()
             .as_secs() as i64;
         let exp = match payload.get("exp").and_then(|v| v.as_i64()) {
-            Some(exp) if exp > now => exp,
-            _ => return Err(bad("assertion expired")),
+            Some(exp) => exp,
+            None => return Err(bad("assertion expired")),
         };
-        // exp に上限を課す。上限が無いと、長命な assertion を jti 失効(後述)後〜exp の窓で
-        // リプレイでき、また jti を exp まで覚える際の保持期間も無制限になる。
-        if exp > now + MAX_ASSERTION_LIFETIME_SECS {
-            return Err(bad("assertion exp is too far in the future"));
+        // exp は受理窓内（now < exp <= now + 上限）。上限が無いと、長命な assertion を
+        // jti 失効(後述)後〜exp の窓でリプレイでき、jti 保持期間も無制限になる。
+        // 窓検査は exp_in_window（Kani 検証済・オーバーフロー安全）に集約。
+        if !exp_in_window(exp, now, MAX_ASSERTION_LIFETIME_SECS) {
+            return Err(bad("assertion expired or exp too far in the future"));
         }
         // nbf 検証: 大きく未来の nbf は拒否（FAPI2: 60 秒超の clock skew は不可）。
         if let Some(nbf) = payload.get("nbf").and_then(|v| v.as_i64()) {
-            if nbf > now + 60 {
+            if nbf > now.saturating_add(60) {
                 return Err(bad("assertion nbf too far in the future"));
             }
         }
