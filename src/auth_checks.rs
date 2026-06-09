@@ -31,6 +31,12 @@ impl AuthorizationCheck for CheckClient {
     }
 }
 
+/// requested が登録値のいずれかと **バイト完全一致** するか。正規化・前方一致は一切しない
+/// （open redirect を生む正規化の抜け道が無いことを Kani で固定する純粋述語）。
+pub(crate) fn redirect_uri_registered(requested: &str, registered: &[String]) -> bool {
+    registered.iter().any(|u| u == requested)
+}
+
 /// redirect_uri が登録値と完全一致するか（OIDC は完全一致が必須）。
 pub struct CheckRedirectUri;
 #[async_trait]
@@ -41,7 +47,7 @@ impl AuthorizationCheck for CheckRedirectUri {
             .redirect_uri
             .as_deref()
             .ok_or_else(|| OAuthError::InvalidRequest("redirect_uri required".into()))?;
-        if !ctx.client().redirect_uris.iter().any(|u| u == ru) {
+        if !redirect_uri_registered(ru, &ctx.client().redirect_uris) {
             return Err(OAuthError::InvalidRequest(format!(
                 "redirect_uri {ru} not registered"
             )));
@@ -77,6 +83,12 @@ impl AuthorizationCheck for CheckScope {
     }
 }
 
+/// code_challenge_method が S256 として受理されるか。method 省略時の既定は plain で、これは拒否。
+/// `plain` への暗黙フォールバックでダウングレードできないことを Kani で固定する純粋述語。
+pub(crate) fn pkce_method_is_s256(method: Option<&str>) -> bool {
+    method.unwrap_or("plain") == "S256"
+}
+
 /// PKCE。public client では必須、code_challenge_method は S256 のみ。
 pub struct CheckPkce;
 #[async_trait]
@@ -86,8 +98,7 @@ impl AuthorizationCheck for CheckPkce {
         let required = ctx.client().is_public() || ctx.client().require_pkce;
         match ctx.params.code_challenge.as_deref() {
             Some(_) => {
-                let method = ctx.params.code_challenge_method.as_deref().unwrap_or("plain");
-                if method != "S256" {
+                if !pkce_method_is_s256(ctx.params.code_challenge_method.as_deref()) {
                     return Err(OAuthError::InvalidRequest(
                         "code_challenge_method must be S256".into(),
                     ));

@@ -39,7 +39,10 @@ pub fn ath(access_token: &str) -> String {
 }
 
 /// htu 正規化: query(?) と fragment(#) を除去（RFC 9449 §4.3）。
-fn strip_query_fragment(u: &str) -> &str {
+/// `'?'`/`'#'` は ASCII なので `find` の返す byte index は常に UTF-8 境界 → `&u[..end]` は
+/// panic しない。この境界安全性を Kani で確認する（記号モデルが見ない実装固有の死角。ただし
+/// `find` の記号スキャンが状態爆発するため代表的な境界ケースに有界化。kani_harness.rs 参照）。
+pub(crate) fn strip_query_fragment(u: &str) -> &str {
     let end = u.find(['?', '#']).unwrap_or(u.len());
     &u[..end]
 }
