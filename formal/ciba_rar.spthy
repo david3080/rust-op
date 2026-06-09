@@ -1,0 +1,112 @@
+theory CIBARARMandate
+begin
+
+/*
+  ロードマップ #3: CIBA（切り離し承認） + RAR マンデート
+  rust-op 固有・学術的にも手薄。中心の脅威は「ユーザが見たものと違う要求を承認させられる」。
+
+  検証する性質:
+    - binding 完全性: (arid, m) のトークンが発行されたなら、ユーザは“まさにその” (arid, m) を承認していた。
+                       = 表示すり替え（binding_message/mandate 詐称）でユーザを騙せない。
+    - マンデート単回: 同じ auth_req_id から2トークンは出ない。
+
+  登場人物: クライアント（消費デバイス = ciba-rp, confidential）/ AS / ユーザ（認証デバイス, passkey 抽象）。
+  攻撃者: Dolev-Yao。**ユーザへの通知チャネルを操作できる**（表示すり替えの脅威を表現）。
+  抽象: passkey = ユーザ署名鍵。binding_message/authorization_details(mandate) = 値 m。
+        「ユーザが m を読む」は人間の前提（モデル外）だが、「ユーザは“見た m”に署名で commit する」ことで表現。
+
+  実行: tamarin-prover --prove --auto-sources formal/ciba_rar.spthy
+*/
+
+builtins: signing
+
+/* ---- ユーザの認証鍵（passkey 抽象）---- */
+rule Setup_User:
+    [ Fr(~uk) ]
+  --[ ]->
+    [ !UserKey($U, ~uk), !UserPub($U, pk(~uk)), Out(pk(~uk)) ]
+
+rule Reveal_User:
+    [ !UserKey($U, ~uk) ]
+  --[ RevealUser($U) ]->
+    [ Out(~uk) ]
+
+/* ---- confidential client（消費デバイス = ciba-rp）---- */
+rule Setup_Client:
+    [ Fr(~ck) ]
+  --[ ]->
+    [ !ClientKey($Cl, ~ck), !ClientPub($Cl, pk(~ck)), Out(pk(~ck)) ]
+
+/* ---- クライアント: CIBA backchannel 要求を発行（mandate ~m, ユーザ $U 宛, クライアント認証）---- */
+rule C_Backchannel:
+    [ !ClientKey($Cl, ~ck), Fr(~m) ]
+  --[ ClientRequest($Cl, $U, ~m) ]->
+    [ Out( <'backchannel', $Cl, $U, ~m, sign(<'backchannel', $Cl, $U, ~m>, ~ck)> ) ]
+
+/* ---- AS: クライアント認証 → pending 作成（linear = 単回）→ ユーザ通知 + クライアントへ arid 返却 ----
+   通知は In/Out（ネットワーク）＝攻撃者が m をすり替え可能（表示すり替えの脅威）。 */
+rule AS_Backchannel:
+    [ In( <'backchannel', Cl, U, m, sig> ), !ClientPub(Cl, cpk), Fr(~arid) ]
+  --[ Eq(verify(sig, <'backchannel', Cl, U, m>, cpk), true)
+    , CreatePending(Cl, U, ~arid, m) ]->
+    [ Pending(~arid, Cl, U, m)
+    , Out( <'notify', ~arid, Cl, m> )    // 認証デバイス(ユーザ)への通知
+    , Out( <'bcresp', Cl, ~arid> )       // 起案クライアントへ auth_req_id 返却
+    ]
+
+/* ---- ユーザ: 通知を受け取り、見た mandate(mseen) に署名して承認（passkey）。
+        “見たものに commit”する＝承認は (arid, mseen) を束縛する。 ---- */
+rule U_Approve:
+    [ !UserKey(U, ~uk), In( <'notify', arid, Cl, mseen> ) ]
+  --[ UserApproved(U, arid, mseen) ]->
+    [ Out( <'approval', arid, mseen, sign(<'approve', arid, mseen>, ~uk)> ) ]
+
+/* ---- クライアント: token endpoint をポーリング（クライアント認証）---- */
+rule C_PollToken:
+    [ !ClientKey(Cl, ~ck), In( <'bcresp', Cl, arid> ) ]
+  --[ ]->
+    [ Out( <'tokenpoll', Cl, arid, sign(<'tokenpoll', Cl, arid>, ~ck)> ) ]
+
+/* ---- AS: トークン発行。pending 消費(単回) + ユーザ承認検証 + 束縛(承認 m = 保存 m) + クライアント認証 ---- */
+rule AS_IssueToken:
+    [ Pending(arid, Cl, U, m)
+    , !UserPub(U, upk)
+    , !ClientPub(Cl, cpk)
+    , In( <'approval', arid, mapproved, asig> )
+    , In( <'tokenpoll', Cl, arid, csig> )
+    , Fr(~token)
+    ]
+  --[ Eq(verify(asig, <'approve', arid, mapproved>, upk), true)   // ユーザ承認の署名検証
+    , Eq(mapproved, m)                                            // 束縛: ユーザが承認した mandate = 保存 mandate
+    , Eq(verify(csig, <'tokenpoll', Cl, arid>, cpk), true)        // クライアント認証（poll）
+    , IssueToken(Cl, U, arid, m, ~token)
+    ]->
+    [ ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* ======================== 性質 ======================== */
+
+/* (0) 健全性 */
+lemma executable:
+  exists-trace
+    "Ex Cl U arid m token #i.
+        IssueToken(Cl, U, arid, m, token) @ #i
+      & not (Ex UU #r. RevealUser(UU) @ #r)"
+
+/* (1) binding 完全性: (arid, m) のトークン発行 ⇒ ユーザは (arid, m) を承認していた（鍵漏洩を除く）。
+       = 表示すり替えでユーザを騙して未承認 mandate のトークンを得ることはできない。 */
+lemma binding_integrity:
+    "All Cl U arid m token #i.
+        IssueToken(Cl, U, arid, m, token) @ #i
+      ==> (Ex #a. UserApproved(U, arid, m) @ #a) | (Ex #r. RevealUser(U) @ #r)"
+
+/* (2) マンデート単回: 同じ arid から2トークンは出ない（Pending が linear = 単回消費）。 */
+lemma mandate_single_use:
+    "All Cl U arid m t1 t2 #i #j.
+        IssueToken(Cl, U, arid, m, t1) @ #i
+      & IssueToken(Cl, U, arid, m, t2) @ #j
+      ==> #i = #j"
+
+end
