@@ -1,0 +1,141 @@
+theory CompositionCodeDPoP
+begin
+
+/*
+  ロードマップ #6: 合成（#1 認可コード+PKCE+クライアント認証 × #2 DPoP × #4 ユーザ同意）
+  rust-op の FAPI2 ログイン（confidential client = private_key_jwt = DCR/FAPI）。
+
+  ★ この合成は一筋縄ではいかなかった（合成は別物）。Tamarin が2度 falsify を返し、
+    “抽象化で落としていた前提”を炙り出した:
+      (i)  ユーザ同意の束縛: コードは「ユーザが“その特定クライアント”に同意した」ときだけ出るべき。
+           無いと誰のクライアントでもユーザの認可を得られる。→ U_Consent を追加。
+      (ii) public client では client_id 詐称で流れを乗っ取れる（本来 redirect_uri 完全一致が防ぐ）。
+           → confidential client（クライアント認証）に切り替え。クライアント認証が償還を守る。
+    これらは“形式検証が隠れた前提を強制的に明示させた”実例。
+
+  検証する性質（エンドツーエンドのリソース秘匿）:
+    正規ユーザ U の保護リソースは、DPoP 鍵もユーザ鍵も漏れない限り攻撃者に漏れない。
+    依存: ユーザ同意(#4) + クライアント認証 + PKCE(#1) + cnf.jkt(#2)。
+    → どれを外しても falsify するはず（NEG 変種で client-auth / PKCE / cnf を確認）。
+
+  攻撃者: Dolev-Yao。コードもトークンも窃取可能。
+  実行: tamarin-prover --prove --auto-sources formal/composition_code_dpop.spthy
+*/
+
+builtins: hashing, signing, asymmetric-encryption
+
+/* ---- RS の保護リソース（正規ユーザ $U のもの）---- */
+rule Setup_Resource:
+    [ Fr(~res) ]
+  --[ Protected($U, ~res) ]->
+    [ !Resource($U, ~res) ]
+
+/* ---- ユーザの認証鍵（passkey, #4）---- */
+rule Setup_User:
+    [ Fr(~uk) ] --[ ]-> [ !UserKey($U, ~uk), !UserPub($U, pk(~uk)), Out(pk(~uk)) ]
+rule Reveal_User:
+    [ !UserKey($U, ~uk) ] --[ RevealUser($U) ]-> [ Out(~uk) ]
+
+/* ---- confidential client（private_key_jwt = DCR/FAPI）---- */
+rule Setup_Client:
+    [ Fr(~ck) ] --[ ]-> [ !ClientKey($Cl, ~ck), !ClientPub($Cl, pk(~ck)), Out(pk(~ck)) ]
+
+/* ---- 認可要求。PKCE verifier ~v ---- */
+rule C_AuthReq:
+    [ Fr(~v) ]
+  --[ ClientStart($Cl, ~v) ]->
+    [ St_C($Cl, ~v), Out( <'authreq', $Cl, h(~v)> ) ]
+
+/* ---- ユーザ同意: “この特定クライアント Cl”に passkey で同意（#4 の束縛）---- */
+rule U_Consent:
+    [ !UserKey(U, ~uk), In( <'authreq', Cl, challenge> ) ]
+  --[ UserConsent(U, Cl, challenge) ]->
+    [ Out( <'consent', Cl, challenge, sign(<'consent', Cl, challenge>, ~uk)> ) ]
+
+/* ---- AS: ユーザ同意を検証 → コード発行（(Cl,U,challenge) 束縛, 単回）---- */
+rule AS_IssueCode:
+    [ In( <'authreq', Cl, challenge> )
+    , In( <'consent', Cl, challenge, appr> )
+    , !UserPub(U, upk)
+    , Fr(~code)
+    ]
+  --[ Eq(verify(appr, <'consent', Cl, challenge>, upk), true)
+    , IssueCode(Cl, U, ~code, challenge) ]->
+    [ AS_Code(Cl, U, ~code, challenge), Out(~code) ]
+
+/* ---- client: 償還。code + verifier ~v + DPoP 鍵 ~dk + クライアント署名（client auth）---- */
+rule C_Redeem:
+    [ St_C(Cl, ~v), !ClientKey(Cl, ~ck), Fr(~dk), In(code) ]
+  --[ ClientRedeem(Cl, code, ~v) ]->
+    [ !CDk(Cl, ~dk)
+    , Out( <'tokenreq', Cl, code, ~v, pk(~dk),
+            sign(<'tokenreq', Cl, code, ~v, pk(~dk)>, ~ck)> )
+    ]
+
+rule Reveal_DPoP:
+    [ !CDk(Cl, ~dk) ] --[ RevealDPoP(Cl) ]-> [ Out(~dk) ]
+
+/* ---- AS: token endpoint。code 単回消費 + クライアント認証 + PKCE → access token を cnf.jkt 束縛で発行 ----
+   token は平文配送（窃取可能 = #2 の脅威）。 */
+rule AS_IssueToken:
+    let req = <'tokenreq', Cl, code, v, dppub, csig>
+    in
+    [ AS_Code(Cl, U, code, challenge)
+    , !ClientPub(Cl, cpk)
+    , In(req)
+    , Fr(~at)
+    ]
+  --[ Eq(verify(csig, <'tokenreq', Cl, code, v, dppub>, cpk), true)   // クライアント認証（#1）
+    , Eq(h(v), challenge)                                             // PKCE（#1）
+    , IssueToken(Cl, U, ~at, h(dppub)) ]->
+    [ !Bound(~at, h(dppub))      // cnf.jkt 束縛（#2）
+    , !TokenUser(~at, U)
+    , Out(~at)                   // 平文配送（窃取可能）
+    ]
+
+/* ---- client: token を DPoP proof 付きで RS へ ---- */
+rule C_UseAT:
+    let payload = <'dpop', $M, $RU, ~jti, at>
+    in
+    [ !CDk(Cl, ~dk), In(at), Fr(~jti) ]
+  --[ ClientUsesAT(Cl, at) ]->
+    [ Out( <'rsreq', at, payload, sign(payload, ~dk), pk(~dk)> ) ]
+
+/* ---- RS: cnf.jkt 一致 + proof 署名 + jti 単回 → リソースをリクエスタの鍵へ暗号化して開放 ---- */
+rule RS_Accept:
+    let payload = <'dpop', M, RU, jti, at>
+    in
+    [ !Bound(at, jkt), !TokenUser(at, U), !Resource(U, ~res)
+    , In( <'rsreq', at, payload, sig, dppub> )
+    ]
+  --[ Eq(h(dppub), jkt)                          // cnf.jkt 一致（#2）
+    , Eq(verify(sig, payload, dppub), true)       // proof 署名
+    , Once(jti)
+    , RS_Grant(at, U)
+    ]->
+    [ Out( aenc(~res, dppub) ) ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+restriction OnceJti:
+    "All x #i #j. Once(x) @ #i & Once(x) @ #j ==> #i = #j"
+
+/* ======================== 性質 ======================== */
+
+lemma executable:
+  exists-trace
+    "Ex at U #g.
+        RS_Grant(at, U) @ #g
+      & not (Ex Cl #r. RevealDPoP(Cl) @ #r)
+      & not (Ex UU #r. RevealUser(UU) @ #r)"
+
+/* エンドツーエンドのリソース秘匿（#1 × #2 × #4 の合成）:
+   正規ユーザの保護リソースは、DPoP鍵もユーザ鍵も漏れない限り攻撃者に漏れない。 */
+lemma comp_resource_secrecy:
+    "All U res #i.
+        Protected(U, res) @ #i
+      & (not (Ex Cl #r. RevealDPoP(Cl) @ #r))
+      & (not (Ex UU #r. RevealUser(UU) @ #r))
+      ==> not (Ex #j. K(res) @ #j)"
+
+end

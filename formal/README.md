@@ -219,3 +219,48 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
 ### 限界
 - ユーザ認証/同意は #4 で抽象化（**#6 合成**で繋ぐ）。
 - iss/mix-up は OP 鍵束縛で部分表現（明示的な mix-up 実験は別途）。
+
+---
+
+## モデル #6: 合成（#1 認可コード+PKCE+クライアント認証 × #2 DPoP × #4 ユーザ同意）
+
+`composition_code_dpop.spthy` — rust-op の FAPI2 ログイン（confidential client = DCR/FAPI）。
+**エンドツーエンドのリソース秘匿**: 正規ユーザの保護リソースは、DPoP 鍵もユーザ鍵も漏れない限り攻撃者に漏れない。
+
+### ★ 合成は一筋縄ではいかなかった（formal verification が隠れた前提を炙り出した）
+最初の合成は **2度 falsify** され、抽象化で落としていた前提を Tamarin が強制的に明示させた:
+1. **ユーザ同意の束縛が必要**: コードは「ユーザが“その特定クライアント”に同意した」ときだけ出るべき。
+   無いと誰のクライアントでもユーザの認可を得られる（1度目の falsify）。→ `U_Consent` を追加。
+2. **public client は client_id 詐称で乗っ取れる**（本来 **redirect_uri 完全一致** が防ぐもの）。
+   モデルが redirect_uri を抽象化していた（2度目の falsify）。→ confidential client（クライアント認証）に切替。
+3. さらに `executable` が falsify（no trace）→ token-use メッセージ形式の不一致という**モデルのバグ**を発見・修正。
+
+これは「個々に安全でも合成は別物」「証明が完成しないと前提を隠せない」の生きた実例。
+
+### 検証結果（Tamarin 1.12.0, 2026-06-09 実測）
+| モデル | 結果 |
+|---|---|
+| `composition_code_dpop.spthy` | `executable` / `comp_resource_secrecy` **verified**（空虚でない＝honest flow が通る） |
+| `composition_NEG_no_cnf.spthy`（cnf を外す, #2）| `comp_resource_secrecy` **falsified（盗難トークンが RS を通る）** |
+| `composition_NEG_no_clientauth.spthy`（クライアント認証を外す, #1）| `comp_resource_secrecy` **falsified（攻撃者が盗んだコードを償還）** |
+
+→ **#2(cnf) と #1(クライアント認証) は各々個別に必要**（外すとエンドツーエンドが破れる）。
+→ PKCE・consent は confidential client では**多層防御で冗長**（client auth が償還を守る）。
+   これらの個別の必要性は **public client の文脈**で現れる（上記の 2 度の falsify がそれ）。
+
+### 合成の結論
+**#1（償還の保護）と #2（盗難トークンの無効化）が重なって初めて、エンドツーエンドの安全性が出る**:
+- #1 だけ: トークンは正規クライアントに届くが、盗まれたら使える（#2 が無いと）。
+- #2 だけ: 盗難トークンは無効だが、攻撃者が最初から償還できる（#1 が無いと）。
+- 両方 + ユーザ同意: 攻撃者は正規ユーザの認可で RS に到達できない。
+
+### 限界
+- ID token(#5) の合成は別（本モデルはアクセストークンの送り主束縛に焦点）。
+- public client の完全な合成（redirect_uri / プラットフォーム束縛込み）は follow-up。
+
+---
+
+## ロードマップ達成状況
+**#1 ✅ #2 ✅ #3 ✅ #4 ✅ #5 ✅ #6 ✅** — 全モデルが Tamarin 1.12.0 で verified、各前提の必要性も
+NEG 変種の falsify で実証。各モデルが「防げる攻撃 ＋ 必要前提（→ rust-op の運用要件）」を1セット産んだ。
+合成(#6) は形式検証が隠れた前提（consent 束縛・redirect_uri 束縛）を炙り出した実例でもある。
