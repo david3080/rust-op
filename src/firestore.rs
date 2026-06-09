@@ -140,6 +140,9 @@ impl Firestore {
         Ok(tok)
     }
 
+    // ドキュメント URL にはドキュメント ID が入る。ID は accounts/profiles では email/sub（＝PII）。
+    // reqwest の Error::Display は URL を ` for url (...)` として必ず付加する（0.12 系）ため、
+    // この URL を使う送受信エラーは必ず `e.without_url()` でログから ID を落とす。
     fn doc_url(&self, col: &str, id: &str) -> String {
         format!(
             "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/{}/{}",
@@ -159,7 +162,7 @@ impl Firestore {
             .json(&json!({ "fields": fields }))
             .send()
             .await
-            .map_err(|e| format!("set: {e}"))?;
+            .map_err(|e| format!("set: {}", e.without_url()))?;
         if r.status().is_success() {
             Ok(())
         } else {
@@ -176,14 +179,14 @@ impl Firestore {
             .bearer_auth(tok)
             .send()
             .await
-            .map_err(|e| format!("get: {e}"))?;
+            .map_err(|e| format!("get: {}", e.without_url()))?;
         if r.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !r.status().is_success() {
             return Err(format!("get {}", r.status()));
         }
-        let j: Value = r.json().await.map_err(|e| format!("get json: {e}"))?;
+        let j: Value = r.json().await.map_err(|e| format!("get json: {}", e.without_url()))?;
         Ok(j.get("fields").cloned())
     }
 
@@ -200,14 +203,14 @@ impl Firestore {
             .bearer_auth(tok)
             .send()
             .await
-            .map_err(|e| format!("get: {e}"))?;
+            .map_err(|e| format!("get: {}", e.without_url()))?;
         if r.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !r.status().is_success() {
             return Err(format!("get {}", r.status()));
         }
-        let j: Value = r.json().await.map_err(|e| format!("get json: {e}"))?;
+        let j: Value = r.json().await.map_err(|e| format!("get json: {}", e.without_url()))?;
         let fields = j.get("fields").cloned().unwrap_or(Value::Null);
         let update_time = j.get("updateTime").and_then(|v| v.as_str()).unwrap_or("").to_string();
         Ok(Some((fields, update_time)))
@@ -232,7 +235,7 @@ impl Firestore {
             .json(&json!({ "fields": fields }))
             .send()
             .await
-            .map_err(|e| format!("cas: {e}"))?;
+            .map_err(|e| format!("cas: {}", e.without_url()))?;
         if r.status().is_success() {
             return Ok(true);
         }
@@ -259,7 +262,7 @@ impl Firestore {
             .json(&json!({ "fields": fields }))
             .send()
             .await
-            .map_err(|e| format!("create_if_absent: {e}"))?;
+            .map_err(|e| format!("create_if_absent: {}", e.without_url()))?;
         if r.status().is_success() {
             return Ok(true);
         }
@@ -289,7 +292,7 @@ impl Firestore {
             .bearer_auth(tok)
             .send()
             .await
-            .map_err(|e| format!("cas delete: {e}"))?;
+            .map_err(|e| format!("cas delete: {}", e.without_url()))?;
         if r.status().is_success() {
             return Ok(true);
         }
@@ -396,7 +399,7 @@ impl Firestore {
             .bearer_auth(tok)
             .send()
             .await
-            .map_err(|e| format!("delete: {e}"))?;
+            .map_err(|e| format!("delete: {}", e.without_url()))?;
         if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND {
             Ok(())
         } else {
@@ -422,7 +425,7 @@ impl Firestore {
             .json(&json!({ "fields": fields }))
             .send()
             .await
-            .map_err(|e| format!("merge: {e}"))?;
+            .map_err(|e| format!("merge: {}", e.without_url()))?;
         if r.status().is_success() {
             Ok(())
         } else {
@@ -434,4 +437,25 @@ impl Firestore {
 /// fields から文字列値を取り出す。
 pub fn field_str<'a>(fields: &'a Value, name: &str) -> Option<&'a str> {
     fields.get(name)?.get("stringValue")?.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    // ドキュメント URL に埋まる ID（accounts/profiles では email = PII）が送受信エラーの
+    // ログ文字列へ漏れないことを固定する。without_url を {e} に戻すと落ちる回帰ロック。
+    #[tokio::test]
+    async fn transport_error_strips_url_with_pii_id() {
+        // 閉じたポート(127.0.0.1:1)への接続失敗で URL 付きの reqwest エラーを得る（ネットワーク非依存）。
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v1/documents/accounts/a%40b.com")
+            .send()
+            .await
+            .unwrap_err();
+        // 前提の確認: 素の Display は URL（= percent-encode した email）を含む。
+        assert!(format!("{err}").contains("a%40b.com"), "precondition: raw error leaks the id");
+        // without_url 後は email を一切含まない（%40 も生 @ も）。
+        let scrubbed = format!("get: {}", err.without_url());
+        assert!(!scrubbed.contains("a%40b.com"), "scrubbed leaked %40 form: {scrubbed}");
+        assert!(!scrubbed.contains("a@b.com"), "scrubbed leaked raw form: {scrubbed}");
+    }
 }
