@@ -1,0 +1,85 @@
+theory IDToken
+begin
+
+/*
+  ロードマップ #5: OIDC ID token（フェデレーションの原子 = 署名付き身元主張）
+  OP がユーザの身元を RP に主張する。RP は OP の署名を検証して身元を信じる。
+
+  検証する性質:
+    - 偽造不能: RP が身元を受理 ⇒ OP が実際にその ID token を発行した（署名鍵が漏れない限り）。
+    - aud 束縛: token は **特定の RP（aud）宛**。RP1 宛の token を RP2 で使えない（audience confusion 防止）。
+    - nonce 新鮮: RP は **その flow の nonce** と一致を検査。古い token の再送を防ぐ。
+
+  登場人物: OP（署名鍵保持）/ RP（複数。aud 束縛が効くため）/ ユーザ(sub, 認証は #4 で抽象化)。
+  攻撃者: Dolev-Yao。**悪意の RP** として、被害 RP の nonce を自分の OP ログインに転送できる
+          （audience-confusion / cut-and-paste 攻撃を表現）。
+
+  実行: tamarin-prover --prove --auto-sources formal/id_token.spthy
+*/
+
+builtins: signing
+
+/* ---- OP の署名鍵（rust-op は ES256 / Cloud KMS）---- */
+rule Setup_OP:
+    [ Fr(~sk) ]
+  --[ ]->
+    [ !OPKey($OP, ~sk), !OPPub($OP, pk(~sk)), Out(pk(~sk)) ]
+
+rule Reveal_OP:
+    [ !OPKey($OP, ~sk) ]
+  --[ RevealOP($OP) ]->
+    [ Out(~sk) ]
+
+/* ---- RP: ログイン開始。新鮮な nonce（Pending = この flow に紐付く）---- */
+rule RP_Login:
+    [ Fr(~nonce) ]
+  --[ RPLogin($RP, ~nonce) ]->
+    [ Pending($RP, ~nonce), Out( <'authreq', $RP, ~nonce> ) ]
+
+/* ---- OP: ID token 発行。aud = 要求元 client、nonce = 要求の nonce、sub = ユーザ。OP 鍵で署名 ----
+   ユーザ認証/同意は #4 で抽象化（ここでは認証済みユーザ sub への発行を仮定）。
+   悪意 client は aud=自分・nonce=被害RPのnonce で要求しうる（攻撃者が nonce を網羅）。 */
+rule OP_Issue:
+    let payload = <'idt', OP, $sub, client, nonce>
+    in
+    [ In( <'authreq', client, nonce> ), !OPKey(OP, ~sk) ]
+  --[ OP_Issued(OP, $sub, client, nonce) ]->
+    [ Out( <'idtoken', payload, sign(payload, ~sk)> ) ]
+
+/* ---- RP: 検証。署名検証 + aud 束縛(aud==自分) + nonce 一致(token nonce == この flow の nonce) → 受理 ---- */
+rule RP_Verify:
+    let payload = <'idt', OP, sub, aud, tnonce>
+    in
+    [ Pending($RP, pnonce)
+    , !OPPub(OP, opk)
+    , In( <'idtoken', payload, sig> )
+    ]
+  --[ Eq(verify(sig, payload, opk), true)   // 署名検証（偽造不能）
+    , Eq(aud, $RP)                            // aud 束縛: token は この RP 宛
+    , Eq(tnonce, pnonce)                      // nonce 一致: token の nonce == この flow の nonce
+    , RP_Accept($RP, OP, sub, pnonce)
+    ]->
+    [ ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* ======================== 性質 ======================== */
+
+/* (0) 健全性 */
+lemma executable:
+  exists-trace
+    "Ex RP OP sub nonce #i.
+        RP_Accept(RP, OP, sub, nonce) @ #i
+      & not (Ex O #r. RevealOP(O) @ #r)"
+
+/* (1) ID token 完全性（偽造不能 + aud 束縛 + nonce 新鮮）:
+       RP が (sub, nonce) のログインを受理 ⇒ OP が **この RP 宛(aud=RP)・この nonce** で発行していた
+       （署名鍵漏洩を除く）。
+       = 偽造・他 RP 宛 token の流用・古い token の再送、いずれもできない。 */
+lemma idtoken_integrity:
+    "All RP OP sub nonce #i.
+        RP_Accept(RP, OP, sub, nonce) @ #i
+      ==> (Ex #a. OP_Issued(OP, sub, RP, nonce) @ #a) | (Ex #r. RevealOP(OP) @ #r)"
+
+end

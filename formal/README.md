@@ -186,3 +186,36 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
 ### 限界
 - signCount（anti-clone）は「偽造防止」でなく「クローン異常検知」で、記号的モデルの対象外。
 - ブラウザの SOP（rpId=origin 強制）を「認証器は文脈の o に署名」で抽象化。
+
+---
+
+## モデル #5: OIDC ID token（フェデレーションの原子）
+
+`id_token.spthy` — OP がユーザの身元を RP に主張（署名付き）。複数 RP（aud 束縛が効く）。
+攻撃者は**悪意 RP として被害 RP の nonce を自分の OP ログインに転送できる**（audience-confusion / cut-and-paste）。
+
+検証する性質: **偽造不能** + **aud 束縛**（RP1 宛 token を RP2 で使えない）+ **nonce 新鮮**（古い token 再送防止）を `idtoken_integrity` に集約。
+
+### 検証結果（Tamarin 1.12.0, 2026-06-09 実測）
+| モデル | 結果 |
+|---|---|
+| `id_token.spthy` | `executable` / `idtoken_integrity` **verified** |
+| `id_token_NEG_no_aud.spthy`（aud 検査を外す）| `idtoken_integrity` **falsified（audience confusion）** |
+| `id_token_NEG_no_nonce.spthy`（nonce 検査を外す）| `idtoken_integrity` **falsified（replay）** |
+
+→ **aud 束縛が必要**（外すと RP1 宛 token を RP2 が受理）／**nonce 新鮮が必要**（外すと古い token 再送）。
+
+### 表に出た前提 → rust-op の担保
+| ID | 前提（抽象） | rust-op の担保 |
+|---|---|---|
+| P-OPKEY | OP 署名鍵は秘匿 | ES256 / Cloud KMS（鍵をプロセスに展開しない） |
+| P-AUD | RP は aud == 自分の client_id を検査 | OP 側: token に aud=client_id。RP 側(fido2demo/oidc): aud 検証 |
+| P-NONCE | nonce 新鮮 + RP が一致検査 | OP: 認可要求の nonce を token へ。RP: nonce 検証 |
+| P-SIG | RP は OP の JWKS で署名検証 | discovery / JWKS 公開、RP が検証 |
+| P-ISS | iss（発行者）確認（IdP mix-up 防止） | token の iss=OP。RP は OP の鍵で検証（モデルは OP 鍵束縛で表現） |
+
+→ 導出された運用要件: **RP は aud==自分・nonce==自 flow・iss==期待 OP・署名を検査せよ**（外すと audience confusion / replay / mix-up）。
+
+### 限界
+- ユーザ認証/同意は #4 で抽象化（**#6 合成**で繋ぐ）。
+- iss/mix-up は OP 鍵束縛で部分表現（明示的な mix-up 実験は別途）。
