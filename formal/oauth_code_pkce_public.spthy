@@ -1,0 +1,95 @@
+theory OAuthCodePKCEPublic
+begin
+
+/*
+  ロードマップ #1 変種: public client（クライアント認証なし・PKCE のみ）
+  rust-op の実主力クライアント demo-rp / mobile-rp（token_endpoint_auth_method = "none" + PKCE）に対応。
+
+  狙い: confidential client では client認証とPKCEが多層防御で冗長だったが、
+        public client では **PKCE が唯一の防御**になる。PKCE の“個別の必要性”を表に出す。
+
+  攻撃者: Dolev-Yao。
+  抽象:
+    - フロントチャネル（authreq / code redirect）は攻撃者可視（In/Out）。攻撃者は client_id・challenge・code を見るが verifier ~v は見ない。
+    - token endpoint への要求は TLS で AS へ（AS公開鍵への暗号化で抽象化）。応答はリクエスタの一時鍵へ（TLSセッション抽象）。
+    - public client なのでクライアント長期鍵は無い。
+
+  実行: tamarin-prover --prove --auto-sources formal/oauth_code_pkce_public.spthy
+*/
+
+builtins: hashing, asymmetric-encryption
+
+/* ---- AS のサーバ鍵（TLS サーバ認証＋token endpoint の機密性）---- */
+rule AS_Setup:
+    [ Fr(~ltkAS) ]
+  --[ ASKey() ]->
+    [ !AS_Ltk(~ltkAS), !AS_Pk(pk(~ltkAS)), Out(pk(~ltkAS)) ]
+
+/* ---- public client: 認可要求。PKCE verifier ~v を生成、challenge=h(~v) をフロントへ ----
+   ~v はフロントチャネルに出ない（h(~v) だけ）。 */
+rule C_AuthRequest:
+    [ Fr(~v) ]
+  --[ ClientStart($C, ~v) ]->
+    [ St_C1($C, ~v), Out(<'authreq', $C, h(~v)>) ]
+
+/* ---- AS: コード発行（単回 linear）。フロントへ redirect（攻撃者可視）---- */
+rule AS_IssueCode:
+    [ In(<'authreq', C, challenge>), Fr(~code) ]
+  --[ IssueCode(C, ~code, challenge) ]->
+    [ AS_Code(C, ~code, challenge), Out(~code) ]
+
+/* ---- client: コード交換。一時鍵 ~ek（応答用 TLS セッション）を作り、
+        要求を AS 公開鍵へ暗号化（TLS to AS）して送る。クライアント認証は無い。 ---- */
+rule C_Redeem:
+    [ St_C1($C, ~v), !AS_Pk(aspk), Fr(~ek), In(code) ]
+  --[ ClientRedeem($C, code, ~v) ]->
+    [ St_C2($C, ~ek)
+    , Out( aenc(<'tokenreq', $C, code, ~v, pk(~ek)>, aspk) )
+    ]
+
+/* ---- AS: トークン発行。code 単回消費 + PKCE 検査(h(v)=challenge)。応答はリクエスタの一時鍵へ暗号化 ----
+   クライアント認証は無い → PKCE だけが「正しいリクエスタか」を担保する。 */
+rule AS_IssueToken:
+    [ AS_Code(C, code, challenge)
+    , !AS_Ltk(~ltkAS)
+    , In( aenc(<'tokenreq', C, code, v, ekpub>, pk(~ltkAS)) )
+    , Fr(~token)
+    ]
+  --[ Eq(h(v), challenge)              // PKCE（唯一の防御）
+    , IssueToken(C, code, ~token)
+    ]->
+    [ Out( aenc(~token, ekpub) ) ]
+
+/* ---- client: トークン受領 ---- */
+rule C_GetToken:
+    [ St_C2($C, ~ek), In( aenc(token, pk(~ek)) ) ]
+  --[ ClientGotToken($C, token) ]->
+    [ ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* (0) 健全性 */
+lemma executable:
+  exists-trace
+    "Ex C v code token #a #b #c.
+        ClientStart(C, v) @ #a
+      & ClientRedeem(C, code, v) @ #b
+      & IssueToken(C, code, token) @ #c"
+
+/* (1) 認可コード単回 */
+lemma code_single_use:
+    "All C code t1 t2 #i #j.
+        IssueToken(C, code, t1) @ #i & IssueToken(C, code, t2) @ #j ==> #i = #j"
+
+/* (2) PKCE がコード横取りを防ぐ:
+       正直なクライアントの challenge=h(~v) に対して発行された code から出たトークンは攻撃者に漏れない。
+       理由(PKCE有): その code を交換するには h(v)=h(~v) すなわち v=~v が要り、~v は秘密 → 攻撃者は交換できない。
+       PKCE を外すと攻撃者が横取りした code をそのまま交換でき、この lemma は falsify するはず（NEG変種）。 */
+lemma token_secrecy:
+    "All C code token #i.
+        IssueToken(C, code, token) @ #i
+      & (Ex v #a #b. ClientStart(C, v) @ #a & IssueCode(C, code, h(v)) @ #b)
+      ==> not (Ex #j. K(token) @ #j)"
+
+end

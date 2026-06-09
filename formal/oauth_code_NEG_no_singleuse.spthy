@@ -1,0 +1,130 @@
+theory OAuthCodeNoSingleUse
+begin
+
+/*
+  ロードマップ #1: 認可コード + PKCE + クライアント認証 -> アクセストークン
+  rust-op の「委譲の核」を Tamarin で記号的にモデル化した第一版。
+  対象は confidential client（private_key_jwt 相当 = DCR/FAPI クライアント）。
+
+  狙い: 「防げる攻撃」と「そのための前提」を表に出す。完璧な証明より前提の明示が目的。
+
+  攻撃者: Dolev-Yao（In/Out を完全支配。盗聴・改ざん・注入・再送が可能）。
+  抽象:
+    - 暗号は理想（署名は鍵なしに偽造不能、aenc は鍵なしに復号不能、h は一方向）。
+    - TLS でのトークン配送は「クライアントの登録公開鍵への暗号化」で抽象化。
+    - ユーザ認証/同意は AS のコード発行で抽象化（WebAuthn の精緻化は roadmap #4）。
+
+  実行:
+    brew install tamarin-prover
+    tamarin-prover --prove formal/oauth_code_pkce.spthy
+  注意: 第一版。token_secrecy 等は sources/reuse 補題が要る場合あり。
+        非終了や open-chain が出たら iterate する（「Tamarin が詰まる = 足りない前提が見える」も収穫）。
+*/
+
+builtins: hashing, signing, asymmetric-encryption
+
+/* ---- 登録: クライアントの長期鍵（クライアント認証 = private_key_jwt）----
+   前提[P-REG]: AS はクライアントの公開鍵を登録済み（registration / DCR）。
+   前提[P-CKEY]: クライアントの秘密鍵は秘匿。 */
+rule Register_Client:
+    [ Fr(~ltkC) ]
+  --[ RegisterClient($C) ]->
+    [ !Ltk($C, ~ltkC)       // クライアント秘密鍵（秘匿が前提）
+    , !Pk($C, pk(~ltkC))    // AS が知る登録公開鍵
+    , Out(pk(~ltkC))        // 公開鍵は公知
+    ]
+
+/* ---- 攻撃者がクライアント鍵を奪取できる（前提 P-CKEY を“表に出す”ため）----
+   この経路があるおかげで、token_secrecy が「鍵が漏れない限り」と条件付きで述べられる。 */
+rule Reveal_Client_Key:
+    [ !Ltk($C, ~ltkC) ]
+  --[ Reveal($C) ]->
+    [ Out(~ltkC) ]
+
+/* ---- クライアント: 認可要求（フロントチャネル = 攻撃者可視）----
+   PKCE: code_verifier ~v を生成し code_challenge = h(~v) を送る。
+   前提[P-VERIFIER]: ~v は推測不能で秘密（h は一方向なので challenge から復元不能）。 */
+rule C_AuthRequest:
+    [ Fr(~v), !Ltk($C, ~ltkC) ]
+  --[ ClientStart($C, ~v) ]->
+    [ St_C1($C, ~v)
+    , Out(<'authreq', $C, h(~v)>)   // 攻撃者は client_id と challenge を見るが ~v は不明
+    ]
+
+/* ---- AS: 認可コード発行（ユーザ同意は抽象化）。フロントチャネルへ redirect ----
+   前提[P-CODEFRESH]: code は推測不能（CSPRNG = Fr）。
+   前提[P-SINGLEUSE]: AS_Code は linear fact = 原子的単回消費（rust-op の code consume に対応）。
+     これを !AS_Code（persistent）にすると code が再利用でき code_single_use が破れる
+     → 「原子的単回消費」が必要前提だと見える。 */
+rule AS_IssueCode:
+    [ In(<'authreq', C, challenge>), Fr(~code) ]
+  --[ IssueCode(C, ~code, challenge) ]->
+    [ !AS_Code(C, ~code, challenge)
+    , Out(~code)                     // redirect で code を返す（攻撃者可視 = コード横取りの脅威）
+    ]
+
+/* ---- クライアント: コードをトークンに交換（バックチャネル）。client_assertion で自己認証 ---- */
+rule C_Redeem:
+    [ St_C1($C, ~v), !Ltk($C, ~ltkC), In(code) ]
+  --[ ClientRedeem($C, code, ~v) ]->
+    [ St_C2($C)
+    , Out(<'tokenreq', $C, code, ~v, sign(<'tokenreq', $C, code, ~v>, ~ltkC)>)
+    ]
+
+/* ---- AS: トークン発行。code 単回消費 + クライアント認証 + PKCE 検査 + 機密配送 ----
+   - AS_Code(...) を消費 = 単回[P-SINGLEUSE]
+   - Eq(verify(...)=true) = クライアント認証[P-CKEY,P-REG]
+   - Eq(h(v)=challenge) = PKCE 検査
+   - aenc(~token, pkC) = TLS 抽象[P-TLS]: 登録クライアントの鍵へ暗号化して配送 */
+rule AS_IssueToken:
+    let req = <'tokenreq', C, code, v, sig>
+    in
+    [ !AS_Code(C, code, challenge)
+    , In(req)
+    , !Pk(C, pkC)
+    , Fr(~token)
+    ]
+  --[ Eq(verify(sig, <'tokenreq', C, code, v>, pkC), true)
+    , Eq(h(v), challenge)
+    , IssueToken(C, code, ~token)
+    ]->
+    [ Out(aenc(~token, pkC)) ]
+
+/* ---- クライアント: トークン受領（復号）。フロー完了・executability 用 ---- */
+rule C_GetToken:
+    [ St_C2($C), !Ltk($C, ~ltkC), In(aenc(token, pk(~ltkC))) ]
+  --[ ClientGotToken($C, token) ]->
+    [ ]
+
+/* ---- 制約: Eq は等号 ---- */
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* ======================== 性質（lemma） ======================== */
+
+/* (0) 健全性: 正直な実行（要求→交換→発行）が完了しうる（鍵未漏洩で）。 */
+lemma executable:
+  exists-trace
+    "Ex C v code token #a #b #c.
+        ClientStart(C, v) @ #a
+      & ClientRedeem(C, code, v) @ #b
+      & IssueToken(C, code, token) @ #c
+      & not (Ex #r. Reveal(C) @ #r)"
+
+/* (1) 認可コードは単回: 同じ code から2つのトークンは発行されない。
+       AS_Code が linear（消費される）ことから従う = 単回消費の必要性を示す。 */
+lemma code_single_use:
+    "All C code t1 t2 #i #j.
+        IssueToken(C, code, t1) @ #i
+      & IssueToken(C, code, t2) @ #j
+      ==> #i = #j"
+
+/* (2) トークン秘匿: 攻撃者は honest client へ発行されたトークンを知り得ない
+       （当該クライアントの鍵が漏れない限り）。回線を完全支配する攻撃者に対して。
+       成立を支える前提: P-CKEY（鍵秘匿）・P-VERIFIER（PKCE）・P-SINGLEUSE・P-TLS。 */
+lemma token_secrecy:
+    "All C code token #i.
+        IssueToken(C, code, token) @ #i
+      ==> (not (Ex #j. K(token) @ #j)) | (Ex #r. Reveal(C) @ #r)"
+
+end
