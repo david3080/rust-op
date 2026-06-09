@@ -1,0 +1,88 @@
+theory WebAuthn
+begin
+
+/*
+  ロードマップ #4: WebAuthn / FIDO2 ユーザ認証（passkey）
+  段1〜3 の「認証」の正体。OAuth/CIBA フローの中で AS がユーザを認証する所。
+
+  検証する性質:
+    - 認証(偽造不能): RP がログインを受理 ⇒ そのユーザが実際に署名していた。
+    - オリジン束縛(anti-phishing): RP は **自分のオリジン rp に対する**アサーションしか受理しない。
+      偽サイト（別オリジン）でユーザが署名しても、本物 RP は受理しない。passkey の核。
+    - challenge 単回(anti-replay): 同じ challenge で2回ログインは通らない。
+
+  登場人物: RP(=AS, 検証側) / ユーザの認証器(credential 鍵 = passkey)。
+  攻撃者: Dolev-Yao。**ユーザを任意のオリジン o へ誘導できる**（フィッシングを表現）。
+  抽象: 認証器は「自分が呼ばれた文脈のオリジン o」に署名する（ブラウザが rpId=origin を強制）。
+        RP は o == 自分の rp を検査（origin/rpId 束縛）。signCount(anti-clone) は本モデル対象外。
+
+  実行: tamarin-prover --prove --auto-sources formal/webauthn.spthy
+*/
+
+builtins: signing
+
+/* ---- ユーザの認証器鍵（credential 秘密鍵 = passkey）---- */
+rule Setup_Auth:
+    [ Fr(~ak) ]
+  --[ ]->
+    [ !AuthKey($U, ~ak), !AuthPub($U, pk(~ak)), Out(pk(~ak)) ]
+
+rule Reveal_Auth:
+    [ !AuthKey($U, ~ak) ]
+  --[ RevealAuth($U) ]->
+    [ Out(~ak) ]
+
+/* ---- RP: 自分のオリジン $rp で新鮮な challenge を発行（Pending = 単回）---- */
+rule RP_Challenge:
+    [ Fr(~chal) ]
+  --[ Challenge($rp, ~chal) ]->
+    [ Pending(~chal, $rp), Out( <'challenge', $rp, ~chal> ) ]
+
+/* ---- ユーザ認証: いるオリジン o（攻撃者が誘導可）で、そこで受け取った challenge に署名 ----
+   認証器は **自分が呼ばれた文脈のオリジン o** に署名する（ブラウザが rpId=origin を強制）。
+   フィッシングでは o = 偽オリジン になる。 */
+rule User_Authenticate:
+    [ !AuthKey(U, ~ak), In( <'authctx', o, chal> ) ]
+  --[ UserSigns(U, o, chal) ]->
+    [ Out( <'assertion', o, chal, sign(<'webauthn', o, chal>, ~ak)> ) ]
+
+/* ---- RP: 検証。origin/rpId 束縛(o==$rp) + challenge は自分が発行(単回) + 署名検証 → 受理 ---- */
+rule RP_Verify:
+    [ Pending(chal, $rp)
+    , !AuthPub(U, apk)
+    , In( <'assertion', o, chal, sig> )
+    ]
+  --[ Eq(o, $rp)                                       // origin/rpId 束縛: アサーションのオリジン == この RP
+    , Eq(verify(sig, <'webauthn', o, chal>, apk), true) // 署名検証
+    , RP_Accept($rp, U, chal)
+    ]->
+    [ ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+/* ======================== 性質 ======================== */
+
+/* (0) 健全性 */
+lemma executable:
+  exists-trace
+    "Ex rp U chal #i.
+        RP_Accept(rp, U, chal) @ #i
+      & not (Ex UU #r. RevealAuth(UU) @ #r)"
+
+/* (1) 認証 + anti-phishing: RP がログインを受理 ⇒ そのユーザは **この RP のオリジン rp** と
+       この challenge に署名していた（鍵漏洩を除く）。
+       = 偽オリジンで署名させても本物 RP は受理しない（フィッシング耐性）。 */
+lemma authentication:
+    "All rp U chal #i.
+        RP_Accept(rp, U, chal) @ #i
+      ==> (Ex #a. UserSigns(U, rp, chal) @ #a) | (Ex #r. RevealAuth(U) @ #r)"
+
+/* (2) challenge 単回(anti-replay): 同じ challenge で2回受理は起きない。 */
+lemma challenge_single_use:
+    "All rp U1 U2 chal #i #j.
+        RP_Accept(rp, U1, chal) @ #i
+      & RP_Accept(rp, U2, chal) @ #j
+      ==> #i = #j"
+
+end
