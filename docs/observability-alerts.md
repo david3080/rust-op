@@ -96,6 +96,6 @@ gcloud alpha monitoring policies create \
 - **done（Cloud Monitoring に適用済 2026-06-09, project fido2-8b943）**:
   - log-based metric 5本: `rust_op_kms_sign_failed` / `rust_op_client_auth_failed` / `rust_op_login_failed` / `rust_op_http_5xx` / `rust_op_dcr_registered`
   - アラートポリシー 5本（上表の閾値: kms≥1, client_auth>10/5m, login_failed>20/5m, 5xx>5/5m, dcr>3/1h）
-  - 通知チャネル: email → `info@sonrisa.co.jp`
-- **残（ユーザの最終アクション）**: 通知チャネルは**未 verify**。`info@sonrisa.co.jp` に届く Google Cloud Monitoring の確認メールのリンクをクリックすると配信が有効化される（それまでポリシーは発火しても未配信）。
+  - 通知チャネル: email → **`david3080@gmail.com`**（`rust-op OP alerts`）。当初 `info@sonrisa.co.jp` で作成したが、同ドメインは M365 で確認メールが検疫され届かないため Gmail に差し替え。`info@` のチャネルは残置（M365 検疫を解いて後で戻せる）。
+- **残（ユーザの最終アクション）**: gmail チャネルの確認メール（Google Cloud Monitoring 送信、`sendVerificationCode` 済）を `david3080@gmail.com` で開きリンクをクリックして verify（Google→Gmail は確実に届く）。verify までは発火しても未配信。
 - **残（Enterprise/Advanced, 対象外）**: 自動 first-pass triage・統計的異常検知・agentic SOAR・不変監査ログ。
