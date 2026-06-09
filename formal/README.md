@@ -85,3 +85,33 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
 ロードマップ（[`docs/security-ladder.md`](../docs/security-ladder.md) の「Tamarin モデリング・ロードマップ」）:
 **#1 認可コード+PKCE（本ファイル）→ #2 DPoP 送り主束縛 → #3 CIBA+RAR マンデート → #4 WebAuthn → #5 ID token → #6 合成**。
 各モデルが「防げる攻撃＋必要前提」を1セット産み、積むほど rust-op の前提集合が埋まる。
+
+---
+
+## モデル #2: DPoP 送り主束縛（RFC 9449）
+
+`dpop_binding.spthy` — トークンの**利用フェーズ**（リソースサーバ RS での検証）に焦点。発行は #1 から抽象化。
+**「盗まれた bearer アクセストークンは DPoP 秘密鍵なしには使えない」** を検証する。
+
+フロー: AS が token に `cnf.jkt = h(DPoP公開鍵)` を束縛して発行 → クライアントは token + DPoP proof
+（DPoP 鍵で署名、htm/htu/jti/ath を含む）を RS に提示 → RS は cnf.jkt 一致・proof 署名・jti 単回 を検査して許可。
+攻撃者は token を窃取できる（`Steal_Token`）。
+
+### 検証結果（Tamarin 1.12.0, 2026-06-09 実測）
+- `dpop_binding.spthy` → `executable` / `dpop_sender_constraining` **verified**（処理 ~0.8s）。
+- 必要性の実験 `dpop_NEG_no_cnf.spthy`（cnf.jkt 検査を外す）→ `dpop_sender_constraining` **falsified（攻撃トレース発見）**。
+  = **cnf.jkt 束縛検査は必要**。外すと攻撃者が盗んだ token に**自分の鍵の proof** を付けて RS を通せる。
+
+### 表に出た前提 → rust-op の担保
+| ID | 前提（抽象） | rust-op の担保 |
+|---|---|---|
+| P-DKEY | DPoP 秘密鍵は秘匿（漏れると束縛が無効） | クライアント側保持。rust-op は proof を検証するだけで**鍵を持たない** |
+| P-CNF | RS は「proof の鍵 thumbprint = token の cnf.jkt」を検査 | `authenticate_token`（`at.jkt` と proof の jkt 一致）。introspection が cnf.jkt 公開 |
+| P-PROOFSIG | DPoP proof の署名検証（ES256） | `Es256Dpop`（`dpop.rs`） |
+| P-JTI | DPoP proof の jti 単回（リプレイ防止） | jti 単回ストア（`NonceStore` / Firestore 分散） |
+
+→ 導出された運用要件: **RS は token の cnf.jkt と DPoP proof の鍵 thumbprint の一致を検査せよ**（外すと盗難トークンが通る）。
+
+### 限界 / 次版
+- トークン発行は #1 から抽象化（**#6 合成**で #1×#2 を繋ぐ）。
+- htm/htu は payload に持たせる（厳密一致は部分モデル）。jti 単回は含むが「proof 非リプレイ」の個別 lemma は別途。
