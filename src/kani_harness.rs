@@ -139,3 +139,37 @@ fn strip_query_fragment_safe() {
         assert!(!r.contains('?') && !r.contains('#'), "本当に区切りを含まない");
     }
 }
+
+/// 橋（Integrity, 本物の変換コード）: `es256::pad32` は座標を 32 バイトに左ゼロ埋めする手書き変換。
+/// `out[32 - b.len()..].copy_from_slice(b)` が、(a) `32 - b.len()` の **usize 下溢れ**を起こさない
+/// （`b.len() > 32` の早期 return ガードが十分か）、(b) スライス長と copy 長が一致し panic しない、
+/// (c) 結果は左ゼロ埋め＋末尾 len バイトが入力一致、を**全入力**で機械検証する。
+/// b64url（base64 クレート委譲）と jwk_thumbprint（固定フォーマット＋SHA256）はライブラリ/構成上正しく
+/// 検証対象外。pad32 のみが手書きの算術＋スライス＝本物の panic 面。整数/バイト論理ゆえ tractable。
+#[kani::proof]
+#[kani::unwind(34)]
+fn pad32_safe() {
+    const N: usize = 33; // 33 で len>32(=33) ガード経路も踏む。32 以下は全網羅
+    let buf: [u8; N] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= N);
+    let b = &buf[..len];
+
+    match crate::es256::pad32(b) {
+        Err(_) => assert!(len > 32, "Err となるのは len>32 のときのみ"),
+        Ok(out) => {
+            assert!(len <= 32, "Ok は len<=32 のときのみ");
+            let pad = 32 - len;
+            let mut i = 0;
+            while i < pad {
+                assert!(out[i] == 0, "左側 32-len バイトはゼロ");
+                i += 1;
+            }
+            let mut j = 0;
+            while j < len {
+                assert!(out[pad + j] == b[j], "末尾 len バイトは入力を保存");
+                j += 1;
+            }
+        }
+    }
+}

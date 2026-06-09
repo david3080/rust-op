@@ -52,7 +52,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 | **3. Observability & auditing** | `tracing` 構造化ログ（`event=token_issued` 等）はあるが **request-id 連鎖・形式化なし** | L4 | — | — | **gap → Step3 で Foundation 着手** |
 | **4. Behavioral monitoring & response** | 実行時検知は予防的証明の射程外 | — | — | — | **未着手（L4/L5）** |
 | **5. Input validation & output** | プロトコル入力堅牢性は一部（JAR/PAR・exp/nonce/jti・htu 正規化）。LLM 向け classifier/output filter は別物 | L3 | Kani `strip_query_fragment_safe`/`exp_in_window` | A4 | **大半が別スコープ**（一部○） |
-| **6. Integrity & recovery** | 全 JWT/JWS 署名検証（偽造不能を*モデルで*証明）、KMS fail-closed、Cloud Run リビジョン rollback、cargo-deny。手書き変換 `pad32` は**未検証** | L1＋L4 | Tamarin 偽造不能、過去修正 | A2,A4 | **部分一致 → Step2 で `pad32` を L3 化** |
+| **6. Integrity & recovery** | 全 JWT/JWS 署名検証（偽造不能を*モデルで*証明）、KMS fail-closed、Cloud Run リビジョン rollback、cargo-deny。手書き変換 `pad32` は **L3 検証済**（panic/下溢れ非発生＋正当性） | L1＋L3＋L4 | Tamarin 偽造不能、Kani `pad32_safe`、過去修正 | A2,A4 | **部分一致（`pad32` は L3 verified）** |
 
 ---
 
@@ -90,7 +90,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 本評価を起点に、後続 Step が**特定の gap を covered に変える**:
 
-- **Step2**（Integrity 変換コードの Kani 橋）→ §2 領域6 の「手書き変換 `pad32` は未検証」を **L3 verified** に flip。b64url は base64 クレート委譲＝**ライブラリ（A4 で仮定、検証対象外）**、thumbprint は固定フォーマット＋SHA256＝**構成上正しい（lock）**、と正直に区別する。
+- **Step2 ✓ 完了**（Integrity 変換コードの Kani 橋, Kani `pad32_safe`）→ §2 領域6 の「手書き変換 `pad32` 未検証」を **L3 verified** に flip 済（`32 - b.len()` の usize 下溢れ非発生＋スライス長一致＋左ゼロ埋め/末尾保存を全入力で証明）。b64url は base64 クレート委譲＝**ライブラリ（A4 で仮定、検証対象外）**、thumbprint は固定フォーマット＋SHA256＝**構成上正しい（lock）**、と正直に区別した（手書き変換は pad32 のみ）。
 - **Step3**（L4 ランタイムモニタ Foundation）→ §2 領域3・§3 フェーズ8 の「Observability gap」を、**Request-ID 連鎖（Foundation tier）covered** に flip。秘密（Authorization/DPoP proof/code/secret/PII）は**ログに出さない**を厳守。異常検知・SOAR は対象外。
 
 ---
