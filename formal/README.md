@@ -43,8 +43,15 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
   = **原子的単回消費（P-SINGLEUSE）は“必要”**。外すと同一コードから2トークン（トークン要求のリプレイ）。
     単回性の役割は**コード再利用の阻止に特定**される（token_secrecy には影響しない）。
   = 段0「引換券は一度きり」の、**機械検証された必要十分**。
-- 注: 本版は confidential client で client認証とPKCEが両方あり（多層防御）。**PKCE の個別の必要性**を示すには
-  public client 変種（client認証を外しPKCEのみ）が次。
+- **public client 変種** `oauth_code_pkce_public.spthy`（demo-rp / mobile-rp 相当 = `none` + PKCE、クライアント認証なし）
+  → 3 lemma すべて verified。**PKCE が唯一の防御**として機能。
+- **必要性の実験(PKCE)** `oauth_code_public_NEG_no_pkce.spthy`（public client から PKCE 検査を外す）
+  → `token_secrecy` が **falsified（コード横取り攻撃トレース発見）**。
+  = public client では **PKCE は“個別に必要”**。外すと攻撃者が横取りした code をそのまま交換しトークンを得る。
+- **まとめ（#1 の前提導出が完成、nuance まで機械検証）**:
+  - **confidential client**（private_key_jwt = DCR/FAPI）: クライアント認証 と PKCE は**冗長な多層防御**（各々単独で攻撃を阻止）。
+  - **public client**（none = demo-rp / mobile-rp）: **PKCE が単独で必要**（外すと code 横取りが成立）。
+  - **単回消費**（P-SINGLEUSE）は両者で必要。
 
 ## 表に出た前提 → rust-op の担保（本層の成果物）
 
