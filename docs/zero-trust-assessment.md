@@ -49,7 +49,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 |---|---|---|---|---|---|
 | **1. Identity & authentication** | OAuth IdP として短命トークン発行（F 直撃）。private_key_jwt+JWKS で暗号クライアント ID（E 相当）。DPoP で sender-bound。passkey で人間認証 F バー。KMS で鍵非展開 | L1＋L3＋L2 | Tamarin #1/#4/#5、Kani `pkce_method_no_downgrade`/`redirect_uri_match_is_exact`/`exp_in_window` | A2,A4 | **F 完全＋E 相当をモデル/述語で裏打ち**（コード全体ではない） |
 | **2. Access control / least agency** | RAR mandate scoping、scope/aud 制限、DPoP cnf（鍵保持者のみ）、redirect 完全一致、単回コード、step_up | L1＋L3 | Tamarin #2/#3、Kani `redirect_uri_match_is_exact` | A1,A4 | **資格情報側の scoping を裏打ち**。実行時 sandbox/網分離は管轄外 |
-| **3. Observability & auditing** | `tracing` 構造化ログ（`event=token_issued` 等）はあるが **request-id 連鎖・形式化なし** | L4 | — | — | **gap → Step3 で Foundation 着手** |
+| **3. Observability & auditing** | `tracing` 構造化ログ＋**全リクエストに request_id 付与・ドメインログ（`event=token_issued` 等）に連鎖**（`web::request_trace`）。異常検知/不変監査(E/A)は未 | L4 | `web::request_trace`（Request-ID 連鎖, Foundation tier） | — | **Foundation covered（Request-ID 連鎖）。E/A は未着手** |
 | **4. Behavioral monitoring & response** | 実行時検知は予防的証明の射程外 | — | — | — | **未着手（L4/L5）** |
 | **5. Input validation & output** | プロトコル入力堅牢性は一部（JAR/PAR・exp/nonce/jti・htu 正規化）。LLM 向け classifier/output filter は別物 | L3 | Kani `strip_query_fragment_safe`/`exp_in_window` | A4 | **大半が別スコープ**（一部○） |
 | **6. Integrity & recovery** | 全 JWT/JWS 署名検証（偽造不能を*モデルで*証明）、KMS fail-closed、Cloud Run リビジョン rollback、cargo-deny。手書き変換 `pad32` は **L3 検証済**（panic/下溢れ非発生＋正当性） | L1＋L3＋L4 | Tamarin 偽造不能、Kani `pad32_safe`、過去修正 | A2,A4 | **部分一致（`pad32` は L3 verified）** |
@@ -67,7 +67,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 | 5. Secure tool access | 「agent identity に束縛した短命トークン」＝**DPoP を供給** | **直撃**（L1 #2） |
 | 6. Protect agent credentials | 短命 IdP 発行・per-client ID・埋め込み無し・失効（DCR register/revoke-client） | **直撃**（L1 #1, A2） |
 | 7. Safeguard memory | agent memory は別。rust-op 自身の状態リプレイ防止＝単回 CAS（A1） | 管轄外（※A1 が類似機構） |
-| 8. Measure what matters | observability/検知 | gap → Step3 |
+| 8. Measure what matters | Request-ID 相関の土台あり（`web::request_trace`）。dwell time/異常検知は未 | Foundation 着手 |
 
 ---
 
@@ -77,7 +77,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 - **広範なコード↔モデルのギャップ**: L3（Kani）は5述語のみ橋を架けた。残る約11k 行は Kani 未検証。L1 が証明するのは*モデル*であって実コードではない。
 - **L2 暗号は仮定であり証明していない**（A4）。p256/sha2/base64/subtle の正しさは外部の信頼境界。
-- **Observability / Behavioral monitoring / agentic SOAR**（ZT 領域3–4・Part V）= 枠組みが面積の半分を割く**検知・対応**層が空白。Step3 で領域3の Foundation（Request-ID 連鎖）に着手するが、異常検知・SOAR は対象外。
+- **Behavioral monitoring / agentic SOAR**（ZT 領域4・Part V）= 枠組みが面積の半分を割く**検知・対応**層がほぼ空白。領域3 Observability は **Foundation（Request-ID 連鎖）まで実装済**（Step3）だが、不変監査ログ・異常検知・自動応答（E/A）と SOAR は未着手。
 - **agent 固有領域**（prompt injection・tool access・memory poisoning）= rust-op の管轄外。ただし rust-op の scoped・sender-bound・単回な資格情報は、これらが起きても**blast radius を封じ込める**。
 - **AI-BOM / attestation / self-healing**（領域6 Advanced）未着手。
 - **rate-limit は friction であって barrier ではない**（枠組み Phase 5 が明言: 「buy time but do not stop a determined agentic attacker」）。DCR の rate-limit は補助であり load-bearing にしない。
@@ -91,7 +91,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 本評価を起点に、後続 Step が**特定の gap を covered に変える**:
 
 - **Step2 ✓ 完了**（Integrity 変換コードの Kani 橋, Kani `pad32_safe`）→ §2 領域6 の「手書き変換 `pad32` 未検証」を **L3 verified** に flip 済（`32 - b.len()` の usize 下溢れ非発生＋スライス長一致＋左ゼロ埋め/末尾保存を全入力で証明）。b64url は base64 クレート委譲＝**ライブラリ（A4 で仮定、検証対象外）**、thumbprint は固定フォーマット＋SHA256＝**構成上正しい（lock）**、と正直に区別した（手書き変換は pad32 のみ）。
-- **Step3**（L4 ランタイムモニタ Foundation）→ §2 領域3・§3 フェーズ8 の「Observability gap」を、**Request-ID 連鎖（Foundation tier）covered** に flip。秘密（Authorization/DPoP proof/code/secret/PII）は**ログに出さない**を厳守。異常検知・SOAR は対象外。
+- **Step3 ✓ 完了**（L4 ランタイムモニタ Foundation, `web::request_trace`）→ §2 領域3・§3 フェーズ8 の「Observability gap」を **Request-ID 連鎖（Foundation tier）covered** に flip 済。全リクエストに request_id を付与し、span でハンドラを囲んで既存ドメインログ（`event=token_issued` 等）に request_id を継承、応答に method/path/status/latency を1行記録、応答ヘッダにも返す。**秘密非ログを厳守**: query を含めず path のみ、ヘッダ/ボディ/Authorization/DPoP proof/トークンは一切記録しない。**閾値アラート（threshold/異常検知）と SOAR は対象外（Enterprise/Advanced）**。将来そこを足すなら `event=http_request` の status/latency_ms と `token_issued` 等を集計点（dwell time/coverage）として hook する。
 
 ---
 
