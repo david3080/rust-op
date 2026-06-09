@@ -1,0 +1,127 @@
+theory CompositionPublicNEGNoRedirect
+begin
+
+/*
+  #8 の NEG 変種 (a): redirect_uri 完全一致を**外す**と何が壊れるかを示す（必要性証明）。
+  本体 composition_public_pkce_dpop.spthy との差分は AS_IssueCode / C_Redeem の2箇所だけ:
+    - AS_IssueCode: code を登録エンドポイント ~ep へ配送（RedirectCode）するのをやめ、平文 Out(~code) に戻す。
+    - C_Redeem: ~ep からではなく In(code) で受け取る。
+  これだけで comp_resource_secrecy は **falsify** する（= redirect_uri 完全一致が public で load-bearing）。
+
+  攻撃（Dolev-Yao が直接構成）:
+    1. 攻撃者が自分の verifier ~v_adv で authreq(C, U, h(~v_adv)) を投げる（C は public・認証なし）。
+    2. ユーザは challenge=h(~v_adv) に passkey 同意（challenge は攻撃者が選べる）。
+    3. AS が code を Out → 攻撃者が code を入手。
+    4. 攻撃者が aenc(<'tokenreq', C, code, ~v_adv, pk(~dk_adv)>, aspk) を自前で構成 → AS が
+       h(~v_adv)=challenge を満たすので **攻撃者鍵 ~dk_adv に束縛**したトークンを発行・Out。
+    5. 攻撃者が自鍵で DPoP proof を作り RS に提示 → cnf 一致でリソースを自鍵宛に開放 → 復号。
+    DPoP鍵もユーザ鍵も漏れていないのにリソースが漏れる。
+
+  期待: comp_resource_secrecy が falsified。executable は verified のまま（モデルが健全な証拠）。
+  実行: tamarin-prover --prove --auto-sources formal/composition_public_NEG_no_redirect.spthy
+*/
+
+builtins: hashing, signing, asymmetric-encryption
+
+rule Setup_User:
+    [ Fr(~uk) ] --[ ]-> [ !UserKey($U, ~uk), !UserPub($U, pk(~uk)), Out(pk(~uk)) ]
+rule Reveal_User:
+    [ !UserKey($U, ~uk) ] --[ RevealUser($U) ]-> [ Out(~uk) ]
+
+rule Setup_Resource:
+    [ Fr(~res) ] --[ Protected($U, ~res) ]-> [ !Resource($U, ~res) ]
+
+rule AS_Setup:
+    [ Fr(~ltkAS) ] --[ ]-> [ !AS_Ltk(~ltkAS), !AS_Pk(pk(~ltkAS)), Out(pk(~ltkAS)) ]
+
+rule Setup_Client:
+    [ Fr(~ep) ] --[ ]-> [ !ClientEP($C, ~ep) ]
+
+rule C_AuthRequest:
+    [ !ClientEP($C, ~ep), Fr(~v) ]
+  --[ ClientStart($C, $U, ~v) ]->
+    [ St_C1($C, ~ep, $U, ~v), Out( <'authreq', $C, $U, h(~v)> ) ]
+
+rule U_Consent:
+    [ !UserKey(U, ~uk), In( <'authreq', C, U, challenge> ) ]
+  --[ UserConsent(U, C, challenge) ]->
+    [ Out( <'consent', C, challenge, sign(<'consent', C, challenge>, ~uk)> ) ]
+
+/* ★ NEG 差分: code を登録エンドポイントへ配送せず、平文 Out(~code) に戻す（redirect_uri 完全一致を外す）。 */
+rule AS_IssueCode:
+    [ In( <'authreq', C, U, challenge> )
+    , In( <'consent', C, challenge, appr> )
+    , !UserPub(U, upk)
+    , Fr(~code)
+    ]
+  --[ Eq(verify(appr, <'consent', C, challenge>, upk), true)
+    , IssueCode(C, U, ~code, challenge) ]->
+    [ AS_Code(C, U, ~code, challenge)
+    , Out(~code)
+    ]
+
+/* ★ NEG 差分: ~ep からではなく In(code) で受ける。 */
+rule C_Redeem:
+    [ St_C1($C, ~ep, $U, ~v), In(code), !AS_Pk(aspk), Fr(~dk) ]
+  --[ ClientRedeem($C, code, ~v) ]->
+    [ !CDk($C, ~dk)
+    , Out( aenc(<'tokenreq', $C, code, ~v, pk(~dk)>, aspk) )
+    ]
+
+rule Reveal_DPoP:
+    [ !CDk($C, ~dk) ] --[ RevealDPoP($C) ]-> [ Out(~dk) ]
+
+rule AS_IssueToken:
+    [ AS_Code(C, U, code, challenge)
+    , !AS_Ltk(~ltkAS)
+    , In( aenc(<'tokenreq', C, code, v, dppub>, pk(~ltkAS)) )
+    , Fr(~at)
+    ]
+  --[ Eq(h(v), challenge)
+    , IssueToken(C, U, code, ~at, h(dppub)) ]->
+    [ !Bound(~at, h(dppub))
+    , !TokenUser(~at, U)
+    , Out(~at)
+    ]
+
+rule C_UseAT:
+    let payload = <'dpop', $M, $RU, ~jti, at>
+    in
+    [ !CDk($C, ~dk), In(at), Fr(~jti) ]
+  --[ ClientUsesAT($C, at) ]->
+    [ Out( <'rsreq', at, payload, sign(payload, ~dk), pk(~dk)> ) ]
+
+rule RS_Accept:
+    let payload = <'dpop', M, RU, jti, at>
+    in
+    [ !Bound(at, jkt), !TokenUser(at, U), !Resource(U, ~res)
+    , In( <'rsreq', at, payload, sig, dppub> )
+    ]
+  --[ Eq(h(dppub), jkt)
+    , Eq(verify(sig, payload, dppub), true)
+    , Once(jti)
+    , RS_Grant(at, U)
+    ]->
+    [ Out( aenc(~res, dppub) ) ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+restriction OnceJti:
+    "All x #i #j. Once(x) @ #i & Once(x) @ #j ==> #i = #j"
+
+lemma executable:
+  exists-trace
+    "Ex at U #g.
+        RS_Grant(at, U) @ #g
+      & not (Ex C #r. RevealDPoP(C) @ #r)
+      & not (Ex UU #r. RevealUser(UU) @ #r)"
+
+/* redirect を外したので falsify する（攻撃者が自鍵束縛トークンを得てリソースを奪う）。 */
+lemma comp_resource_secrecy:
+    "All U res #i.
+        Protected(U, res) @ #i
+      & (not (Ex C #r. RevealDPoP(C) @ #r))
+      & (not (Ex UU #r. RevealUser(UU) @ #r))
+      ==> not (Ex #j. K(res) @ #j)"
+
+end
