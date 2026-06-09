@@ -152,3 +152,37 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
 ### 限界
 - 「ユーザが読む」は記号的に捉えられない人間前提（P-UREAD）。モデルは「ユーザは見た m に commit する」までを表現。
 - 反スパム（量的）は Tamarin の対象外（rust-op は `ciba_rate` で対処）。
+
+---
+
+## モデル #4: WebAuthn / FIDO2 ユーザ認証（passkey）
+
+`webauthn.spthy` — 段1〜3 の「認証」の正体。OAuth/CIBA の中で AS がユーザを認証する所。
+攻撃者は**ユーザを任意のオリジンへ誘導できる**（フィッシングを表現）。
+
+検証する性質: **認証**（偽造不能）+ **オリジン束縛**（anti-phishing, passkey の核）+ **challenge 単回**（anti-replay）。
+
+### 検証結果（Tamarin 1.12.0, 2026-06-09 実測）
+| モデル | 結果 |
+|---|---|
+| `webauthn.spthy` | `executable` / `authentication` / `challenge_single_use` **verified** |
+| `webauthn_NEG_no_origin.spthy`（origin 検査を外す）| `authentication` **falsified（フィッシング攻撃トレース）** |
+| `webauthn_NEG_no_singleuse.spthy`（Pending を persistent に）| `challenge_single_use` **falsified（リプレイ）** |
+
+→ **オリジン束縛が必要**（外すと偽オリジンのアサーションを本物 RP が受理＝フィッシング）。
+→ **challenge 単回が必要**（外すとアサーション再送）。
+
+### 表に出た前提 → rust-op の担保
+| ID | 前提（抽象） | rust-op の担保 |
+|---|---|---|
+| P-AKEY | 認証器 credential 鍵は秘匿 | secure enclave。rust-op は**公開鍵のみ保持** |
+| P-ORIGIN | RP は origin/rpId == 自分 を検査 | `webauthn::verify_authentication`（origin + rpIdHash） |
+| P-CHAL | challenge 新鮮 + 単回 | `create/consume_webauthn_challenge`（単回） |
+| P-SIG | 登録公開鍵で署名検証 | `webauthn::verify_authentication` |
+| （anti-clone） | signCount 単調増加 | signcount 検査（**記号的モデル対象外**＝異常検知） |
+
+→ 導出された運用要件: **RP は origin/rpId が自分のものか検査せよ**（外すとフィッシング）／**challenge は単回**。
+
+### 限界
+- signCount（anti-clone）は「偽造防止」でなく「クローン異常検知」で、記号的モデルの対象外。
+- ブラウザの SOP（rpId=origin 強制）を「認証器は文脈の o に署名」で抽象化。
