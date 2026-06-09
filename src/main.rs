@@ -15,6 +15,8 @@ mod firestore_store;
 mod grants;
 mod interaction_policy;
 mod jws;
+#[cfg(kani)]
+mod kani_harness;
 mod kms;
 mod mailer;
 mod model;

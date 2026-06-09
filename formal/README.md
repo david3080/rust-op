@@ -264,3 +264,38 @@ tamarin-prover interactive formal/oauth_code_pkce.spthy   # → http://127.0.0.1
 **#1 ✅ #2 ✅ #3 ✅ #4 ✅ #5 ✅ #6 ✅** — 全モデルが Tamarin 1.12.0 で verified、各前提の必要性も
 NEG 変種の falsify で実証。各モデルが「防げる攻撃 ＋ 必要前提（→ rust-op の運用要件）」を1セット産んだ。
 合成(#6) は形式検証が隠れた前提（consent 束縛・redirect_uri 束縛）を炙り出した実例でもある。
+
+---
+
+## L3: コード↔モデル橋（Kani 0.67.0 / CBMC）
+
+Tamarin（L1）は記号モデル上で前提が成り立てば性質が成り立つことを示す。が、**その前提を実コードが本当に担保しているか**、また
+**記号モデルが見ない実装固有の落とし穴（整数オーバーフロー等）が無いか**は L1 では分からない。これを埋めるのが Kani による
+有界モデル検査（L3）。`#[cfg(kani)] mod kani_harness`（`src/kani_harness.rs`）に置き、通常ビルド・テストからは除外される。
+
+```sh
+cargo install --locked kani-verifier && cargo kani setup
+cargo kani                       # 全ハーネス
+cargo kani --harness exp_in_window_spec
+```
+
+### 検証結果（Kani 0.67.0 / CBMC, 2026-06-09 実測）
+
+| ハーネス | 検証した命題 | 結果 |
+|---|---|---|
+| `exp_in_window_spec` | `exp_in_window(exp,now,max)` は全 i64 で **panic せず**（saturating_add でオーバーフロー無し）、定義どおり `ok ⇔ now<exp≤now+max` | ✅ 4/4 checks |
+| `jti_ttl_is_bounded` | 受理された exp に対し jti TTL = `exp-now` が **(0, 3600] に有界・溢れない** | ✅ SUCCESSFUL |
+
+### 橋の意味（Tamarin の前提 → Kani が機械検証した実コード述語）
+
+| Tamarin 側 | Kani 側の担保 |
+|---|---|
+| #1 の client_assertion 新鮮性の **時間有効性**の半分（リプレイ不能の半分は jti 単回ストアが担い、本ハーネス対象外） | `exp_in_window`（`client_auth.rs`）が窓検査を一点に集約し、Kani が全 i64 でオーバーフロー非発生＋定義一致を証明 |
+| jti を覚える窓が有界であること（さもなくば保持無限肥大／TTL オーバーフロー） | `jti_ttl_is_bounded` が `exp-now ∈ (0,3600]` を機械保証。**exp_in_window は jti 単回防御を健全かつ有界にする load-bearing な前提**だと位置づく |
+
+→ **記号モデルが算術を見ない死角（遠未来 exp による TTL オーバーフロー／jti 保持の無限肥大）を、Kani が実コード上で閉じた**。
+これが「L1 の前提＝L3 の証明義務」を1つ履行した形。
+
+### 次に橋を架ける候補（security-critical 順）
+redirect_uri **完全一致**（正規化抜け道が無いこと）／PKCE **S256 完全一致**（平文フォールバック不可）／認可コード **単回**（`Once`）／DPoP **cnf 束縛**。
+exp 新鮮性は相対的に軽い前提で、上記の方が load-bearing。どれを次に Kani 化するかは個別に純粋述語へ切り出してから。
