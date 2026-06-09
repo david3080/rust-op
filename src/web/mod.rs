@@ -342,3 +342,51 @@ async fn authenticate_token(
     Ok(at)
 }
 
+#[cfg(test)]
+mod obs_tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct VecWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for VecWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+        type Writer = VecWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `request_trace` の肝＝span の request_id が、span 内で出る既存ドメインログ
+    /// （`event=token_issued` 等）に**継承される**ことを、本番と同じ `fmt().json()` 構成で確認する。
+    /// これは型検査では分からず subscriber 構成依存（http_request 行は明示フィールドなので常に出るが、
+    /// 相関先のドメインログが span 継承で出るかは別問題）なので、ここで明示的に検証する。
+    #[test]
+    fn request_id_span_field_propagates_to_domain_logs() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(VecWriter(buf.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("http", request_id = "RID-TEST-123");
+            let _g = span.enter();
+            tracing::info!(event = "token_issued"); // 既存ドメインログ相当
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("RID-TEST-123"),
+            "span の request_id がドメインログに継承される必要がある: {out}"
+        );
+        assert!(out.contains("token_issued"));
+    }
+}
+

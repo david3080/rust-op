@@ -92,6 +92,9 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 - **Step2 ✓ 完了**（Integrity 変換コードの Kani 橋, Kani `pad32_safe`）→ §2 領域6 の「手書き変換 `pad32` 未検証」を **L3 verified** に flip 済（`32 - b.len()` の usize 下溢れ非発生＋スライス長一致＋左ゼロ埋め/末尾保存を全入力で証明）。b64url は base64 クレート委譲＝**ライブラリ（A4 で仮定、検証対象外）**、thumbprint は固定フォーマット＋SHA256＝**構成上正しい（lock）**、と正直に区別した（手書き変換は pad32 のみ）。
 - **Step3 ✓ 完了**（L4 ランタイムモニタ Foundation, `web::request_trace`）→ §2 領域3・§3 フェーズ8 の「Observability gap」を **Request-ID 連鎖（Foundation tier）covered** に flip 済。全リクエストに request_id を付与し、span でハンドラを囲んで既存ドメインログ（`event=token_issued` 等）に request_id を継承、応答に method/path/status/latency を1行記録、応答ヘッダにも返す。**秘密非ログを厳守**: query を含めず path のみ、ヘッダ/ボディ/Authorization/DPoP proof/トークンは一切記録しない。**閾値アラート（threshold/異常検知）と SOAR は対象外（Enterprise/Advanced）**。将来そこを足すなら `event=http_request` の status/latency_ms と `token_issued` 等を集計点（dwell time/coverage）として hook する。
+  - **span 継承は単体テストで確認済**（`web::obs_tests`、本番と同じ `fmt().json()` 構成で span の request_id がドメインログに出ることを検証）。型検査では分からない核心挙動なので明示テスト。デプロイ時は実 `/token` で `http_request` と `token_issued` の両行に同一 request_id が出ることをスモークで確認すること。
+  - **path パラメータ（`/login/{uid}`・`/ciba/{auth_req_id}/...` の uid/auth_req_id）は意図的にログする**＝識別子であって資格情報ではない（CIBA の auth_req_id はハンドル）。秘密が乗る query は除外済。誤記載でなく観測のための判断。
+  - **未対応（follow-up・本 PR では広げない）**: Cloud Run/Firebase は `X-Cloud-Trace-Context`（W3C `traceparent`）を出すが本実装は `X-Request-Id` のみ踏襲＝本番ではほぼ毎回 uuid 採番でプラットフォーム側ログと ID が揃わない。内部相関（rust-op 自身のログ）は成立。プラットフォーム相関が要るならトレースヘッダ読取りを追加。
 
 ---
 
