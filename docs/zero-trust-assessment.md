@@ -39,6 +39,23 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 > この台帳が「前提を明示し、必要な運用を導出する」という本来ゴールの中身。**proof は前提付き**であり、前提（A1–A7）は運用（L4）と仮定（L2）で支える、という構造を崩さないこと。
 
+### 1.1 トークン/資格情報の寿命（実測 2026-06-09）
+
+枠組みは「token lifetimes **measured in minutes**」を求める。実コードの値:
+
+| 種別 | TTL | 場所 | 評価（ZT「分単位」） |
+|---|---|---|---|
+| **access token** | **900s = 15分** | `firestore_store.rs ACCESS_TTL` / `grants.rs expires_in:900` | ○ 分単位を満たす |
+| **id_token** | **900s = 15分**（`exp = iat + 900`） | `grants.rs:78` | ○ |
+| client_assertion exp 上限 | 3600s（＋jti 単回） | `client_auth.rs MAX_ASSERTION_LIFETIME_SECS`（L3 `exp_in_window` 検証済） | ○ 一度きりの認証材料ゆえ可 |
+| DPoP proof jti | 300s = 5分 | `dpop.rs JTI_TTL` | ○ |
+| PAR request_uri | 60s | `par.rs TTL_SECS` | ○ |
+| CIBA auth_req | 300s = 5分 | `ciba.rs TTL_SECS` | ○ |
+| refresh token | 14日 | `firestore_store.rs REFRESH_TTL` | 標準（短命 access の更新用。単回回転＋盗難検知は別途 A1 に依存） |
+| session cookie | 7日 | `firestore_store.rs SESSION_TTL` | ブラウザセッション。トークンではない |
+
+→ **bearer/proof 系はすべて分単位**で枠組みの bar を満たす。長命なのは refresh（14日）と session（7日）のみで、いずれも bearer access ではない。refresh は短命 access を更新する設計上の長命であり、その安全性は A1（単回消費の CAS 原子性）に依存する。
+
 ---
 
 ## 2. Zero Trust Part III（6制御領域）× rust-op × 層
@@ -81,7 +98,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 - **agent 固有領域**（prompt injection・tool access・memory poisoning）= rust-op の管轄外。ただし rust-op の scoped・sender-bound・単回な資格情報は、これらが起きても**blast radius を封じ込める**。
 - **AI-BOM / attestation / self-healing**（領域6 Advanced）未着手。
 - **rate-limit は friction であって barrier ではない**（枠組み Phase 5 が明言: 「buy time but do not stop a determined agentic attacker」）。DCR の rate-limit は補助であり load-bearing にしない。
-- **アクセストークン実 TTL の「分単位」posture が未文書化**。枠組みは「token lifetimes in minutes」を求める。client_assertion 上限は 3600s＋jti 単回（一度きりゆえ可）だが、access token の実 TTL を測り文書化する（要対応）。
+- ~~アクセストークン実 TTL の「分単位」posture が未文書化~~ → **測定・文書化済（§1.1）**: access token・id_token とも 900s=15分で枠組みの「minutes」を満たす。長命は refresh（14日）/session（7日）のみで bearer access ではない。
 - **Foundation の "automated first-pass triage"** は純粋に運用側で未構築。
 
 ---
