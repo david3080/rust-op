@@ -93,9 +93,14 @@ gcloud alpha monitoring policies create \
 
 - **done（コード, 本番稼働）**: アラート可能なセキュリティイベントの構造化 emit。request_id 相関（[Step3](./zero-trust-assessment.md)）。
 - **done（本書, config 定義）**: 期待ベースライン・閾値・log-based metric/アラートポリシーの定義と実行 snippet。
-- **done（Cloud Monitoring に適用済 2026-06-09, project fido2-8b943）**:
-  - log-based metric 5本: `rust_op_kms_sign_failed` / `rust_op_client_auth_failed` / `rust_op_login_failed` / `rust_op_http_5xx` / `rust_op_dcr_registered`
-  - アラートポリシー 5本（上表の閾値: kms≥1, client_auth>10/5m, login_failed>20/5m, 5xx>5/5m, dcr>3/1h）
-  - 通知チャネル: email → **`david3080@gmail.com`**（`rust-op OP alerts`）。当初 `info@sonrisa.co.jp` で作成したが、同ドメインは M365 で確認メールが検疫され届かないため Gmail に差し替え。`info@` のチャネルは残置（M365 検疫を解いて後で戻せる）。
-- **残（ユーザの最終アクション）**: gmail チャネルの確認メール（Google Cloud Monitoring 送信、`sendVerificationCode` 済）を `david3080@gmail.com` で開きリンクをクリックして verify（Google→Gmail は確実に届く）。verify までは発火しても未配信。
+- **done（Cloud Monitoring に適用・重複排除済 2026-06-09, project fido2-8b943）**: 既存の "OP:" アラート基盤（2026-06-02 構築）に統合。当初 `rust_op_*`/`rust-op:` で作ったが既存 `op_*`/`OP:` と重複したため**削除**し、欠けていた2つだけ "OP:" 命名で追加。**上の snippet は汎用例で、実体のメトリクス/ポリシー名は `op_`/`OP:`**。
+  - アラートポリシー 5本（すべて `OP:`、通知先 = gmail）:
+    - `OP: auth failure spike` — `client_auth_failed` **OR** `login_failed` > 10 / **1分**（既存。認証失敗の複合）
+    - `OP: 5xx error spike` — 5xx > 20 / 1分（既存）
+    - `OP: signing key unavailable (fail-closed startup abort)`（既存。起動時の署名鍵 fail-closed）
+    - `OP: KMS sign failed (runtime)` — `kms_sign_failed` ≥1 / 5分（**追加**。実行時の署名失敗）
+    - `OP: DCR registration spike` — `dcr_client_registered` > 3 / 1時間（**追加**）
+  - log-based metric（`op_`）: `op_client_auth_failed` / `op_login_failed` / `op_token_issued`（既存）＋ `op_kms_sign_failed` / `op_dcr_registered`（追加）
+  - 通知チャネル: email → **`david3080@gmail.com`**（`rust-op OP alerts`, **VERIFIED**）。`info@sonrisa.co.jp` は M365(Exchange Online) で確認メールが検疫され未達のため不採用（チャネルは残置・M365 検疫を解けば後で差し替え可）。
+- **done（end-to-end 実証 2026-06-09）**: テストでクレデンシャルスタッフィング（`/token` に 14 回の認証失敗）→ `op_client_auth_failed` 集計 → `OP: auth failure spike` 発火 → **Gmail へ配信**を確認。失敗イベントは 5 分窓から抜けて自動 resolve。
 - **残（Enterprise/Advanced, 対象外）**: 自動 first-pass triage・統計的異常検知・agentic SOAR・不変監査ログ。
