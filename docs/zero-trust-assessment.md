@@ -67,7 +67,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 | **1. Identity & authentication** | OAuth IdP として短命トークン発行（F 直撃）。private_key_jwt+JWKS で暗号クライアント ID（E 相当）。DPoP で sender-bound。passkey で人間認証 F バー。KMS で鍵非展開 | L1＋L3＋L2 | Tamarin #1/#4/#5、Kani `pkce_method_no_downgrade`/`redirect_uri_match_is_exact`/`exp_in_window` | A2,A4 | **F 完全＋E 相当をモデル/述語で裏打ち**（コード全体ではない） |
 | **2. Access control / least agency** | RAR mandate scoping、scope/aud 制限、DPoP cnf（鍵保持者のみ）、redirect 完全一致、単回コード、step_up | L1＋L3 | Tamarin #2/#3、Kani `redirect_uri_match_is_exact` | A1,A4 | **資格情報側の scoping を裏打ち**。実行時 sandbox/網分離は管轄外 |
 | **3. Observability & auditing** | `tracing` 構造化ログ＋**全リクエストに request_id 付与・ドメインログ（`event=token_issued` 等）に連鎖**（`web::request_trace`）。異常検知/不変監査(E/A)は未 | L4 | `web::request_trace`（Request-ID 連鎖, Foundation tier） | — | **Foundation covered（Request-ID 連鎖）。E/A は未着手** |
-| **4. Behavioral monitoring & response** | 実行時検知は予防的証明の射程外 | — | — | — | **未着手（L4/L5）** |
+| **4. Behavioral monitoring & response** | アラート可能イベント（`client_auth_failed`/`login_failed`/`kms_sign_failed`/http 5xx 等）を構造化 emit 済。閾値・期待ベースライン・アラートポリシーを `docs/observability-alerts.md` に定義（実適用はゲート）。自動 triage/統計的異常検知/SOAR は未 | L4 | [`docs/observability-alerts.md`](./observability-alerts.md)＋既存イベント | — | **Foundation（信号＋閾値定義）covered。実適用ゲート、E/A 未** |
 | **5. Input validation & output** | プロトコル入力堅牢性は一部（JAR/PAR・exp/nonce/jti・htu 正規化）。LLM 向け classifier/output filter は別物 | L3 | Kani `strip_query_fragment_safe`/`exp_in_window` | A4 | **大半が別スコープ**（一部○） |
 | **6. Integrity & recovery** | 全 JWT/JWS 署名検証（偽造不能を*モデルで*証明）、KMS fail-closed、Cloud Run リビジョン rollback、cargo-deny。手書き変換 `pad32` は **L3 検証済**（panic/下溢れ非発生＋正当性） | L1＋L3＋L4 | Tamarin 偽造不能、Kani `pad32_safe`、過去修正 | A2,A4 | **部分一致（`pad32` は L3 verified）** |
 
@@ -94,7 +94,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 - **広範なコード↔モデルのギャップ**: L3（Kani）は5述語のみ橋を架けた。残る約11k 行は Kani 未検証。L1 が証明するのは*モデル*であって実コードではない。
 - **L2 暗号は仮定であり証明していない**（A4）。p256/sha2/base64/subtle の正しさは外部の信頼境界。
-- **Behavioral monitoring / agentic SOAR**（ZT 領域4・Part V）= 枠組みが面積の半分を割く**検知・対応**層がほぼ空白。領域3 Observability は **Foundation（Request-ID 連鎖）まで実装済**（Step3）だが、不変監査ログ・異常検知・自動応答（E/A）と SOAR は未着手。
+- **検知・対応層**: 領域3 Observability は **Foundation（Request-ID 連鎖）実装済**（Step3）、領域4 Behavioral monitoring も **Foundation（アラート信号＋閾値定義）まで**（`docs/observability-alerts.md`）。**残**: アラートポリシーの実適用（通知先選択ゆえユーザ gate）、不変監査ログ・統計的異常検知・自動応答・agentic SOAR（Enterprise/Advanced・Part V）。
 - **agent 固有領域**（prompt injection・tool access・memory poisoning）= rust-op の管轄外。ただし rust-op の scoped・sender-bound・単回な資格情報は、これらが起きても**blast radius を封じ込める**。
 - **AI-BOM / attestation / self-healing**（領域6 Advanced）未着手。
 - **rate-limit は friction であって barrier ではない**（枠組み Phase 5 が明言: 「buy time but do not stop a determined agentic attacker」）。DCR の rate-limit は補助であり load-bearing にしない。
