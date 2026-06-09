@@ -81,7 +81,7 @@ async fn finalize_login(
     let uid = interaction.uid.clone();
     interaction.account_id = Some(account_sub.clone());
     interaction.auth_time = Some(auth_time);
-    tracing::info!(event = "login_success", sub = %account_sub);
+    tracing::info!(event = "login_success", sub = %super::pseudonymize_sub(&account_sub));
     p.store.save_interaction(interaction).await;
     let sid = uuid::Uuid::new_v4().to_string();
     p.store

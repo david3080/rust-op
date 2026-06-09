@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -166,6 +167,16 @@ async fn request_trace(req: axum::extract::Request, next: axum::middleware::Next
         resp.headers_mut().insert("x-request-id", v);
     }
     resp
+}
+
+/// ログ用の sub 擬似化（ZT output-control）。平文 PII（メール）をログに出さず、subject ごとに
+/// **安定な相関トークン**（`h:` 接頭辞付き）を返す。`LOG_PSEUDONYM_KEY` が設定されていれば salt として
+/// 混ぜ、オフライン推測に耐える。未設定なら平文 SHA256（PII 平文は消えるが、メール空間は列挙可能ゆえ
+/// 推測耐性は弱い）。incident 時の逆引きは salt＋候補ハッシュ照合か別の安全な対応表で行う。
+pub(crate) fn pseudonymize_sub(sub: &str) -> String {
+    let salt = std::env::var("LOG_PSEUDONYM_KEY").unwrap_or_default();
+    let digest = Sha256::digest(format!("{salt}\0{sub}").as_bytes());
+    format!("h:{}", &crate::es256::b64url_encode(digest)[..16])
 }
 
 /// 未マッチのリクエストをログする（MDS3 等が叩く未実装パスの特定用）。
@@ -387,6 +398,18 @@ mod obs_tests {
             "span の request_id がドメインログに継承される必要がある: {out}"
         );
         assert!(out.contains("token_issued"));
+    }
+
+    /// sub 擬似化: 同じ sub は安定、異なる sub は別、生メールを含まない。
+    #[test]
+    fn pseudonymize_sub_is_stable_and_not_plaintext() {
+        let a = super::pseudonymize_sub("david3080@gmail.com");
+        let b = super::pseudonymize_sub("david3080@gmail.com");
+        let c = super::pseudonymize_sub("other@example.com");
+        assert_eq!(a, b, "同じ sub は安定な相関トークン");
+        assert_ne!(a, c, "異なる sub は異なる");
+        assert!(!a.contains("david3080") && !a.contains('@'), "生メールを含まない: {a}");
+        assert!(a.starts_with("h:"), "擬似化マーカー h: 付き: {a}");
     }
 }
 

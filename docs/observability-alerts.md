@@ -27,8 +27,9 @@ span 由来（request_id）は `jsonPayload.span.request_id`。severity は trac
 | `token_issued` | INFO | トークン発行量＝**異常な発行スパイク** | 平常のベースライン量 | 例: 平常比 × 5 の急増（高水位閾値） |
 
 補助シグナル: `http_request` の `latency_ms`（dwell/性能）、`login_success`/`token_issued` の量（正常ベースライン）。
-**注意**: `token_issued`/`login_success` は `fields.sub`（メール=PII）を含む。集計/アラートには使うが、PII の取り扱いは
-[Zero Trust 自己評価](./zero-trust-assessment.md) の output-control 観察（将来 pseudonymize 候補）を参照。
+**PII**: `token_issued`/`login_success` の `fields.sub` は**擬似化済**（`h:...` の安定相関トークン。`web::pseudonymize_sub`、
+平文メールはログに残らない）。subject 単位の相関は擬似化トークンで可能。逆引きは `LOG_PSEUDONYM_KEY` 設定時の
+salt＋候補照合で（未設定時は平文 SHA256 ゆえ推測耐性は弱い）。
 
 ## 期待ベースライン（「正常」の手定義 = Foundation）
 
