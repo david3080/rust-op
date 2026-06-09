@@ -15,7 +15,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::Instrument;
+use uuid::Uuid;
 
 mod ciba;
 mod login;
@@ -99,7 +101,7 @@ pub fn router(provider: Provider) -> Router {
         )
         .with_state(shared);
 
-    if base_path.is_empty() {
+    let app = if base_path.is_empty() {
         inner.merge(fido).merge(magic).fallback(log_unmatched)
     } else {
         // ドメイン直下 `/` と末尾スラッシュ `/oidc/` を `/oidc`（サインイン画面）へ寄せる。
@@ -124,7 +126,46 @@ pub fn router(provider: Provider) -> Router {
             .nest(&base_path, inner)
             .merge(fido)
             .merge(magic)
+    };
+    // 全リクエストに request_id を付与し、構造化ログを相関させる（ZT Observability Foundation）。
+    app.layer(axum::middleware::from_fn(request_trace))
+}
+
+/// リクエスト相関ミドルウェア（L4 Observability の Foundation 層）:
+/// request_id を採番（または健全な inbound `X-Request-Id` を踏襲）し、span でハンドラを囲んで
+/// 既存のドメインログ（`event=token_issued` 等）に request_id を継承させる。応答後に
+/// method/path/status/latency を1行記録し、応答ヘッダにも request_id を返す。
+///
+/// 秘密はログに出さない: **query を含めず path のみ**（query には code 等が乗りうる）、
+/// ヘッダ・ボディ・Authorization・DPoP proof・トークン類は一切記録しない。
+async fn request_trace(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string(); // query は付けない（秘密が乗りうる）
+    // inbound の X-Request-Id は健全（短い ASCII 図形文字のみ）な場合だけ踏襲。ログ注入を防ぐ。
+    let rid = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| (1..=200).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_graphic()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let span = tracing::info_span!("http", request_id = %rid);
+    let start = Instant::now();
+    let mut resp = next.run(req).instrument(span).await;
+
+    tracing::info!(
+        event = "http_request",
+        request_id = %rid,
+        method = %method,
+        path = %path,
+        status = resp.status().as_u16(),
+        latency_ms = start.elapsed().as_millis() as u64,
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&rid) {
+        resp.headers_mut().insert("x-request-id", v);
     }
+    resp
 }
 
 /// 未マッチのリクエストをログする（MDS3 等が叩く未実装パスの特定用）。
@@ -299,5 +340,53 @@ async fn authenticate_token(
         }
     }
     Ok(at)
+}
+
+#[cfg(test)]
+mod obs_tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct VecWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for VecWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+        type Writer = VecWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `request_trace` の肝＝span の request_id が、span 内で出る既存ドメインログ
+    /// （`event=token_issued` 等）に**継承される**ことを、本番と同じ `fmt().json()` 構成で確認する。
+    /// これは型検査では分からず subscriber 構成依存（http_request 行は明示フィールドなので常に出るが、
+    /// 相関先のドメインログが span 継承で出るかは別問題）なので、ここで明示的に検証する。
+    #[test]
+    fn request_id_span_field_propagates_to_domain_logs() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(VecWriter(buf.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("http", request_id = "RID-TEST-123");
+            let _g = span.enter();
+            tracing::info!(event = "token_issued"); // 既存ドメインログ相当
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("RID-TEST-123"),
+            "span の request_id がドメインログに継承される必要がある: {out}"
+        );
+        assert!(out.contains("token_issued"));
+    }
 }
 
