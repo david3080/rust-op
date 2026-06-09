@@ -1,0 +1,124 @@
+theory CompositionPublicNEGNoCnf
+begin
+
+/*
+  #8 の NEG 変種 (b): cnf.jkt（DPoP 鍵束縛）を**外す**と何が壊れるかを示す（必要性証明）。
+  本体 composition_public_pkce_dpop.spthy との差分は RS_Accept の1箇所だけ:
+    - RS_Accept から cnf 一致検査 Eq(h(dppub), jkt) を削除（= sender-constrained でない bearer トークン）。
+  redirect_uri 完全一致は**残す**（code は登録エンドポイントにだけ届く）。それでも falsify する。
+
+  攻撃（トークン窃取後の再利用）:
+    1. 正規フローが完走し、トークン at が平文配送（Out）される。
+    2. 攻撃者が at を窃取（DY で In）。cnf 検査が無いので自前の鍵 ~dk_adv で DPoP proof を構成。
+    3. RS は cnf を見ないため proof 署名さえ通れば受理 → リソースを攻撃者鍵宛に開放 → 復号。
+    DPoP鍵もユーザ鍵も漏れていないのに、平文配送トークンの窃取だけでリソースが漏れる。
+
+  期待: comp_resource_secrecy が falsified。executable は verified のまま。
+  → これと NEG_no_redirect の両方が falsify することで、redirect 完全一致と cnf 束縛の
+    **両方が** load-bearing（どちらか欠けると壊れる）ことを示す。
+  実行: tamarin-prover --prove --auto-sources formal/composition_public_NEG_no_cnf.spthy
+*/
+
+builtins: hashing, signing, asymmetric-encryption
+
+rule Setup_User:
+    [ Fr(~uk) ] --[ ]-> [ !UserKey($U, ~uk), !UserPub($U, pk(~uk)), Out(pk(~uk)) ]
+rule Reveal_User:
+    [ !UserKey($U, ~uk) ] --[ RevealUser($U) ]-> [ Out(~uk) ]
+
+rule Setup_Resource:
+    [ Fr(~res) ] --[ Protected($U, ~res) ]-> [ !Resource($U, ~res) ]
+
+rule AS_Setup:
+    [ Fr(~ltkAS) ] --[ ]-> [ !AS_Ltk(~ltkAS), !AS_Pk(pk(~ltkAS)), Out(pk(~ltkAS)) ]
+
+rule Setup_Client:
+    [ Fr(~ep) ] --[ ]-> [ !ClientEP($C, ~ep) ]
+
+rule C_AuthRequest:
+    [ !ClientEP($C, ~ep), Fr(~v) ]
+  --[ ClientStart($C, $U, ~v) ]->
+    [ St_C1($C, ~ep, $U, ~v), Out( <'authreq', $C, $U, h(~v)> ) ]
+
+rule U_Consent:
+    [ !UserKey(U, ~uk), In( <'authreq', C, U, challenge> ) ]
+  --[ UserConsent(U, C, challenge) ]->
+    [ Out( <'consent', C, challenge, sign(<'consent', C, challenge>, ~uk)> ) ]
+
+rule AS_IssueCode:
+    [ In( <'authreq', C, U, challenge> )
+    , In( <'consent', C, challenge, appr> )
+    , !UserPub(U, upk)
+    , !ClientEP(C, ep)
+    , Fr(~code)
+    ]
+  --[ Eq(verify(appr, <'consent', C, challenge>, upk), true)
+    , IssueCode(C, U, ~code, challenge) ]->
+    [ AS_Code(C, U, ~code, challenge)
+    , RedirectCode(ep, ~code)
+    ]
+
+rule C_Redeem:
+    [ St_C1($C, ~ep, $U, ~v), RedirectCode(~ep, code), !AS_Pk(aspk), Fr(~dk) ]
+  --[ ClientRedeem($C, code, ~v) ]->
+    [ !CDk($C, ~dk)
+    , Out( aenc(<'tokenreq', $C, code, ~v, pk(~dk)>, aspk) )
+    ]
+
+rule Reveal_DPoP:
+    [ !CDk($C, ~dk) ] --[ RevealDPoP($C) ]-> [ Out(~dk) ]
+
+rule AS_IssueToken:
+    [ AS_Code(C, U, code, challenge)
+    , !AS_Ltk(~ltkAS)
+    , In( aenc(<'tokenreq', C, code, v, dppub>, pk(~ltkAS)) )
+    , Fr(~at)
+    ]
+  --[ Eq(h(v), challenge)
+    , IssueToken(C, U, code, ~at, h(dppub)) ]->
+    [ !Bound(~at, h(dppub))
+    , !TokenUser(~at, U)
+    , Out(~at)
+    ]
+
+rule C_UseAT:
+    let payload = <'dpop', $M, $RU, ~jti, at>
+    in
+    [ !CDk($C, ~dk), In(at), Fr(~jti) ]
+  --[ ClientUsesAT($C, at) ]->
+    [ Out( <'rsreq', at, payload, sign(payload, ~dk), pk(~dk)> ) ]
+
+/* ★ NEG 差分: cnf 一致検査 Eq(h(dppub), jkt) を削除（bearer 化）。proof 署名と jti 単回だけ見る。 */
+rule RS_Accept:
+    let payload = <'dpop', M, RU, jti, at>
+    in
+    [ !Bound(at, jkt), !TokenUser(at, U), !Resource(U, ~res)
+    , In( <'rsreq', at, payload, sig, dppub> )
+    ]
+  --[ Eq(verify(sig, payload, dppub), true)
+    , Once(jti)
+    , RS_Grant(at, U)
+    ]->
+    [ Out( aenc(~res, dppub) ) ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+restriction OnceJti:
+    "All x #i #j. Once(x) @ #i & Once(x) @ #j ==> #i = #j"
+
+lemma executable:
+  exists-trace
+    "Ex at U #g.
+        RS_Grant(at, U) @ #g
+      & not (Ex C #r. RevealDPoP(C) @ #r)
+      & not (Ex UU #r. RevealUser(UU) @ #r)"
+
+/* cnf を外したので falsify する（平文配送トークンを窃取して自鍵 proof で使える）。 */
+lemma comp_resource_secrecy:
+    "All U res #i.
+        Protected(U, res) @ #i
+      & (not (Ex C #r. RevealDPoP(C) @ #r))
+      & (not (Ex UU #r. RevealUser(UU) @ #r))
+      ==> not (Ex #j. K(res) @ #j)"
+
+end

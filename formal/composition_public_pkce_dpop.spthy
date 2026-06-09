@@ -1,0 +1,160 @@
+theory CompositionPublicPkceDpop
+begin
+
+/*
+  backlog #8: public client の完全合成（認可コード × redirect_uri 完全一致 × PKCE × #2 DPoP × ユーザ同意）
+  rust-op の public client（token_endpoint_auth_method="none"、demo-rp / mobile-rp 型）。
+  #6（confidential = private_key_jwt の合成）と対になる **public 版**。
+
+  ★ 形式検証が隠れた前提を炙り出した実例（#6 に続く2例目）:
+    最初 redirect_uri 束縛**無し**でモデル化すると、executable は verified のまま comp_resource_secrecy だけが
+    falsify した（= モデルは健全で本物の攻撃が見つかった）。攻撃は「**攻撃者が自分の verifier v_adv で
+    authreq(C,U,h(v_adv)) を作り、ユーザに同意させ、出た code を自分で償還して自鍵束縛トークンを得る**」。
+    public client はクライアント認証が無いので、これを止めるのは **redirect_uri 完全一致（code を登録済み
+    エンドポイントにだけ配送）**。これを入れると verified になる（下記）。
+    → L1 が「なぜ redirect_uri 完全一致が public で load-bearing か」を示し、L3 Kani `redirect_uri_match_is_exact`
+      が「実コードが厳密一致を担保」を示す、という層の対応が閉じる。
+
+  検証する性質（エンドツーエンドのリソース秘匿）:
+    正規ユーザ U の保護リソースは、DPoP 鍵もユーザ鍵も漏れない限り攻撃者に漏れない。
+    依存: ユーザ同意 + **redirect_uri 完全一致** + cnf.jkt + code 単回。
+    → redirect を外すと上記の攻撃で falsify、cnf を外すと盗難トークンの使用で falsify（NEG 変種で確認）。
+
+  注（PKCE の扱い）: 本モデルでは code が登録エンドポイントにだけ届くため、PKCE(h(v)=challenge) は**冗長**
+    （横取り code が存在しない）。PKCE の“個別の必要性”は code 可視（横取り）シナリオの
+    `oauth_code_pkce_public.spthy` + `oauth_code_public_NEG_no_pkce.spthy` で別途証明済み。
+    本 #8 が証明するのは **redirect_uri 完全一致 と cnf 束縛の必要性**であり、PKCE 等は前提として置く。
+
+  攻撃者: Dolev-Yao。フロントの authreq・challenge は可視、token は平文配送＝窃取可能。
+  抽象: passkey=ユーザ署名鍵。redirect endpoint 制御 = 秘密ハンドル ~ep（never Out）。token endpoint=AS公開鍵暗号化。
+
+  実行: tamarin-prover --prove --auto-sources formal/composition_public_pkce_dpop.spthy
+*/
+
+builtins: hashing, signing, asymmetric-encryption
+
+/* ---- ユーザ認証鍵（passkey）---- */
+rule Setup_User:
+    [ Fr(~uk) ] --[ ]-> [ !UserKey($U, ~uk), !UserPub($U, pk(~uk)), Out(pk(~uk)) ]
+rule Reveal_User:
+    [ !UserKey($U, ~uk) ] --[ RevealUser($U) ]-> [ Out(~uk) ]
+
+/* ---- RS の保護リソース ---- */
+rule Setup_Resource:
+    [ Fr(~res) ] --[ Protected($U, ~res) ]-> [ !Resource($U, ~res) ]
+
+/* ---- AS のサーバ鍵（TLS to AS / token endpoint の機密性）---- */
+rule AS_Setup:
+    [ Fr(~ltkAS) ] --[ ]-> [ !AS_Ltk(~ltkAS), !AS_Pk(pk(~ltkAS)), Out(pk(~ltkAS)) ]
+
+/* ---- public client の登録: redirect endpoint 制御ハンドル ~ep（秘密・never Out）。
+        redirect_uri 文字列は公開だが「そのエンドポイントを制御する」ことを ~ep で表す。 ---- */
+rule Setup_Client:
+    [ Fr(~ep) ] --[ ]-> [ !ClientEP($C, ~ep) ]
+
+/* ---- public client: 認可要求。PKCE verifier ~v、challenge=h(~v) をフロントへ（~v は出さない）---- */
+rule C_AuthRequest:
+    [ !ClientEP($C, ~ep), Fr(~v) ]
+  --[ ClientStart($C, $U, ~v) ]->
+    [ St_C1($C, ~ep, $U, ~v), Out( <'authreq', $C, $U, h(~v)> ) ]
+
+/* ---- ユーザ同意: “この client C・この challenge”に passkey で同意（challenge は攻撃者が選べる）---- */
+rule U_Consent:
+    [ !UserKey(U, ~uk), In( <'authreq', C, U, challenge> ) ]
+  --[ UserConsent(U, C, challenge) ]->
+    [ Out( <'consent', C, challenge, sign(<'consent', C, challenge>, ~uk)> ) ]
+
+/* ---- AS: ユーザ同意検証 → code 発行（単回）。code は **登録エンドポイント ~ep にだけ配送**（Out しない）。
+        ＝ redirect_uri 完全一致。攻撃者は ~ep を持たないので code を受け取れない。 ---- */
+rule AS_IssueCode:
+    [ In( <'authreq', C, U, challenge> )
+    , In( <'consent', C, challenge, appr> )
+    , !UserPub(U, upk)
+    , !ClientEP(C, ep)
+    , Fr(~code)
+    ]
+  --[ Eq(verify(appr, <'consent', C, challenge>, upk), true)
+    , IssueCode(C, U, ~code, challenge) ]->
+    [ AS_Code(C, U, ~code, challenge)
+    , RedirectCode(ep, ~code)     // 登録エンドポイントへの配送（linear・非 Out）
+    ]
+
+/* ---- public client: コード交換。自分のエンドポイント ~ep から code を取り、verifier ~v + DPoP 鍵 ~dk を
+        AS 公開鍵へ暗号化（TLS to AS）。クライアント認証は無い。 ---- */
+rule C_Redeem:
+    [ St_C1($C, ~ep, $U, ~v), RedirectCode(~ep, code), !AS_Pk(aspk), Fr(~dk) ]
+  --[ ClientRedeem($C, code, ~v) ]->
+    [ !CDk($C, ~dk)
+    , Out( aenc(<'tokenreq', $C, code, ~v, pk(~dk)>, aspk) )
+    ]
+
+rule Reveal_DPoP:
+    [ !CDk($C, ~dk) ] --[ RevealDPoP($C) ]-> [ Out(~dk) ]
+
+/* ---- AS: トークン発行。code 単回消費 + PKCE 検査(h(v)=challenge) → cnf.jkt 束縛で発行。token は平文配送。 ---- */
+rule AS_IssueToken:
+    [ AS_Code(C, U, code, challenge)
+    , !AS_Ltk(~ltkAS)
+    , In( aenc(<'tokenreq', C, code, v, dppub>, pk(~ltkAS)) )
+    , Fr(~at)
+    ]
+  --[ Eq(h(v), challenge)
+    , IssueToken(C, U, code, ~at, h(dppub)) ]->
+    [ !Bound(~at, h(dppub))
+    , !TokenUser(~at, U)
+    , Out(~at)
+    ]
+
+/* ---- client: token を DPoP proof 付きで RS へ ---- */
+rule C_UseAT:
+    let payload = <'dpop', $M, $RU, ~jti, at>
+    in
+    [ !CDk($C, ~dk), In(at), Fr(~jti) ]
+  --[ ClientUsesAT($C, at) ]->
+    [ Out( <'rsreq', at, payload, sign(payload, ~dk), pk(~dk)> ) ]
+
+/* ---- RS: cnf.jkt 一致 + proof 署名 + jti 単回 → リソースをリクエスタ鍵へ暗号化して開放 ---- */
+rule RS_Accept:
+    let payload = <'dpop', M, RU, jti, at>
+    in
+    [ !Bound(at, jkt), !TokenUser(at, U), !Resource(U, ~res)
+    , In( <'rsreq', at, payload, sig, dppub> )
+    ]
+  --[ Eq(h(dppub), jkt)
+    , Eq(verify(sig, payload, dppub), true)
+    , Once(jti)
+    , RS_Grant(at, U)
+    ]->
+    [ Out( aenc(~res, dppub) ) ]
+
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+restriction OnceJti:
+    "All x #i #j. Once(x) @ #i & Once(x) @ #j ==> #i = #j"
+
+/* ======================== 性質 ======================== */
+
+lemma executable:
+  exists-trace
+    "Ex at U #g.
+        RS_Grant(at, U) @ #g
+      & not (Ex C #r. RevealDPoP(C) @ #r)
+      & not (Ex UU #r. RevealUser(UU) @ #r)"
+
+/* (1) エンドツーエンドのリソース秘匿（public client）:
+   redirect_uri 完全一致（code を登録 endpoint にだけ配送）と cnf 束縛が両方効いて初めて成立。 */
+lemma comp_resource_secrecy:
+    "All U res #i.
+        Protected(U, res) @ #i
+      & (not (Ex C #r. RevealDPoP(C) @ #r))
+      & (not (Ex UU #r. RevealUser(UU) @ #r))
+      ==> not (Ex #j. K(res) @ #j)"
+
+/* (2) 認可コード単回 */
+lemma code_single_use:
+    "All C U code at1 j1 at2 j2 #i #k.
+        IssueToken(C, U, code, at1, j1) @ #i
+      & IssueToken(C, U, code, at2, j2) @ #k
+      ==> #i = #k"
+
+end

@@ -297,11 +297,70 @@ mandate 束縛（すり替え無効化）が**重なって初めて** end-to-end
 
 ---
 
+## モデル #8: 合成（public client 認可コード × redirect_uri 完全一致 × PKCE × #2 DPoP × ユーザ同意）
+
+`composition_public_pkce_dpop.spthy` — rust-op の **public client**（`token_endpoint_auth_method="none"`、
+demo-rp / mobile-rp 型）の end-to-end。#6（confidential = private_key_jwt の合成）と対になる **public 版**。
+クライアント認証が無い分、**何がその穴を埋めているか**を炙り出すのが主眼。
+
+### ★ 形式検証が再び隠れた前提を炙り出した（#6 に続く2例目）
+最初 redirect_uri 束縛**無し**（code を平文 `Out`）でモデル化すると、`executable` は verified のまま
+`comp_resource_secrecy` だけが **falsified（11 steps）**＝モデルは健全で**本物の攻撃**が見つかった:
+**攻撃者が自分の verifier `~v_adv` で `authreq(C,U,h(~v_adv))` を作り、ユーザに同意させ、出た code を
+自分で償還して自鍵束縛トークンを得る**（public はクライアント認証が無く、PKCE challenge も攻撃者が選べるので
+PKCE は素通り）。これを止める唯一の防御が **redirect_uri 完全一致**（code を登録エンドポイントにだけ配送）。
+モデルに endpoint 制御（秘密ハンドル `~ep`、never Out）を入れて code をそこへだけ届けると **verified（13 steps）** になる。
+→ **修正がそのまま診断の検証**になっている（redirect 束縛を入れて verify したことで、攻撃の原因が redirect 欠如だと確定）。
+
+### 検証結果（Tamarin 1.12.0 / maude 3.5.1, 2026-06-09 実測）
+| モデル | 結果 |
+|---|---|
+| `composition_public_pkce_dpop.spthy` | `executable` (13) / `comp_resource_secrecy` (13) / `code_single_use` (10) **verified** |
+| `composition_public_NEG_no_redirect.spthy`（redirect 束縛を外し `Out(~code)` に戻す）| `comp_resource_secrecy` **falsified（11 steps）** ＝ 上記の自鍵束縛トークン攻撃 |
+| `composition_public_NEG_no_cnf.spthy`（RS の cnf.jkt 検査を外す, #2）| `comp_resource_secrecy` **falsified（9 steps）** ＝ 平文配送トークンを窃取し自鍵 proof で使用 |
+
+→ **redirect_uri 完全一致 と cnf 束縛が各々個別に必要**（どちらを外しても end-to-end が破れる）。両 NEG とも
+`executable` は verified のまま（モデルが健全な証拠）。
+
+### このモデルが証明すること / しないこと（正直に）
+- **証明する**: public client では **redirect_uri 完全一致**（= code の配送先制御）と **cnf 束縛**が load-bearing。
+- **証明しない（前提として置く）**: 本モデルは code が登録エンドポイントにだけ届くため、**PKCE は冗長**
+  （横取り code が存在しないので `h(v)=challenge` 検査は攻撃を1つも止めていない）。PKCE の**個別の必要性**は
+  code 可視（横取り）シナリオの `oauth_code_pkce_public.spthy` + `oauth_code_public_NEG_no_pkce.spthy` で別途証明済み。
+  **#8 が PKCE の必要性を示すと主張してはいけない**——#8 が示すのは redirect + cnf の必要性。
+
+### L1 ↔ L3 の層対応が閉じる
+#8 の falsify は、**なぜ redirect_uri 完全一致が public client で load-bearing か**をプロトコル論理で示す。
+これは L3 Kani の `redirect_uri_match_is_exact`（実コード `auth_checks::redirect_uri_registered` がバイト完全一致で、
+正規化の抜け道が無いことをロック）の**プロトコル側の正当化**になる:
+- **L1（#8）= なぜ**厳密一致が必要か（外すと自鍵束縛トークン攻撃が成立）。
+- **L3（Kani）= 実コードが**その厳密一致を本当に担保しているか（`u==ru` の完全一致、空リストは不一致）。
+
+これで「L1 の前提＝L3 の証明義務」が redirect_uri について両側から閉じる（#6 で「redirect_uri 束縛が public で
+load-bearing」と気づいた所を、#8 が記号モデルで明示し、Kani が実コードで固めた）。
+
+### 表に出た前提 → rust-op の担保
+| 前提（抽象） | rust-op の担保（具体） |
+|---|---|
+| code は**登録エンドポイントにだけ**配送（redirect_uri 完全一致） | `auth_checks::redirect_uri_registered`（バイト完全一致、Kani `redirect_uri_match_is_exact` でロック） |
+| トークンは **cnf.jkt で送り主束縛**（盗まれても無効） | DPoP（`dpop.rs`、grants の `dpop_jkt` 一致） |
+| ユーザ同意は**その client への同意**（passkey 署名） | login/consent の passkey 署名（`webauthn.rs`） |
+| 認可コードは**単回消費** | store の CAS 単回（前提 A1 に依存、Tamarin `Once` で表現） |
+| （PKCE）verifier 秘密 + `h(v)=challenge` | `auth_checks::pkce_method_is_s256`。本合成では冗長だが多層防御として保持 |
+
+### 限界
+- フィッシング/同意すり替え（ユーザが偽 client に同意）はスコープ外（client は1つに固定）。redirect 束縛は
+  「code の**配送先**が攻撃者に渡らない」ことだけを表現。
+- ID token(#5) の合成は別。
+
+---
+
 ## ロードマップ達成状況
-**#1 ✅ #2 ✅ #3 ✅ #4 ✅ #5 ✅ #6 ✅ #7 ✅** — 全モデルが Tamarin 1.12.0 で verified、各前提の必要性も
+**#1 ✅ #2 ✅ #3 ✅ #4 ✅ #5 ✅ #6 ✅ #7 ✅ #8 ✅** — 全モデルが Tamarin 1.12.0 で verified、各前提の必要性も
 NEG 変種の falsify で実証。各モデルが「防げる攻撃 ＋ 必要前提（→ rust-op の運用要件）」を1セット産んだ。
-合成 #6（認可コード系）と #7（CIBA 系）は、複数防御が**重なって初めて**end-to-end の安全性が出ることを示す。
-#6 は形式検証が隠れた前提（consent 束縛・redirect_uri 束縛）を炙り出した実例でもある。
+合成 #6（confidential 認可コード系）・#7（CIBA 系）・#8（public 認可コード系）は、複数防御が**重なって初めて**
+end-to-end の安全性が出ることを示す。#6 と #8 は形式検証が隠れた前提（consent 束縛・redirect_uri 完全一致）を
+炙り出した実例でもある（#8 は redirect 束縛の load-bearing 性を記号モデルで明示し、L3 Kani の redirect ロックと層対応が閉じた）。
 
 ---
 
