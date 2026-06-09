@@ -32,7 +32,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 | **A1** | **Firestore CAS の原子性**（code/jti/CIBA/refresh の単回消費を `cas_take`＝updateTime 条件付き削除で実現） | L4 | 認可コード/トークンの二重発行・リプレイ | Firestore のリージョン/SLA 維持、`cas_take` 経路を全消費に適用、回帰テスト `store::code_reuse_revokes_issued_tokens`。L1 では Tamarin `Once`／linear fact で単回性を証明済（モデル） |
 | **A2** | **KMS 署名鍵がプロセス外で非展開**（ES256/RS256, Cloud KMS） | L4 | 全署名の偽造 → OP なりすまし（Tamarin の `RevealOP` が**起きない**前提） | KMS 権限最小化・鍵ローテ・fail-closed（鍵不在は起動拒否）。Secret Manager / 起動時一時鍵への fallback は監査対象 |
 | **A3** | **TLS 終端の機密性**（Cloud Run / Firebase Hosting） | L4 | トークン平文窃取が容易（Tamarin は「鍵への暗号化」で抽象化） | TLS 強制・HSTS・証明書管理。issuer=`https://oidc.sonrisa.co.jp/oidc` |
-| **A4** | **暗号/エンコーディングライブラリの正当性**（p256, sha2, base64, subtle `ct_eq`） | **L2** | 署名検証バイパス・タイミング漏洩等 | **証明せず信頼境界として引用**。cargo-deny（SHA ピン）で供給網監査。将来 CryptoVerif/EasyCrypt を引く余地 |
+| **A4** | **暗号/エンコーディングライブラリの正当性**（p256, sha2, rsa, ed25519, base64, subtle `ct_eq`） | **L2** | 署名検証バイパス・タイミング漏洩等 | [`docs/crypto-assumptions.md`](./crypto-assumptions.md) で3分解: **(a) 設計安全性＝文献で確立・引用可（ECDSA/EdDSA/RSA の EUF-CMA, SHA-256 ROM/CR）/ (b) 実装正しさ＝クレート監査・テストベクタに依拠（深掘りは hax/Aeneas）/ (c) 定数時間＝subtle に依拠**。cargo-deny（SHA ピン）で供給網監査。残余 (b)(c) は GAP |
 | **A5** | **DPoP 時刻スキュー ≤60s / jti TTL 有界** | L4＋L3 | リプレイ窓の拡大・jti 保持の無限肥大 | clock 同期。jti 保持窓は **L3 `jti_ttl_is_bounded` で ≤3600s 有界を証明済** |
 | **A6** | **試験面の本番排除**（`CONFORMANCE_CLIENTS_ENABLED` / `FIDO_CONFORMANCE_ENABLED`） | L4 | 試験用クライアント/エンドポイントが本番で有効化 | 本番デプロイで両フラグ無効を確認（現リビジョンで `/fido/*`=404、試験クライアント排除） |
 | **A7** | **client_assertion exp 上限（3600s）＋ jti 単回** | L3＋L1 | 長命 assertion のリプレイ | **L3 `exp_in_window` で窓検査＋オーバーフロー安全を証明済**。jti 単回は A1 に依存 |
@@ -93,7 +93,7 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 **最重要の節。** ✓ の裏で**何が未検証か**を明示する。枠組み自身が「不確かなら foundational controls はまだ work が要る」と言う姿勢に従う。
 
 - **広範なコード↔モデルのギャップ**: L3（Kani）は5述語のみ橋を架けた。残る約11k 行は Kani 未検証。L1 が証明するのは*モデル*であって実コードではない。
-- **L2 暗号は仮定であり証明していない**（A4）。p256/sha2/base64/subtle の正しさは外部の信頼境界。
+- **L2 暗号は仮定**（A4, [`docs/crypto-assumptions.md`](./crypto-assumptions.md) で3分解）。**(a) 設計安全性は文献で確立・引用可**だが、**(b) クレートの実装正しさ**（深掘りは hax/Aeneas）と **(c) 定数時間**（subtle 依拠）は残余。rust-op 内で機械証明はしていない。
 - **検知・対応層**: 領域3 Observability は **Foundation（Request-ID 連鎖）実装済**（Step3）、領域4 Behavioral monitoring も **Foundation（アラート信号＋閾値定義）まで**（`docs/observability-alerts.md`）。**残**: アラートポリシーの実適用（通知先選択ゆえユーザ gate）、不変監査ログ・統計的異常検知・自動応答・agentic SOAR（Enterprise/Advanced・Part V）。
 - **agent 固有領域**（prompt injection・tool access・memory poisoning）= rust-op の管轄外。ただし rust-op の scoped・sender-bound・単回な資格情報は、これらが起きても**blast radius を封じ込める**。
 - **AI-BOM / attestation / self-healing**（領域6 Advanced）未着手。
