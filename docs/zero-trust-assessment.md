@@ -51,10 +51,12 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 | DPoP proof jti | 300s = 5分 | `dpop.rs JTI_TTL` | ○ |
 | PAR request_uri | 60s | `par.rs TTL_SECS` | ○ |
 | CIBA auth_req | 300s = 5分 | `ciba.rs TTL_SECS` | ○ |
-| refresh token | 14日 | `firestore_store.rs REFRESH_TTL` | 標準（短命 access の更新用。単回回転＋盗難検知は別途 A1 に依存） |
+| refresh token | 14日 | `firestore_store.rs REFRESH_TTL` | 標準（短命 access の更新用。単回回転＋**DPoP 鍵束縛**＋盗難検知は A1 に依存） |
 | session cookie | 7日 | `firestore_store.rs SESSION_TTL` | ブラウザセッション。トークンではない |
 
 → **bearer/proof 系はすべて分単位**で枠組みの bar を満たす。長命なのは refresh（14日）と session（7日）のみで、いずれも bearer access ではない。refresh は短命 access を更新する設計上の長命であり、その安全性は A1（単回消費の CAS 原子性）に依存する。
+
+> **2026-06-10 発見・修正（DPoP sender-binding の refresh への適用漏れ）**: refresh token が DPoP 鍵に束縛されていなかった（`RefreshToken` に jkt 無し）。public client（`token_endpoint_auth_method: none`）の refresh を窃取すると、攻撃者が自鍵の proof を作るだけで被害者アカウントの sender-bound access token を取得でき、DPoP（RFC 9449）が refresh 経路で完全バイパスされていた。`mobile-rp`/`demo-rp`（ともに public + `dpop_bound`）が該当。**修正**: `RefreshToken.jkt` を追加し発行時に束縛、`RefreshTokenGrant` で消費前に提示 proof の jkt と照合（不一致は `invalid_dpop_proof`、被害者 RT は消費しない＝DoS も防止）、ローテーションで束縛を継承、束縛なし RT は public client で拒否。回帰テスト: `grants::tests::regression_stolen_refresh_token_cannot_rebind_to_attacker_key` ほか。これは authorization_code 経路（`grants.rs:180-189` で既に jkt 照合）との非対称を解消したもの。
 
 ---
 

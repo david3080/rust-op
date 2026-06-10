@@ -99,6 +99,7 @@ fn at_hash(access_token: &str) -> String {
 }
 
 /// offline_access scope があればリフレッシュトークンを発行・保存して返す。
+#[allow(clippy::too_many_arguments)]
 async fn maybe_issue_refresh(
     p: &Provider,
     client_id: &str,
@@ -107,6 +108,7 @@ async fn maybe_issue_refresh(
     resource: Option<&str>,
     acr: Option<&str>,
     auth_time: Option<u64>,
+    jkt: Option<&str>,
 ) -> Option<String> {
     if !has_scope(scope, "offline_access") {
         return None;
@@ -119,6 +121,7 @@ async fn maybe_issue_refresh(
             account_id: account_id.to_string(),
             scope: scope.to_string(),
             resource: resource.map(str::to_string),
+            jkt: jkt.map(str::to_string),
             acr: acr.map(str::to_string),
             auth_time,
         })
@@ -197,12 +200,13 @@ impl GrantHandler for AuthorizationCodeGrant {
             code.nonce.as_deref(),
             Some(code.auth_time),
             code.acr.as_deref(),
-            dpop_jkt,
+            dpop_jkt.clone(),
             client.id_token_signed_response_alg.as_deref(),
             code.resource.as_deref(),
             None,
         )
         .await;
+        // RFC 9449 §5: DPoP proof を伴う発行では refresh token も同じ鍵に束縛する。
         let refresh_token = maybe_issue_refresh(
             p,
             &client.client_id,
@@ -211,6 +215,7 @@ impl GrantHandler for AuthorizationCodeGrant {
             code.resource.as_deref(),
             code.acr.as_deref(),
             Some(code.auth_time),
+            dpop_jkt.as_deref(),
         )
         .await;
         // 再利用時に失効させるため、発行トークンをコードに紐付ける。
@@ -248,16 +253,43 @@ impl GrantHandler for RefreshTokenGrant {
         let rt_val = form
             .get("refresh_token")
             .ok_or_else(|| OAuthError::InvalidRequest("refresh_token required".into()))?;
-        // ローテーション: 取得と同時に消費。再利用は invalid_grant。
+
+        // 消費前に所有者と DPoP 束縛を検証する。検証失敗で被害者の RT をローテーション消費
+        // （=失効）させないため、まず get で参照して通過したものだけ take で単回消費する。
+        let pre = p
+            .store
+            .get_refresh_token(rt_val)
+            .await
+            .ok_or_else(|| OAuthError::InvalidGrant("refresh_token not found or already used".into()))?;
+
+        if pre.client_id != client.client_id {
+            return Err(OAuthError::InvalidGrant("refresh_token issued to another client".into()));
+        }
+
+        // DPoP 束縛 (RFC 9449 §5): 発行時に鍵束縛された RT は、提示 proof の jkt が一致必須。
+        // 盗難 RT を攻撃者の鍵へ付け替える攻撃を防ぐ。束縛なしの RT は public client では拒否
+        // （client 認証が無く、束縛も無ければ bearer 長命資格情報になってしまうため）。
+        match (&pre.jkt, &dpop_jkt) {
+            (Some(bound), Some(got)) if bound == got => {}
+            (Some(_), _) => {
+                return Err(OAuthError::InvalidDpopProof(
+                    "DPoP proof jkt does not match the key bound to this refresh token".into(),
+                ))
+            }
+            (None, _) if client.is_public() => {
+                return Err(OAuthError::InvalidGrant(
+                    "refresh token for a public client must be DPoP-bound".into(),
+                ))
+            }
+            (None, _) => {}
+        }
+
+        // 検証通過。ここで単回消費（ローテーション）。並行リクエストは CAS で高々 1 回成功。
         let rt = p
             .store
             .take_refresh_token(rt_val)
             .await
             .ok_or_else(|| OAuthError::InvalidGrant("refresh_token not found or already used".into()))?;
-
-        if rt.client_id != client.client_id {
-            return Err(OAuthError::InvalidGrant("refresh_token issued to another client".into()));
-        }
 
         // scope の縮小は許可、拡大は拒否（RFC 6749 §6）。指定なしは元の scope を踏襲。
         let scope = match form.get("scope") {
@@ -277,9 +309,10 @@ impl GrantHandler for RefreshTokenGrant {
         let (access_token, id_token) =
             issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, rt.auth_time, rt.acr.as_deref(), dpop_jkt, client.id_token_signed_response_alg.as_deref(), rt.resource.as_deref(), None)
                 .await;
-        // ローテーションした新しい refresh token を再発行。aud(resource)/acr/auth_time を引き継ぐ。
+        // ローテーションした新しい refresh token を再発行。aud(resource)/acr/auth_time と
+        // DPoP 束縛(jkt)を引き継ぐ（鍵束縛は chain 全体で保持される）。
         let refresh_token =
-            maybe_issue_refresh(p, &client.client_id, &rt.account_id, &scope, rt.resource.as_deref(), rt.acr.as_deref(), rt.auth_time).await;
+            maybe_issue_refresh(p, &client.client_id, &rt.account_id, &scope, rt.resource.as_deref(), rt.acr.as_deref(), rt.auth_time, rt.jkt.as_deref()).await;
 
         Ok(TokenResponse {
             access_token,
@@ -421,8 +454,23 @@ mod tests {
             account_id: "user@example.com".into(),
             scope: scope.into(),
             resource: None,
+            jkt: None,
             acr: None,
             auth_time: None,
+        }
+    }
+
+    /// DPoP 鍵に束縛された refresh token（public client の通常経路）。
+    fn rt_bound(token: &str, client_id: &str, scope: &str, jkt: &str) -> RefreshToken {
+        RefreshToken { jkt: Some(jkt.into()), ..rt(token, client_id, scope) }
+    }
+
+    /// client_secret_basic の confidential client（client 認証が防壁。DPoP 束縛は任意）。
+    fn confidential_client(id: &str) -> Client {
+        Client {
+            token_endpoint_auth_method: "client_secret_basic".into(),
+            client_secret: Some("s3cret".into()),
+            ..client(id)
         }
     }
 
@@ -441,6 +489,94 @@ mod tests {
         assert_eq!(r.token_type, "Bearer");
         assert!(r.id_token.is_some());
         assert!(r.refresh_token.is_none()); // offline_access 無し
+    }
+
+    // 回帰: 盗んだ refresh token を攻撃者の DPoP 鍵に付け替える攻撃が拒否される（RFC 9449 §5）。
+    // 元は PoC（攻撃成立）として書いた。jkt 束縛照合の追加により InvalidDpopProof で弾かれる。
+    #[tokio::test]
+    async fn regression_stolen_refresh_token_cannot_rebind_to_attacker_key() {
+        let p = provider();
+        // 本番 mobile-rp / demo-rp と同じ: public(none) かつ dpop_bound=true。
+        let mut c = client("mobile-rp");
+        c.dpop_bound = true;
+
+        // 被害者の RT は発行時に被害者の鍵へ束縛済み（mobile-rp は dpop_bound ゆえ常に束縛）。
+        p.store
+            .save_refresh_token(rt_bound("STOLEN_RT", "mobile-rp", "openid offline_access", "VICTIM-KEY"))
+            .await;
+
+        // 攻撃者は自分の鍵の proof を提示（token endpoint が検証して注入する jkt は攻撃者鍵）。
+        let r = RefreshTokenGrant
+            .handle(&p, &c, &form(&[("refresh_token", "STOLEN_RT")]), Some("ATTACKER-KEY".into()))
+            .await;
+        assert!(
+            matches!(r, Err(OAuthError::InvalidDpopProof(_))),
+            "別鍵への付け替えは拒否されるべき"
+        );
+        // 被害者の RT は消費されていない（DoS 防止）。正規の鍵でなら依然使える。
+        assert!(p.store.get_refresh_token("STOLEN_RT").await.is_some());
+    }
+
+    // 正規経路: 一致する鍵なら成功し、ローテーション後の RT も同じ鍵束縛を引き継ぐ。
+    #[tokio::test]
+    async fn refresh_with_matching_dpop_key_succeeds_and_keeps_binding() {
+        let p = provider();
+        let mut c = client("mobile-rp");
+        c.dpop_bound = true;
+        p.store
+            .save_refresh_token(rt_bound("RT1", "mobile-rp", "openid offline_access", "KEY-A"))
+            .await;
+        let r = RefreshTokenGrant
+            .handle(&p, &c, &form(&[("refresh_token", "RT1")]), Some("KEY-A".into()))
+            .await
+            .unwrap();
+        assert_eq!(r.token_type, "DPoP");
+        // 発行された access token が同じ鍵に cnf.jkt 束縛されている。
+        let at = p.store.get_access_token(&r.access_token).await.unwrap();
+        assert_eq!(at.jkt.as_deref(), Some("KEY-A"));
+        // ローテーションした新 RT も KEY-A 束縛を引き継ぐ。
+        let new_rt = r.refresh_token.unwrap();
+        assert_eq!(p.store.get_refresh_token(&new_rt).await.unwrap().jkt.as_deref(), Some("KEY-A"));
+    }
+
+    // public client の束縛なし RT は拒否（client 認証が無く bearer 長命資格情報になるため）。
+    #[tokio::test]
+    async fn refresh_unbound_for_public_client_rejected() {
+        let p = provider();
+        let c = client("mobile-rp"); // public(none)
+        p.store.save_refresh_token(rt("RT1", "mobile-rp", "openid offline_access")).await;
+        let r = RefreshTokenGrant
+            .handle(&p, &c, &form(&[("refresh_token", "RT1")]), None)
+            .await;
+        assert!(matches!(r, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    // confidential client は束縛なし RT でも client 認証が防壁になるため許可（標準 Bearer）。
+    #[tokio::test]
+    async fn refresh_unbound_for_confidential_client_allowed() {
+        let p = provider();
+        let c = confidential_client("conf-rp");
+        p.store.save_refresh_token(rt("RT1", "conf-rp", "openid offline_access")).await;
+        let r = RefreshTokenGrant
+            .handle(&p, &c, &form(&[("refresh_token", "RT1")]), None)
+            .await
+            .unwrap();
+        assert_eq!(r.token_type, "Bearer");
+    }
+
+    // 対照: authorization_code 経路は元から jkt 照合あり（refresh も同等になったことの確認）。
+    #[tokio::test]
+    async fn contrast_auth_code_rejects_mismatched_dpop_jkt() {
+        let p = provider();
+        let c = client("mobile-rp");
+        let mut code = base_code("C1", "mobile-rp");
+        code.dpop_jkt = Some("VICTIM-KEY-THUMBPRINT".into());
+        p.store.save_code(code).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        let r = AuthorizationCodeGrant
+            .handle(&p, &c, &f, Some("ATTACKER-KEY-THUMBPRINT".into()))
+            .await;
+        assert!(matches!(r, Err(OAuthError::InvalidDpopProof(_))));
     }
 
     #[tokio::test]
@@ -533,13 +669,13 @@ mod tests {
     async fn refresh_rotates_and_reuse_rejected() {
         let p = provider();
         let c = client("rp");
-        p.store.save_refresh_token(rt("RT1", "rp", "openid offline_access")).await;
+        p.store.save_refresh_token(rt_bound("RT1", "rp", "openid offline_access", "KEY-A")).await;
         let f = form(&[("refresh_token", "RT1")]);
-        let r = RefreshTokenGrant.handle(&p, &c, &f, None).await.unwrap();
+        let r = RefreshTokenGrant.handle(&p, &c, &f, Some("KEY-A".into())).await.unwrap();
         assert!(r.refresh_token.is_some());
         assert_ne!(r.refresh_token.as_deref(), Some("RT1")); // ローテーション
         assert!(matches!(
-            RefreshTokenGrant.handle(&p, &c, &f, None).await,
+            RefreshTokenGrant.handle(&p, &c, &f, Some("KEY-A".into())).await,
             Err(OAuthError::InvalidGrant(_))
         )); // 旧 RT 再利用は拒否
     }
@@ -559,15 +695,15 @@ mod tests {
     async fn refresh_scope_widening_rejected_narrowing_ok() {
         let p = provider();
         let c = client("rp");
-        p.store.save_refresh_token(rt("RT1", "rp", "openid profile")).await;
+        p.store.save_refresh_token(rt_bound("RT1", "rp", "openid profile", "KEY-A")).await;
         let widen = form(&[("refresh_token", "RT1"), ("scope", "openid profile email")]);
         assert!(matches!(
-            RefreshTokenGrant.handle(&p, &c, &widen, None).await,
+            RefreshTokenGrant.handle(&p, &c, &widen, Some("KEY-A".into())).await,
             Err(OAuthError::InvalidScope(_))
         ));
-        p.store.save_refresh_token(rt("RT2", "rp", "openid profile")).await;
+        p.store.save_refresh_token(rt_bound("RT2", "rp", "openid profile", "KEY-A")).await;
         let narrow = form(&[("refresh_token", "RT2"), ("scope", "openid")]);
-        let r = RefreshTokenGrant.handle(&p, &c, &narrow, None).await.unwrap();
+        let r = RefreshTokenGrant.handle(&p, &c, &narrow, Some("KEY-A".into())).await.unwrap();
         assert_eq!(r.scope, "openid");
     }
 
