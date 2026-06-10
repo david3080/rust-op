@@ -140,6 +140,9 @@ pub struct RefreshToken {
     pub scope: String,
     /// Resource Indicators (RFC 8707): リフレッシュ後のトークンに引き継ぐ aud。
     pub resource: Option<String>,
+    /// DPoP 束縛 (RFC 9449 §5): 発行時の DPoP proof の jkt。リフレッシュ時に提示 proof の
+    /// jkt と一致必須。盗難 RT を攻撃者の鍵へ付け替える攻撃を防ぐ。ローテーションで引き継ぐ。
+    pub jkt: Option<String>,
     /// 認証コンテキスト。リフレッシュは再認証しないので元の値を引き継ぐ（auth_time は不変）。
     pub acr: Option<String>,
     pub auth_time: Option<u64>,

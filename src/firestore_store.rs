@@ -278,6 +278,9 @@ impl Store for FirestoreStore {
         if let Some(r) = &t.resource {
             f["resource"] = fs_h::s(r);
         }
+        if let Some(jkt) = &t.jkt {
+            f["jkt"] = fs_h::s(jkt);
+        }
         if let Some(acr) = &t.acr {
             f["acr"] = fs_h::s(acr);
         }
@@ -301,6 +304,7 @@ impl Store for FirestoreStore {
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
             resource: fs_h::field_str(&f, "resource").map(str::to_string),
+            jkt: fs_h::field_str(&f, "jkt").map(str::to_string),
             acr: fs_h::field_str(&f, "acr").map(str::to_string),
             auth_time: fs_h::field_u64(&f, "authTime"),
         })
@@ -317,6 +321,7 @@ impl Store for FirestoreStore {
             account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
             scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
             resource: fs_h::field_str(&f, "resource").map(str::to_string),
+            jkt: fs_h::field_str(&f, "jkt").map(str::to_string),
             acr: fs_h::field_str(&f, "acr").map(str::to_string),
             auth_time: fs_h::field_u64(&f, "authTime"),
         })
