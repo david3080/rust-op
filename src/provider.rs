@@ -43,6 +43,8 @@ pub struct Provider {
     pub grants: HashMap<String, Arc<dyn GrantHandler>>,
     pub client_auth: HashMap<String, Arc<dyn ClientAuthMethod>>,
     pub response_modes: HashMap<String, Arc<dyn ResponseMode>>,
+    /// private_key_jwt クライアントの jwks_uri から鍵を取得・キャッシュする（鍵ローテーション）。
+    pub jwks_resolver: crate::jwks_resolver::JwksResolver,
 }
 
 impl Provider {
@@ -88,6 +90,7 @@ impl Provider {
             grants,
             client_auth,
             response_modes,
+            jwks_resolver: crate::jwks_resolver::JwksResolver::new(),
         }
     }
 

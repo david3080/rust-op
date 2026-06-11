@@ -25,8 +25,11 @@ pub struct Client {
     pub post_logout_redirect_uris: Vec<String>,
     /// true なら token endpoint で DPoP proof を要求し access token を jkt に束縛する。
     pub dpop_bound: bool,
-    /// private_key_jwt 用の公開鍵集合。
+    /// private_key_jwt 用の公開鍵集合（インライン）。
     pub jwks: Vec<JwkPub>,
+    /// private_key_jwt の鍵を取得する JWKS エンドポイント（鍵ローテーション対応）。
+    /// inline jwks に kid が無い時にここから取得してキャッシュする（RFC 7591 jwks_uri）。
+    pub jwks_uri: Option<String>,
     /// FAPI: PAR 必須。
     pub require_par: bool,
     /// FAPI: PKCE 必須。

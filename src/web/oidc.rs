@@ -817,6 +817,7 @@ pub(super) async fn register(
         redirect_uris: json_string_array(&v, "redirect_uris"),
         grant_types: json_string_array(&v, "grant_types"),
         jwks: crate::dcr::jwks_from_jwk_set(v.get("jwks")),
+        jwks_uri: v.get("jwks_uri").and_then(|x| x.as_str()).map(String::from),
     };
 
     let client_id = format!("dcr-{}", uuid::Uuid::new_v4().simple());
@@ -875,14 +876,18 @@ fn json_string_array(v: &serde_json::Value, key: &str) -> Vec<String> {
 
 /// RFC 7591 §3.2.1 client information response（登録済みメタデータをエコー）。
 fn register_response(c: &crate::model::Client) -> serde_json::Value {
-    serde_json::json!({
+    let mut resp = serde_json::json!({
         "client_id": c.client_id,
         "client_id_issued_at": now(),
         "token_endpoint_auth_method": c.token_endpoint_auth_method,
         "grant_types": c.grant_types,
         "redirect_uris": c.redirect_uris,
         "require_pushed_authorization_requests": c.require_par,
-    })
+    });
+    if let Some(uri) = &c.jwks_uri {
+        resp["jwks_uri"] = serde_json::json!(uri);
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -929,6 +934,7 @@ mod tests {
             post_logout_redirect_uris: vec![],
             dpop_bound: false,
             jwks: vec![],
+            jwks_uri: None,
             require_par: false,
             require_pkce: false,
             id_token_signed_response_alg: None,

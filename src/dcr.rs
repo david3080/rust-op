@@ -29,6 +29,8 @@ pub struct RegistrationRequest {
     pub redirect_uris: Vec<String>,
     pub grant_types: Vec<String>,
     pub jwks: Vec<JwkPub>,
+    /// inline jwks の代わりに JWKS エンドポイントで鍵を提示する場合（RFC 7591）。
+    pub jwks_uri: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -134,8 +136,9 @@ pub fn validate_registration(
             return Err(DcrError::RedirectHostNotAllowed(host.to_string()));
         }
     }
-    // private_key_jwt 前提: 公開鍵(jwks)必須＝OP は秘密を持たない。
-    if req.jwks.is_empty() {
+    // private_key_jwt 前提: 公開鍵が必須＝OP は秘密を持たない。inline jwks か jwks_uri の
+    // どちらかで公開鍵を提示すること（鍵ローテーション運用なら jwks_uri を使う）。
+    if req.jwks.is_empty() && req.jwks_uri.as_deref().map(str::is_empty).unwrap_or(true) {
         return Err(DcrError::MissingJwks);
     }
     // grant_type: 指定があれば許可集合の部分集合。無指定は authorization_code。
@@ -158,6 +161,7 @@ pub fn validate_registration(
         grant_types,
         dpop_bound: true,
         jwks: req.jwks.clone(),
+        jwks_uri: req.jwks_uri.clone(),
         require_par: true,
         require_pkce: true,
         id_token_signed_response_alg: None,
@@ -207,6 +211,7 @@ mod tests {
             redirect_uris: redirect.iter().map(|s| s.to_string()).collect(),
             grant_types: grants.iter().map(|s| s.to_string()).collect(),
             jwks,
+            jwks_uri: None,
         }
     }
 
@@ -221,6 +226,36 @@ mod tests {
         // FAPI2 既定（PKCE/PAR/DPoP）。
         assert!(c.require_pkce && c.require_par && c.dpop_bound);
         assert_eq!(c.redirect_uris, vec!["https://rp.example.com/cb"]);
+    }
+
+    // B-6: inline jwks の代わりに jwks_uri で登録できる（鍵ローテーション運用）。
+    #[test]
+    fn registration_with_jwks_uri_only_is_accepted() {
+        let r = RegistrationRequest {
+            redirect_uris: vec!["https://rp.example.com/cb".into()],
+            grant_types: vec![],
+            jwks: vec![],
+            jwks_uri: Some("https://rp.example.com/jwks".into()),
+        };
+        let c = validate_registration("cid-2", &r, &constraints()).unwrap();
+        assert_eq!(c.token_endpoint_auth_method, "private_key_jwt");
+        assert_eq!(c.jwks_uri.as_deref(), Some("https://rp.example.com/jwks"));
+        assert!(c.jwks.is_empty());
+    }
+
+    // B-6: jwks も jwks_uri も無いと拒否（OP は秘密を持たないので公開鍵が必須）。
+    #[test]
+    fn registration_without_any_key_source_is_rejected() {
+        let r = RegistrationRequest {
+            redirect_uris: vec!["https://rp.example.com/cb".into()],
+            grant_types: vec![],
+            jwks: vec![],
+            jwks_uri: None,
+        };
+        assert!(matches!(
+            validate_registration("c", &r, &constraints()),
+            Err(DcrError::MissingJwks)
+        ));
     }
 
     #[test]

@@ -142,12 +142,19 @@ impl ClientAuthMethod for PrivateKeyJwt {
             return Err(bad("client is not private_key_jwt"));
         }
 
-        // kid で公開鍵を選び、ES256(raw r||s) で署名検証。
-        let jwk = client
-            .jwks
-            .iter()
-            .find(|k| k.kid == kid)
-            .ok_or_else(|| bad("no matching kid"))?;
+        // kid で公開鍵を選ぶ。inline jwks に無く jwks_uri があれば取得（鍵ローテーション対応）。
+        let jwk = match client.jwks.iter().find(|k| k.kid == kid) {
+            Some(j) => j.clone(),
+            None => match &client.jwks_uri {
+                Some(uri) => p
+                    .jwks_resolver
+                    .resolve(uri, kid)
+                    .await
+                    .ok_or_else(|| bad("no matching kid (jwks_uri)"))?,
+                None => return Err(bad("no matching kid")),
+            },
+        };
+        // ES256(raw r||s) で署名検証。
         let vk = crate::es256::verifying_key_from_xy(&dec(&jwk.x)?, &dec(&jwk.y)?)
             .map_err(|e| bad(&e))?;
         let signing_input = format!("{}.{}", parts[0], parts[1]);
@@ -229,6 +236,7 @@ mod tests {
             post_logout_redirect_uris: vec![],
             dpop_bound: false,
             jwks: vec![],
+            jwks_uri: None,
             require_par: false,
             require_pkce: false,
             id_token_signed_response_alg: None,
@@ -283,6 +291,7 @@ mod tests {
                 x: b64url_encode(pt.x().unwrap()),
                 y: b64url_encode(pt.y().unwrap()),
             }],
+            jwks_uri: None,
             require_par: false,
             require_pkce: false,
             id_token_signed_response_alg: None,

@@ -162,6 +162,7 @@ mod tests {
                 x: b64e(pt.x().unwrap()),
                 y: b64e(pt.y().unwrap()),
             }],
+            jwks_uri: None,
             require_par: true,
             require_pkce: true,
             id_token_signed_response_alg: None,

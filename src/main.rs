@@ -14,6 +14,7 @@ mod firestore;
 mod firestore_store;
 mod grants;
 mod interaction_policy;
+mod jwks_resolver;
 mod jws;
 #[cfg(kani)]
 mod kani_harness;
@@ -83,6 +84,7 @@ async fn main() {
         grant_types: vec!["authorization_code".into(), "refresh_token".into()],
         dpop_bound: true,
         jwks: vec![],
+            jwks_uri: None,
         require_par: false,
         require_pkce: false,
         id_token_signed_response_alg: None,
@@ -98,6 +100,7 @@ async fn main() {
         grant_types: vec!["authorization_code".into(), "refresh_token".into()],
         dpop_bound: true,
         jwks: vec![],
+            jwks_uri: None,
         require_par: false,
         require_pkce: false,
         id_token_signed_response_alg: None,
@@ -113,6 +116,7 @@ async fn main() {
         grant_types: vec!["urn:openid:params:grant-type:ciba".into()],
         dpop_bound: false,
         jwks: vec![],
+            jwks_uri: None,
         require_par: false,
         require_pkce: false,
         id_token_signed_response_alg: None,
