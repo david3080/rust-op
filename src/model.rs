@@ -146,6 +146,14 @@ pub struct RefreshToken {
     /// 認証コンテキスト。リフレッシュは再認証しないので元の値を引き継ぐ（auth_time は不変）。
     pub acr: Option<String>,
     pub auth_time: Option<u64>,
+    /// ローテーション系列の識別子（OAuth Security BCP 再利用検知）。authorize/CIBA 発行で
+    /// 新規採番し、リフレッシュ毎に引き継ぐ。再利用検知時は系列全体を失効する。
+    pub family_id: String,
+    /// 消費済みフラグ。ローテーションで true に CAS。`used=true` の RT が再提示されたら盗難
+    /// （系列が分岐）とみなす。
+    pub used: bool,
+    /// この RT を消費して発行した次の RT。再利用検知時に系列を辿って失効するための連結。
+    pub replaced_by: Option<String>,
 }
 
 /// ユーザーアカウント。claims は OIDC の claim マップ。
