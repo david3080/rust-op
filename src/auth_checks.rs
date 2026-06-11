@@ -128,6 +128,7 @@ mod tests {
             post_logout_redirect_uris: vec![],
             dpop_bound: false,
             jwks: vec![],
+            jwks_uri: None,
             require_par: false,
             require_pkce,
             id_token_signed_response_alg: None,
