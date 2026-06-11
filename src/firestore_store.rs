@@ -25,6 +25,23 @@ fn doc_expired(fields: &Value) -> bool {
     fs_h::field_ts_secs(fields, "expiresAt").unwrap_or(0) < now()
 }
 
+/// refreshTokens の fields から RefreshToken を復元する（take/get 共通）。
+fn rt_from_fields(token: &str, f: &Value) -> RefreshToken {
+    RefreshToken {
+        token: token.to_string(),
+        client_id: fs_h::field_str(f, "clientId").unwrap_or("").to_string(),
+        account_id: fs_h::field_str(f, "accountId").unwrap_or("").to_string(),
+        scope: fs_h::field_str(f, "scope").unwrap_or("").to_string(),
+        resource: fs_h::field_str(f, "resource").map(str::to_string),
+        jkt: fs_h::field_str(f, "jkt").map(str::to_string),
+        acr: fs_h::field_str(f, "acr").map(str::to_string),
+        auth_time: fs_h::field_u64(f, "authTime"),
+        family_id: fs_h::field_str(f, "familyId").unwrap_or("").to_string(),
+        used: fs_h::field_bool(f, "used").unwrap_or(false),
+        replaced_by: fs_h::field_str(f, "replacedBy").map(str::to_string),
+    }
+}
+
 pub struct FirestoreStore {
     fs: Arc<Firestore>,
 }
@@ -287,27 +304,12 @@ impl Store for FirestoreStore {
         if let Some(at) = t.auth_time {
             f["authTime"] = fs_h::int(at);
         }
-        let _ = self.fs.set_doc("refreshTokens", &t.token, f).await;
-    }
-
-    async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken> {
-        // 使用時ローテーション = CAS で単回消費。get_doc + 無条件 delete だと同一 RT の並行
-        // リクエストが両方 Some を得て二重発行する（cas_take が単回性を保証）。
-        // 不変量: 同一 token への take_refresh_token が Some を返すのは高々 1 回。
-        let f = self.cas_take("refreshTokens", token).await?;
-        if doc_expired(&f) {
-            return None;
+        f["familyId"] = fs_h::s(&t.family_id);
+        f["used"] = fs_h::b(t.used);
+        if let Some(rb) = &t.replaced_by {
+            f["replacedBy"] = fs_h::s(rb);
         }
-        Some(RefreshToken {
-            token: token.to_string(),
-            client_id: fs_h::field_str(&f, "clientId").unwrap_or("").to_string(),
-            account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
-            scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
-            resource: fs_h::field_str(&f, "resource").map(str::to_string),
-            jkt: fs_h::field_str(&f, "jkt").map(str::to_string),
-            acr: fs_h::field_str(&f, "acr").map(str::to_string),
-            auth_time: fs_h::field_u64(&f, "authTime"),
-        })
+        let _ = self.fs.set_doc("refreshTokens", &t.token, f).await;
     }
 
     async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken> {
@@ -315,16 +317,47 @@ impl Store for FirestoreStore {
         if doc_expired(&f) {
             return None;
         }
-        Some(RefreshToken {
-            token: token.to_string(),
-            client_id: fs_h::field_str(&f, "clientId").unwrap_or("").to_string(),
-            account_id: fs_h::field_str(&f, "accountId").unwrap_or("").to_string(),
-            scope: fs_h::field_str(&f, "scope").unwrap_or("").to_string(),
-            resource: fs_h::field_str(&f, "resource").map(str::to_string),
-            jkt: fs_h::field_str(&f, "jkt").map(str::to_string),
-            acr: fs_h::field_str(&f, "acr").map(str::to_string),
-            auth_time: fs_h::field_u64(&f, "authTime"),
-        })
+        Some(rt_from_fields(token, &f))
+    }
+
+    async fn mark_refresh_used(&self, token: &str, replaced_by: Option<&str>) -> bool {
+        // 消費前の fields と updateTime を読み、used=false なら used=true + replacedBy を
+        // updateTime 条件付き更新で書く（CAS）。並行ローテーションは高々 1 回成功。
+        let (mut f, ut) = match self.fs.get_doc_with_update_time("refreshTokens", token).await {
+            Ok(Some(x)) => x,
+            _ => return false,
+        };
+        if fs_h::field_bool(&f, "used").unwrap_or(false) {
+            return false; // 既に使用済み（再利用/競合）
+        }
+        f["used"] = fs_h::b(true);
+        if let Some(rb) = replaced_by {
+            f["replacedBy"] = fs_h::s(rb);
+        }
+        self.fs
+            .set_doc_if_unchanged("refreshTokens", token, f, &ut)
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn revoke_refresh_family(&self, start_token: &str) {
+        let mut cur = Some(start_token.to_string());
+        let mut guard = 0;
+        while let Some(t) = cur {
+            guard += 1;
+            if guard > 64 {
+                break; // 系列長の安全上限
+            }
+            let next = self
+                .fs
+                .get_doc("refreshTokens", &t)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|f| fs_h::field_str(&f, "replacedBy").map(str::to_string));
+            let _ = self.fs.delete_doc("refreshTokens", &t).await;
+            cur = next;
+        }
     }
 
     async fn revoke_refresh_token(&self, token: &str) {

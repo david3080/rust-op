@@ -35,12 +35,18 @@ pub trait Store: Send + Sync {
     async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String>;
 
     async fn save_refresh_token(&self, t: RefreshToken);
-    /// リフレッシュトークンは使用時にローテーション（取得と同時に削除）。
-    async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken>;
-    /// 消費せず参照する（失効時の所有者確認用）。
+    /// 消費せず参照する（失効時の所有者確認用・再利用検知の used 判定用）。
     async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken>;
     /// リフレッシュトークンを失効（削除）する（RFC 7009）。未知でも no-op。
     async fn revoke_refresh_token(&self, token: &str);
+    /// ローテーション消費（OAuth Security BCP 再利用検知）: `used=false` の RT を `used=true`
+    /// にし `replaced_by` を記録する CAS。この呼び出しが初めて used 化したら true（=ローテーション
+    /// 成功）、既に used or 競合敗北 or 未存在なら false。delete でなく used マークで残すことで、
+    /// 後の再提示を「再利用」として検知できる。
+    async fn mark_refresh_used(&self, token: &str, replaced_by: Option<&str>) -> bool;
+    /// 再利用検知時に系列を失効する。start から `replaced_by` を辿り各 RT を削除する
+    /// （盗難者・正規ユーザ双方の RT を無効化＝再認証を強制）。
+    async fn revoke_refresh_family(&self, start_token: &str);
 
     /// sub からアカウントを解決。未登録なら自動生成する（PoC 用）。
     async fn find_account(&self, sub: &str) -> Account;
@@ -140,14 +146,34 @@ impl Store for MemoryStore {
     async fn save_refresh_token(&self, t: RefreshToken) {
         self.refresh_tokens.lock().unwrap().insert(t.token.clone(), t);
     }
-    async fn take_refresh_token(&self, token: &str) -> Option<RefreshToken> {
-        self.refresh_tokens.lock().unwrap().remove(token)
-    }
     async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken> {
         self.refresh_tokens.lock().unwrap().get(token).cloned()
     }
     async fn revoke_refresh_token(&self, token: &str) {
         self.refresh_tokens.lock().unwrap().remove(token);
+    }
+    async fn mark_refresh_used(&self, token: &str, replaced_by: Option<&str>) -> bool {
+        let mut map = self.refresh_tokens.lock().unwrap();
+        match map.get_mut(token) {
+            Some(rt) if !rt.used => {
+                rt.used = true;
+                rt.replaced_by = replaced_by.map(str::to_string);
+                true
+            }
+            _ => false,
+        }
+    }
+    async fn revoke_refresh_family(&self, start_token: &str) {
+        let mut map = self.refresh_tokens.lock().unwrap();
+        let mut cur = Some(start_token.to_string());
+        let mut guard = 0;
+        while let Some(t) = cur {
+            guard += 1;
+            if guard > 64 {
+                break; // 系列長の安全上限（壊れた replaced_by ループ対策）
+            }
+            cur = map.remove(&t).and_then(|rt| rt.replaced_by);
+        }
     }
     async fn find_account(&self, sub: &str) -> Account {
         account_for(sub)
@@ -245,7 +271,7 @@ mod tests {
         let s = MemoryStore::default();
         s.save_code(code("C1")).await;
         s.save_access_token(at("AT1")).await;
-        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, jkt: None, acr: None, auth_time: None }).await;
+        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, jkt: None, acr: None, auth_time: None, family_id: "fam1".into(), used: false, replaced_by: None }).await;
         s.link_issued_tokens("C1", "AT1", Some("RT1")).await;
 
         // 初回消費は成功し、発行トークンは生きている。
@@ -255,7 +281,7 @@ mod tests {
         // 再利用は拒否（None）され、発行済みトークンが失効する。
         assert!(s.take_code("C1").await.is_none());
         assert!(s.get_access_token("AT1").await.is_none());
-        assert!(s.take_refresh_token("RT1").await.is_none());
+        assert!(s.get_refresh_token("RT1").await.is_none());
     }
 
     #[tokio::test]
@@ -278,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn get_refresh_token_peeks_without_consuming() {
         let s = MemoryStore::default();
-        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, jkt: None, acr: None, auth_time: None }).await;
+        s.save_refresh_token(RefreshToken { token: "RT1".into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), resource: None, jkt: None, acr: None, auth_time: None, family_id: "fam1".into(), used: false, replaced_by: None }).await;
         // peek は消費しない。
         assert!(s.get_refresh_token("RT1").await.is_some());
         assert!(s.get_refresh_token("RT1").await.is_some());

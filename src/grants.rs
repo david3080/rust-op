@@ -98,7 +98,8 @@ fn at_hash(access_token: &str) -> String {
     b64url(&digest[..16])
 }
 
-/// offline_access scope があればリフレッシュトークンを発行・保存して返す。
+/// offline_access scope があればリフレッシュトークンを発行・保存して返す（新規 family を採番）。
+/// authorize/CIBA からの初回発行に使う（ローテーションは handle 側で直接行う）。
 #[allow(clippy::too_many_arguments)]
 async fn maybe_issue_refresh(
     p: &Provider,
@@ -109,8 +110,15 @@ async fn maybe_issue_refresh(
     acr: Option<&str>,
     auth_time: Option<u64>,
     jkt: Option<&str>,
+    is_public: bool,
 ) -> Option<String> {
     if !has_scope(scope, "offline_access") {
+        return None;
+    }
+    // B-5: public client は DPoP 束縛(jkt)が無い限り refresh を発行しない。発行してしまうと
+    // client 認証も鍵束縛も無い bearer 長命資格情報になり、#41 で refresh 時に拒否する対象を
+    // そもそも作らない（発行時点で塞ぐ）。
+    if jkt.is_none() && is_public {
         return None;
     }
     let token = opaque();
@@ -124,6 +132,9 @@ async fn maybe_issue_refresh(
             jkt: jkt.map(str::to_string),
             acr: acr.map(str::to_string),
             auth_time,
+            family_id: opaque(),
+            used: false,
+            replaced_by: None,
         })
         .await;
     Some(token)
@@ -216,6 +227,7 @@ impl GrantHandler for AuthorizationCodeGrant {
             code.acr.as_deref(),
             Some(code.auth_time),
             dpop_jkt.as_deref(),
+            client.is_public(),
         )
         .await;
         // 再利用時に失効させるため、発行トークンをコードに紐付ける。
@@ -284,35 +296,68 @@ impl GrantHandler for RefreshTokenGrant {
             (None, _) => {}
         }
 
-        // 検証通過。ここで単回消費（ローテーション）。並行リクエストは CAS で高々 1 回成功。
-        let rt = p
-            .store
-            .take_refresh_token(rt_val)
-            .await
-            .ok_or_else(|| OAuthError::InvalidGrant("refresh_token not found or already used".into()))?;
+        // B-4 再利用検知（OAuth Security BCP）: 消費済み(used)の RT が再提示されたら盗難
+        // （系列の分岐）とみなし、系列全体を失効してアラートする。delete でなく used マークで
+        // 残しているからこそ検知できる（盗難者・正規ユーザ双方が再認証を強いられる）。
+        if pre.used {
+            tracing::warn!(
+                event = "refresh_reuse_detected",
+                client_id = %client.client_id,
+                family = %pre.family_id,
+                sub = %crate::web::pseudonymize_sub(&pre.account_id)
+            );
+            p.store.revoke_refresh_family(rt_val).await;
+            return Err(OAuthError::InvalidGrant(
+                "refresh token reuse detected; token family revoked".into(),
+            ));
+        }
 
         // scope の縮小は許可、拡大は拒否（RFC 6749 §6）。指定なしは元の scope を踏襲。
         let scope = match form.get("scope") {
             Some(req) => {
-                let original: Vec<&str> = rt.scope.split_whitespace().collect();
+                let original: Vec<&str> = pre.scope.split_whitespace().collect();
                 if req.split_whitespace().all(|s| original.contains(&s)) {
                     req.clone()
                 } else {
                     return Err(OAuthError::InvalidScope("scope must not exceed original".into()));
                 }
             }
-            None => rt.scope.clone(),
+            None => pre.scope.clone(),
         };
 
+        // ローテーション: 新 RT を先に採番（offline_access がある時）し、old を used=true に
+        // CAS。CAS 敗北（並行/競合）は invalid_grant。delete ではなく used マーク + replaced_by
+        // 連結なので、後で old が再提示されたら再利用検知できる。
+        let new_refresh = has_scope(&scope, "offline_access").then(opaque);
+        if !p.store.mark_refresh_used(rt_val, new_refresh.as_deref()).await {
+            return Err(OAuthError::InvalidGrant("refresh_token not found or already used".into()));
+        }
+
         let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
-        // 認証コンテキスト(acr/auth_time)は再認証しないので元のリフレッシュトークンから引き継ぐ。
+        // 認証コンテキスト(acr/auth_time)は再認証しないので元の RT から引き継ぐ。
         let (access_token, id_token) =
-            issue_access_and_id(p, &client.client_id, &rt.account_id, &scope, None, rt.auth_time, rt.acr.as_deref(), dpop_jkt, client.id_token_signed_response_alg.as_deref(), rt.resource.as_deref(), None)
+            issue_access_and_id(p, &client.client_id, &pre.account_id, &scope, None, pre.auth_time, pre.acr.as_deref(), dpop_jkt, client.id_token_signed_response_alg.as_deref(), pre.resource.as_deref(), None)
                 .await;
-        // ローテーションした新しい refresh token を再発行。aud(resource)/acr/auth_time と
-        // DPoP 束縛(jkt)を引き継ぐ（鍵束縛は chain 全体で保持される）。
-        let refresh_token =
-            maybe_issue_refresh(p, &client.client_id, &rt.account_id, &scope, rt.resource.as_deref(), rt.acr.as_deref(), rt.auth_time, rt.jkt.as_deref()).await;
+        // 新 RT を保存。aud(resource)/acr/auth_time/DPoP 束縛(jkt) と family_id を継承
+        // （系列は chain 全体で 1 つ。再利用検知時にまとめて失効する）。
+        if let Some(new_token) = &new_refresh {
+            p.store
+                .save_refresh_token(RefreshToken {
+                    token: new_token.clone(),
+                    client_id: client.client_id.clone(),
+                    account_id: pre.account_id.clone(),
+                    scope: scope.clone(),
+                    resource: pre.resource.clone(),
+                    jkt: pre.jkt.clone(),
+                    acr: pre.acr.clone(),
+                    auth_time: pre.auth_time,
+                    family_id: pre.family_id.clone(),
+                    used: false,
+                    replaced_by: None,
+                })
+                .await;
+        }
+        let refresh_token = new_refresh;
 
         Ok(TokenResponse {
             access_token,
@@ -457,6 +502,9 @@ mod tests {
             jkt: None,
             acr: None,
             auth_time: None,
+            family_id: "fam-test".into(),
+            used: false,
+            replaced_by: None,
         }
     }
 
@@ -655,14 +703,80 @@ mod tests {
 
     #[tokio::test]
     async fn auth_code_offline_access_issues_refresh() {
+        // DPoP 束縛して発行（public client は B-5 で束縛必須）。
         let p = provider();
         let c = client("rp");
+        let mut code = base_code("C1", "rp");
+        code.scope = "openid offline_access".into();
+        code.dpop_jkt = Some("KEY-A".into());
+        p.store.save_code(code).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        let r = AuthorizationCodeGrant.handle(&p, &c, &f, Some("KEY-A".into())).await.unwrap();
+        assert!(r.refresh_token.is_some());
+    }
+
+    // B-5: public client + offline_access + DPoP 束縛なし → refresh を発行しない（発行時点で塞ぐ）。
+    #[tokio::test]
+    async fn offline_access_public_unbound_issues_no_refresh() {
+        let p = provider();
+        let c = client("rp"); // public(none)
         let mut code = base_code("C1", "rp");
         code.scope = "openid offline_access".into();
         p.store.save_code(code).await;
         let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
         let r = AuthorizationCodeGrant.handle(&p, &c, &f, None).await.unwrap();
+        assert!(r.refresh_token.is_none());
+    }
+
+    // B-5: confidential client は束縛なしでも refresh 発行（client 認証が防壁）。
+    #[tokio::test]
+    async fn offline_access_confidential_unbound_issues_refresh() {
+        let p = provider();
+        let c = confidential_client("conf-rp");
+        let mut code = base_code("C1", "conf-rp");
+        code.scope = "openid offline_access".into();
+        p.store.save_code(code).await;
+        let f = form(&[("code", "C1"), ("redirect_uri", "https://rp/cb")]);
+        let r = AuthorizationCodeGrant.handle(&p, &c, &f, None).await.unwrap();
         assert!(r.refresh_token.is_some());
+    }
+
+    // B-4: 消費済み RT の再提示 → 再利用検知 → invalid_grant、かつ系列全体を失効する。
+    #[tokio::test]
+    async fn refresh_reuse_detected_revokes_family() {
+        let p = provider();
+        let c = client("mobile-rp");
+        p.store
+            .save_refresh_token(rt_bound("RT1", "mobile-rp", "openid offline_access", "KEY-A"))
+            .await;
+        let f = form(&[("refresh_token", "RT1")]);
+        // 正常ローテーション: RT1 -> RT2（RT1 は used、replaced_by=RT2）。
+        let r1 = RefreshTokenGrant.handle(&p, &c, &f, Some("KEY-A".into())).await.unwrap();
+        let rt2 = r1.refresh_token.clone().unwrap();
+        // RT1 を再提示 → 再利用検知 → invalid_grant。
+        let reuse = RefreshTokenGrant.handle(&p, &c, &f, Some("KEY-A".into())).await;
+        assert!(matches!(reuse, Err(OAuthError::InvalidGrant(_))));
+        // 系列失効: 後継 RT2 も無効化されている。
+        let f2 = form(&[("refresh_token", rt2.as_str())]);
+        let after = RefreshTokenGrant.handle(&p, &c, &f2, Some("KEY-A".into())).await;
+        assert!(matches!(after, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    // B-4: ローテーション後の新 RT は同じ family_id を継承する。
+    #[tokio::test]
+    async fn refresh_rotation_inherits_family() {
+        let p = provider();
+        let c = client("mobile-rp");
+        p.store
+            .save_refresh_token(rt_bound("RT1", "mobile-rp", "openid offline_access", "KEY-A"))
+            .await;
+        let fam = p.store.get_refresh_token("RT1").await.unwrap().family_id;
+        let r = RefreshTokenGrant
+            .handle(&p, &c, &form(&[("refresh_token", "RT1")]), Some("KEY-A".into()))
+            .await
+            .unwrap();
+        let rt2 = r.refresh_token.unwrap();
+        assert_eq!(p.store.get_refresh_token(&rt2).await.unwrap().family_id, fam);
     }
 
     #[tokio::test]

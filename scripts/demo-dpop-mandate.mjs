@@ -15,12 +15,13 @@ import {
   randomUUID,
 } from 'node:crypto';
 
-const OP = 'https://oidc.sonrisa.co.jp/oidc';
-const API = 'https://api.sonrisa.co.jp';
-const CLIENT = 'ciba-rp';
-const SECRET = 'ciba-rp-secret';
+const OP = process.env.OP || 'https://oidc.sonrisa.co.jp/oidc';
+const API = process.env.API || 'https://api.sonrisa.co.jp';
+const CLIENT = process.env.CIBA_RP_CLIENT || 'ciba-rp';
+// 本番シークレットはコミットしない（このリポジトリは公開）。env CIBA_RP_SECRET で渡す。
+const SECRET = process.env.CIBA_RP_SECRET || 'ciba-rp-secret';
 const BASIC = 'Basic ' + Buffer.from(`${CLIENT}:${SECRET}`).toString('base64');
-const LOGIN_HINT = 'info@sonrisa.co.jp';
+const LOGIN_HINT = process.env.LOGIN_HINT || 'info@sonrisa.co.jp';
 
 const err = (...a) => console.error(...a);
 const ok = (label, body, code) =>
@@ -176,11 +177,10 @@ async function main() {
   err(`[ciba] authorization_details=${JSON.stringify(tok.authorization_details)}`);
   const accessToken = tok.access_token;
 
-  console.log('\n=== (a) introspection で cnf.jkt を確認 ===');
-  const intro = await postForm(`${OP}/introspect`, { token: accessToken }, {
-    authorization: 'Basic ' + Buffer.from('oidf-basic-1:oidf-basic-secret-1').toString('base64'),
-  });
-  console.log('  ' + JSON.stringify(intro.body));
+  // introspection はリソースサーバ(frog-crud-api)が private_key_jwt で内部実行する。
+  // この E2E では下の /payments 呼び出し((b)〜(e))がその introspection 経路を行使する。
+  // OP を直接叩く確認クライアントはこのデモには持たせない（RS の署名鍵を晒さないため）。
+  console.log('\n=== (a) introspection は RS が server-side で実行（(b) の 201 が成立の証左）===');
 
   // 4) POST /payments を DPoP proof + ath 付きで（一致）
   const payUrl = `${API}/payments`;
