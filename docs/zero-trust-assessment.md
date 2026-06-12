@@ -8,6 +8,16 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 > **これは自己評価であって第三者保証ではない。** 下表の ✓ は「**その層で**検証済み」を意味し、「rust-op のコード全体が正しいと証明された」を意味**しない**。とくに L1（Tamarin）は*モデル*を、L3（Kani）は*ごく少数の純粋述語*を検証するに留まる。広範なコード↔モデルのギャップは**未検証**である（[GAP の節](#gap-検証していないこと)を必ず参照）。
 
+> **更新 (2026-06-12): Phase0 以降の進捗。** 本 Phase0 評価の後、脆弱性修正・本番反映・検知配線を実施した。
+> - **#41 DPoP refresh 束縛**: refresh token を DPoP 鍵に束縛（盗難 RT の別鍵付け替えを阻止、RFC 9449 §5）。本番反映済。
+> - **B-4 再利用検知 + 系列失効**: 消費済み RT の再提示を検知し family 全体を失効（OAuth Security BCP）。`event=refresh_reuse_detected` を**専用アラートに配線済**。
+> - **B-5 offline_access ポリシー**: 束縛なし public client に refresh を発行しない（発行時点で塞ぐ）。
+> - **B-6 jwks_uri**: private_key_jwt の鍵ローテーション対応（`JwksResolver`、SSRF は https-only）。
+> - **デプロイ移行**: 本番 OP は Cloud Run サービス **`rust-op`**（旧 `api` 関数は削除）。リソースサーバ **frog-crud-api**（api.sonrisa.co.jp）が DCR 登録の private_key_jwt クライアントで introspection + mandate 消費。詳細はメモリ project-rust-op-deployment。
+> - **検知の修復**: ログメトリクス/アラート 5 本が移行で `service_name="api"` のまま壊れていたのを `rust-op` に修正し、refresh_reuse アラートを追加。
+> - **最小権限**: frog-crud-api を広域 default SA → 専用 SA（`frog-crud-api-runtime`、datastore.user + 当該 secret のみ）。rust-op は `rust-op-runtime`。RS 秘密鍵は Secret Manager 管理。
+> - **不採用**: mTLS / 証明書束縛トークン (RFC 8705) はインフラ追加コストのため見送り（sender-binding は DPoP で担保）。
+
 ---
 
 ## 0. 検証層の定義と「✓」の読み方
@@ -96,9 +106,12 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 - **広範なコード↔モデルのギャップ**: L3（Kani）は5述語のみ橋を架けた。残る約11k 行は Kani 未検証。L1 が証明するのは*モデル*であって実コードではない。
 - **L2 暗号は仮定**（A4, [`docs/crypto-assumptions.md`](./crypto-assumptions.md) で3分解）。**(a) 設計安全性は文献で確立・引用可**だが、**(b) クレートの実装正しさ**（深掘りは hax/Aeneas）と **(c) 定数時間**（subtle 依拠）は残余。rust-op 内で機械証明はしていない。
-- **検知・対応層**: 領域3 Observability は **Foundation（Request-ID 連鎖）実装済**（Step3）、領域4 Behavioral monitoring も **Foundation（アラート信号＋閾値定義）まで**（`docs/observability-alerts.md`）。**残**: アラートポリシーの実適用（通知先選択ゆえユーザ gate）、不変監査ログ・統計的異常検知・自動応答・agentic SOAR（Enterprise/Advanced・Part V）。
+- **検知・対応層**: 領域3 Observability は **Foundation（Request-ID 連鎖）実装済**。領域4 Behavioral monitoring は **Foundation 達成済へ更新**: ログメトリクス 6 本（token_issued/client_auth_failed/login_failed/kms_sign_failed/dcr_registered/**refresh_reuse**）＋**アラートポリシー実適用済**（5xx・auth failure・signing key・KMS・DCR spike・**refresh token reuse**）。**残**（Enterprise/Advanced・Part V）: 不変監査ログ（append-only + 完全性検証）・統計的異常検知（ベースライン学習）・自動応答/agentic SOAR・automated first-pass triage。
 - **agent 固有領域**（prompt injection・tool access・memory poisoning）= rust-op の管轄外。ただし rust-op の scoped・sender-bound・単回な資格情報は、これらが起きても**blast radius を封じ込める**。
+- **最小権限 / 最小 agency**: rust-op=`rust-op-runtime`、frog-crud-api=`frog-crud-api-runtime`（datastore.user + 当該 secret のみ）に分離済。**残**: frog-crud-api の Firestore アクセス（datastore.user）は E2E 未検証（secret アクセスは確認済）。
+- **config integrity / 署名済みデプロイ**（領域6 Enterprise）未着手: Cloud Run の Binary Authorization（署名イメージのみデプロイ可）は未導入。現状は `gcloud run deploy --source` で署名検証なし。
 - **AI-BOM / attestation / self-healing**（領域6 Advanced）未着手。
+- **新規コードの検証カバレッジ**: #41/B-4/B-5/B-6 はユニットテスト済だが Tamarin/Kani 未カバー。とくに **B-4 の系列失効 chain-walk + mark_refresh_used の CAS 単回性**、**jwks_uri の SSRF guard** は性質検証（Kani/property test）の価値が高い。
 - **rate-limit は friction であって barrier ではない**（枠組み Phase 5 が明言: 「buy time but do not stop a determined agentic attacker」）。DCR の rate-limit は補助であり load-bearing にしない。
 - ~~アクセストークン実 TTL の「分単位」posture が未文書化~~ → **測定・文書化済（§1.1）**: access token・id_token とも 900s=15分で枠組みの「minutes」を満たす。長命は refresh（14日）/session（7日）のみで bearer access ではない。
 - **Foundation の "automated first-pass triage"** は純粋に運用側で未構築。
