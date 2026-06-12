@@ -173,3 +173,35 @@ fn pad32_safe() {
         }
     }
 }
+
+/// B-4 系列失効 `store::Store::revoke_refresh_family` の打ち切り付き連鎖走査の**停止性モデル**。
+/// 実コードは `replaced_by`（HashMap/Firestore）を辿るが、ここでは next を index 配列に抽象化
+/// する（モデル＝L1 寄りであり実コードそのものではない点に注意）。任意の next（自己参照・循環を
+/// 含む）でも、終端 or guard により**有界ステップで必ず停止**する（無限ループ／ハングしない）
+/// ことを全数検証する。実装の guard 定数は 64、本モデルは小定数で同一性質を示す。
+#[kani::proof]
+#[kani::unwind(12)]
+fn refresh_family_walk_terminates() {
+    const N: usize = 4; // 系列の最大ノード数（抽象）
+    const MAX: usize = 8; // guard（実コードは 64）
+
+    let next: [usize; N] = kani::any();
+    let mut i = 0;
+    while i < N {
+        kani::assume(next[i] <= N); // N は終端（replaced_by = None 相当）
+        i += 1;
+    }
+
+    let mut cur: usize = kani::any();
+    kani::assume(cur < N);
+
+    let mut steps: usize = 0;
+    while cur < N {
+        steps += 1;
+        if steps >= MAX {
+            break; // guard: 循環していても必ず打ち切る
+        }
+        cur = next[cur];
+    }
+    assert!(steps <= MAX, "guard により有界ステップで停止する（ハングしない）");
+}

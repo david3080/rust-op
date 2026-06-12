@@ -763,6 +763,36 @@ mod tests {
         assert!(matches!(after, Err(OAuthError::InvalidGrant(_))));
     }
 
+    // B-4(property): N 回ローテーションした系列で最古 RT を再利用 → 系列全体（最新含む）が失効。
+    #[tokio::test]
+    async fn refresh_reuse_revokes_family_any_length() {
+        for n in 1..=6usize {
+            let p = provider();
+            let c = client("mobile-rp");
+            p.store
+                .save_refresh_token(rt_bound("RT0", "mobile-rp", "openid offline_access", "KEY-A"))
+                .await;
+            let mut current = "RT0".to_string();
+            let mut chain = vec!["RT0".to_string()];
+            for _ in 0..n {
+                let r = RefreshTokenGrant
+                    .handle(&p, &c, &form(&[("refresh_token", current.as_str())]), Some("KEY-A".into()))
+                    .await
+                    .unwrap();
+                current = r.refresh_token.unwrap();
+                chain.push(current.clone());
+            }
+            // 最古 RT0（used 済）を再提示 → 再利用検知 → invalid_grant。
+            let reuse = RefreshTokenGrant
+                .handle(&p, &c, &form(&[("refresh_token", "RT0")]), Some("KEY-A".into()))
+                .await;
+            assert!(matches!(reuse, Err(OAuthError::InvalidGrant(_))), "n={n}");
+            for t in &chain {
+                assert!(p.store.get_refresh_token(t).await.is_none(), "n={n} {t} 残存");
+            }
+        }
+    }
+
     // B-4: ローテーション後の新 RT は同じ family_id を継承する。
     #[tokio::test]
     async fn refresh_rotation_inherits_family() {
