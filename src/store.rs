@@ -253,6 +253,57 @@ mod tests {
         AccessToken { token: t.into(), client_id: "cl".into(), account_id: "a".into(), scope: "openid".into(), jkt: None, aud: None, acr: None, auth_time: None, authorization_details: None, mandate_consumed: false }
     }
 
+    fn rtok(token: &str, replaced_by: Option<&str>, used: bool) -> RefreshToken {
+        RefreshToken {
+            token: token.into(), client_id: "cl".into(), account_id: "a".into(),
+            scope: "openid offline_access".into(), resource: None, jkt: None, acr: None,
+            auth_time: None, family_id: "fam".into(), used,
+            replaced_by: replaced_by.map(str::to_string),
+        }
+    }
+
+    // B-4: mark_refresh_used は単回消費（CAS）。最初の 1 回だけ true、replaced_by は初回値が残る。
+    #[tokio::test]
+    async fn mark_refresh_used_is_single_use() {
+        let s = MemoryStore::default();
+        s.save_refresh_token(rtok("RT1", None, false)).await;
+        assert!(s.mark_refresh_used("RT1", Some("RT2")).await); // 初回成功
+        for _ in 0..5 {
+            assert!(!s.mark_refresh_used("RT1", Some("RTx")).await); // 以降は負け
+        }
+        let rt = s.get_refresh_token("RT1").await.unwrap();
+        assert!(rt.used);
+        assert_eq!(rt.replaced_by.as_deref(), Some("RT2")); // 初回の連結が保たれる
+        assert!(!s.mark_refresh_used("UNKNOWN", None).await); // 未存在も false
+    }
+
+    // B-4: revoke_refresh_family は replaced_by 連鎖を辿り family 全体を削除する（任意長）。
+    #[tokio::test]
+    async fn revoke_family_deletes_entire_chain() {
+        for n in 1..=8usize {
+            let s = MemoryStore::default();
+            for i in 1..=n {
+                let rb = if i < n { Some(format!("RT{}", i + 1)) } else { None };
+                s.save_refresh_token(rtok(&format!("RT{i}"), rb.as_deref(), i < n)).await;
+            }
+            s.revoke_refresh_family("RT1").await;
+            for i in 1..=n {
+                assert!(s.get_refresh_token(&format!("RT{i}")).await.is_none(), "n={n} RT{i} 残存");
+            }
+        }
+    }
+
+    // B-4: replaced_by が循環していても停止する（無限ループ・ハングしない）。
+    #[tokio::test]
+    async fn revoke_family_cyclic_chain_terminates() {
+        let s = MemoryStore::default();
+        s.save_refresh_token(rtok("RT1", Some("RT2"), true)).await;
+        s.save_refresh_token(rtok("RT2", Some("RT1"), true)).await; // RT1<->RT2 循環
+        s.revoke_refresh_family("RT1").await; // 停止すること自体が検証点
+        assert!(s.get_refresh_token("RT1").await.is_none());
+        assert!(s.get_refresh_token("RT2").await.is_none());
+    }
+
     #[tokio::test]
     async fn consume_mandate_is_single_use() {
         let s = MemoryStore::default();

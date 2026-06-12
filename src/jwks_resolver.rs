@@ -89,10 +89,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn http_scheme_is_rejected_for_ssrf() {
+    async fn non_https_schemes_are_rejected_for_ssrf() {
         let r = JwksResolver::new();
-        // http(非 https) は取得しない（ネットワークに出ない）。
-        assert!(r.fetch("http://example.com/jwks").await.is_none());
-        assert!(r.fetch("file:///etc/passwd").await.is_none());
+        // https 以外は一切ネットワークに出さない（SSRF 緩和）。大文字 HTTPS も
+        // starts_with は大小区別＝拒否（err on the safe side）。
+        for bad in [
+            "http://example.com/jwks",
+            "file:///etc/passwd",
+            "ftp://host/jwks",
+            "gopher://host/",
+            "javascript:alert(1)",
+            "HTTPS://Example.com/jwks",
+            "https:/missing-slash",
+            "//evil.com/jwks",
+            "",
+            " https://leading-space/jwks",
+        ] {
+            assert!(r.fetch(bad).await.is_none(), "{bad:?} を取得してはならない");
+        }
     }
 }
