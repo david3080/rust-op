@@ -37,7 +37,6 @@ fn has_scope(scope: &str, want: &str) -> bool {
 
 /// access token を保存し、id_token(ES256)を署名して返す。両 grant で共通。
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn issue_access_and_id(
     p: &Provider,
     client_id: &str,

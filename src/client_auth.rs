@@ -89,14 +89,9 @@ impl ClientAuthMethod for ClientSecretBasic {
 }
 
 /// token_endpoint_auth_method = private_key_jwt（RFC 7523, ES256）。
+#[derive(Default)]
 pub struct PrivateKeyJwt {
     jti: crate::nonce::NonceStore,
-}
-
-impl Default for PrivateKeyJwt {
-    fn default() -> Self {
-        Self { jti: crate::nonce::NonceStore::memory() }
-    }
 }
 
 impl PrivateKeyJwt {

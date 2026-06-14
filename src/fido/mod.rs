@@ -123,6 +123,7 @@ fn extract_challenge(client_data_json_b64: &str) -> Option<String> {
 }
 
 /// response オブジェクトから文字列フィールドを取り出す（negative test 耐性）。
+#[allow(clippy::result_large_err)] // conformance ヘルパ。低トラフィックゆえ Response を Err に持つのは許容。
 fn resp_string(m: &serde_json::Map<String, Value>, key: &str) -> Result<String, Response> {
     let resp = m
         .get("response")
@@ -311,6 +312,7 @@ fn ok_with(mut v: Value) -> Response {
 }
 
 /// 生ボディを JSON オブジェクトとしてパース。negative test 耐性のため自前で型チェックする。
+#[allow(clippy::result_large_err)] // conformance ヘルパ。低トラフィックゆえ Response を Err に持つのは許容。
 fn parse_object(body: &str) -> Result<serde_json::Map<String, Value>, Response> {
     let v: Value = serde_json::from_str(body).map_err(|e| failed(format!("invalid JSON: {e}")))?;
     match v {
@@ -326,6 +328,7 @@ fn is_b64url(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+#[allow(clippy::result_large_err)] // conformance ヘルパ。低トラフィックゆえ Response を Err に持つのは許容。
 fn req_string<'a>(m: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str, Response> {
     match m.get(key) {
         Some(Value::String(s)) if !s.is_empty() => Ok(s),

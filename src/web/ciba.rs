@@ -152,7 +152,7 @@ pub(super) async fn backchannel_auth(
                 .into_response();
             }
             for e in arr {
-                if !e.get("type").and_then(|t| t.as_str()).is_some() {
+                if e.get("type").and_then(|t| t.as_str()).is_none() {
                     return OAuthError::InvalidRequest(
                         "authorization_details entry requires 'type'".into(),
                     )
