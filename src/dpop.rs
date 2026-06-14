@@ -47,14 +47,9 @@ pub(crate) fn strip_query_fragment(u: &str) -> &str {
     &u[..end]
 }
 
+#[derive(Default)]
 pub struct Es256Dpop {
     jti: NonceStore,
-}
-
-impl Default for Es256Dpop {
-    fn default() -> Self {
-        Self { jti: NonceStore::memory() }
-    }
 }
 
 impl Es256Dpop {
