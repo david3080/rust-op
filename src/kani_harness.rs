@@ -174,6 +174,69 @@ fn pad32_safe() {
     }
 }
 
+/// 橋（Integrity, 本物の手書きパーサ）: `verify::parse_auth_data` は WebAuthn authenticatorData を
+/// 手動 index でスライスする（`ad[0..32]` / `ad[32]` / `ad[33..37]` / `ad[37..]`、ガードは `len < 37`）。
+/// 攻撃者制御の生バイトを受けるので、(a) **全入力でスライス OOB panic を起こさない**、
+/// (b) 長さガード `37` が後続の全 index に対して**過不足ない**（Err ⇔ len<37）、(c) 各フィールドが
+/// 正しいバイト範囲を指す、を機械検証する。proptest（標本）の no-panic を**全 i 領域**へ格上げする。
+/// pad32 と同型の「手書き算術＋スライス＝本物の panic 面」。SHA256/p256 等のライブラリ委譲は対象外。
+#[kani::proof]
+fn parse_auth_data_safe() {
+    const N: usize = 40; // 37 境界 + rest 数バイト。len は 0..=N を記号的に動かす
+    let buf: [u8; N] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= N);
+    let ad = &buf[..len];
+
+    match crate::fido::verify::parse_auth_data(ad) {
+        // ガードの完全性: 拒否は len<37 のときに限る（37 が下限として過不足ない）。
+        Err(_) => assert!(len < 37, "Err となるのは len<37 のときのみ"),
+        Ok(adata) => {
+            // 健全性: 受理は len>=37 のときに限る。到達＝後続スライスが全て OOB panic 無し。
+            assert!(len >= 37, "Ok は len>=37 のときのみ");
+            assert!(adata.rp_id_hash.len() == 32, "rp_id_hash は ad[0..32]＝32 バイト");
+            assert!(adata.rest.len() == len - 37, "rest は ad[37..]＝残り全部");
+            assert!(adata.flags == buf[32], "flags は ad[32]");
+            // sign_count は ad[33..37] の big-endian（index 33..36 が読まれている証拠）。
+            let sc = ((buf[33] as u32) << 24)
+                | ((buf[34] as u32) << 16)
+                | ((buf[35] as u32) << 8)
+                | (buf[36] as u32);
+            assert!(adata.sign_count == sc, "sign_count は ad[33..37] の big-endian");
+        }
+    }
+}
+
+/// 橋（Integrity, 本物の長さフィールド演算）: `verify::attested_cred_id_end` は authenticatorData の
+/// attestedCredentialData から **2 バイトの credIdLen を読み、`rest[18..end]`/`rest[end..]` を切り出す**
+/// 古典的な「長さフィールド → スライス」面。攻撃者が巨大 credIdLen を送っても、(a) `18 + credIdLen` が
+/// **usize 桁あふれしない**、(b) `Some(end)` を返すなら `end <= rest.len()`＝後続 2 スライスが **OOB panic
+/// しない**、(c) ガード（ヘッダ<18 / credId 超過）が過不足ない、を全入力で機械検証する。
+/// proptest（標本）で no-panic を確認済みの経路を、Kani で**全 credIdLen 値**へ格上げする。
+#[kani::proof]
+fn attested_cred_id_end_safe() {
+    const N: usize = 24; // 18B ヘッダ + 数バイト。credIdLen(buf[16],buf[17]) は 0..=65535 を記号探索
+    let buf: [u8; N] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= N);
+    let rest = &buf[..len];
+
+    match crate::fido::verify::attested_cred_id_end(rest) {
+        None => {
+            // 拒否はヘッダ不足、または credId が rest を超えるときに限る。
+            let n = ((buf[16] as usize) << 8) | (buf[17] as usize);
+            assert!(len < 18 || len < 18 + n, "None はヘッダ<18 か credId 超過のときのみ");
+        }
+        Some(end) => {
+            assert!(len >= 18, "Some はヘッダ>=18 が必要");
+            let n = ((buf[16] as usize) << 8) | (buf[17] as usize);
+            assert!(end == 18 + n, "end = 18 + credIdLen（桁あふれ無し）");
+            // 受理⇒ end<=len。ゆえに rest[18..end] と rest[end..] は構造的に OOB panic しない。
+            assert!(end <= len, "end <= rest.len()（後続スライスは安全）");
+        }
+    }
+}
+
 /// B-4 系列失効 `store::Store::revoke_refresh_family` の打ち切り付き連鎖走査の**停止性モデル**。
 /// 実コードは `replaced_by`（HashMap/Firestore）を辿るが、ここでは next を index 配列に抽象化
 /// する（モデル＝L1 寄りであり実コードそのものではない点に注意）。任意の next（自己参照・循環を

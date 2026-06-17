@@ -31,5 +31,10 @@ ed25519-dalek = "2"
 sha1 = { version = "0.10", features = ["oid"] }
 subtle = "2"
 
+[dev-dependencies]
+proptest = "1"
+# 差分テスト用の独立 COSE 実装（ピュア Rust, openssl/ring 非依存）。
+coset = "0.4"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

@@ -769,37 +769,39 @@ pub(super) async fn register(
     let hash = crate::dcr::hash_token(&raw_iat);
     let tag = &hash[..8]; // 相関用の安全なハンドル（生トークンは出さない）。
 
-    // 素朴な単一 IP からの連発 backstop。Firestore read(peek_iat)を引く Bearer 付き要求だけを
-    // 数える（無 Bearer は I/O 前に 401 になる）。in-memory/インスタンス単位・先頭 X-F-F は
-    // 詐称可能なので増幅防御ではない——IAT 必須が本来の門。
-    let ip = client_ip(&headers);
-    if !p.register_rate.check_and_record("dcr-register", &ip) {
-        return dcr_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too_many_requests",
-            "registration rate limit exceeded; retry later",
-        );
-    }
-
-    let (constraints, expires_at, update_time) = match crate::dcr_store::peek_iat(fs, &hash).await {
+    // IAT を読む（消費はしない）。不明・期限切れは Firestore read 1 回で 401 に落とす。
+    let iat = match crate::dcr_store::peek_iat(fs, &hash).await {
         Ok(Some(x)) => x,
         Ok(None) => {
+            // 不明トークンも IP レート制限に数えて無効 Bearer 連発を bounding する。
+            p.register_rate.check_and_record("dcr-register", &client_ip(&headers));
             return dcr_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_token",
                 "unknown initial access token",
-            )
+            );
         }
         Err(e) => {
             tracing::error!("dcr peek_iat [{tag}]: {e}");
             return dcr_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "registration failed");
         }
     };
-    if now() >= expires_at {
+    if now() >= iat.expires_at {
         return dcr_error(
             StatusCode::UNAUTHORIZED,
             "invalid_token",
             "initial access token expired",
+        );
+    }
+
+    // 素朴な単一 IP からの連発 backstop。本番の単回 IAT のみ throttle する。
+    // reusable(conformance 専用・短 TTL)はスイートがモジュール毎に多数登録するため免除。
+    // in-memory/インスタンス単位・先頭 X-F-F は詐称可能なので増幅防御ではない——IAT 必須が本来の門。
+    if !iat.reusable && !p.register_rate.check_and_record("dcr-register", &client_ip(&headers)) {
+        return dcr_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_requests",
+            "registration rate limit exceeded; retry later",
         );
     }
 
@@ -821,25 +823,28 @@ pub(super) async fn register(
     };
 
     let client_id = format!("dcr-{}", uuid::Uuid::new_v4().simple());
-    let client = match crate::dcr::validate_registration(&client_id, &req, &constraints) {
+    let client = match crate::dcr::validate_registration(&client_id, &req, &iat.constraints) {
         Ok(c) => c,
         // 検証失敗では IAT を消費しない（メタデータ修正後に再試行可能）。
         Err(e) => return dcr_error(StatusCode::BAD_REQUEST, e.code(), &e.description()),
     };
 
     // 単回消費: 検証成功後にだけ CAS 削除する。負け＝並行/再利用なので拒否。
-    match crate::dcr_store::consume_iat(fs, &hash, &update_time).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return dcr_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_token",
-                "initial access token already used",
-            )
-        }
-        Err(e) => {
-            tracing::error!("dcr consume_iat [{tag}]: {e}");
-            return dcr_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "registration failed");
+    // reusable IAT は消費せず残す（期限内は再登録可能。conformance 専用）。
+    if !iat.reusable {
+        match crate::dcr_store::consume_iat(fs, &hash, &iat.update_time).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return dcr_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_token",
+                    "initial access token already used",
+                )
+            }
+            Err(e) => {
+                tracing::error!("dcr consume_iat [{tag}]: {e}");
+                return dcr_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "registration failed");
+            }
         }
     }
 
