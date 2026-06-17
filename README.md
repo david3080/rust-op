@@ -220,3 +220,13 @@ src/
   web/               axum エンドポイント（oidc / ciba / login / register / pages）
   fuzz_tests.rs / diff_tests.rs / kani_harness.rs   品質保証（通常ビルド非対象）
 ```
+
+---
+
+## ライセンス
+
+**MIT License**（[`LICENSE`](./LICENSE)）。
+
+rust-op は独立した Rust 実装で、他プロジェクトのソースコードを複製していません。アーキテクチャの
+着想元・検証オラクル（node-oidc-provider / SimpleWebAuthn / webauthn-rs など）への謝辞は
+[`CREDITS.md`](./CREDITS.md) を参照。

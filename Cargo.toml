@@ -2,6 +2,7 @@
 name = "rust-op"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 # 非公開バイナリ（crates.io へ publish しない）。cargo-deny の private 除外対象になる。
 publish = false
 
