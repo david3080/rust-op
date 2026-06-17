@@ -56,6 +56,29 @@ rust-op は WebAuthn 検証を RustCrypto でピュア Rust 自作する方針�
 
 ---
 
+## 暗号・依存ライブラリ
+
+rust-op は暗号プリミティブを **RustCrypto 系のクレート**に委譲する（OpenSSL/ring 非依存, `openssl = 0`）。
+主要な暗号ライブラリと SPDX ライセンス:
+
+| ライブラリ | 用途 | License |
+|---|---|---|
+| p256 / p384 | ECDSA (ES256/ES384), P-256/P-384 | Apache-2.0 OR MIT |
+| rsa | RSA 検証 (RS256/RS1) | MIT OR Apache-2.0 |
+| ed25519-dalek / curve25519-dalek | EdDSA (Ed25519) | BSD-3-Clause |
+| sha2 / sha1 | SHA-256/384 / SHA-1 | MIT OR Apache-2.0 |
+| ciborium | CBOR (COSE / attestation) | Apache-2.0 |
+| x509-cert / der / spki / const-oid | X.509 証明書チェーン | Apache-2.0 OR MIT |
+| ecdsa / signature / elliptic-curve / digest | 署名・曲線・ハッシュ抽象 | Apache-2.0 OR MIT |
+| subtle | 定数時間比較 | BSD-3-Clause |
+| base64 / zeroize | エンコード / ゼロ化 | MIT OR Apache-2.0 |
+
+いずれもパーミッシブ（コピーレフト無し）で rust-op の MIT と互換。**実行時依存 全 crate** の完全な
+一覧と SPDX ライセンスは [`THIRD-PARTY-LICENSES.md`](./THIRD-PARTY-LICENSES.md) を参照
+（バイナリを第三者配布する場合は `cargo about` 等でライセンス全文・NOTICE まで含めて生成すること）。
+
+---
+
 ## 標準仕様 / 検証ツール
 
 - OpenID Connect Core / Discovery, FAPI 2.0, RFC 6749/7591/7636/8628/9101/9126/9207/9449/9470, WebAuthn (W3C), FIDO2 / MDS3 — 仕様の実装であり、これらは著作権で保護される「表現」ではなく公開仕様です。
