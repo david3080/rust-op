@@ -229,4 +229,5 @@ src/
 
 rust-op は独立した Rust 実装で、他プロジェクトのソースコードを複製していません。アーキテクチャの
 着想元・検証オラクル（node-oidc-provider / SimpleWebAuthn / webauthn-rs など）への謝辞は
-[`CREDITS.md`](./CREDITS.md) を参照。
+[`CREDITS.md`](./CREDITS.md)、実行時依存 crate の SPDX ライセンス一覧は
+[`THIRD-PARTY-LICENSES.md`](./THIRD-PARTY-LICENSES.md) を参照。
