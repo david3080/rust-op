@@ -1,3 +1,8 @@
+// ピュア Rust 方針の明文化: 本番・テストビルドでは unsafe を全面禁止する。
+// 例外は Kani 証明ハーネス（kani_harness.rs）のみ——シンボリック入力のモデル化に
+// from_utf8_unchecked を使うため、cargo kani 時だけ forbid を外す。
+#![cfg_attr(not(kani), forbid(unsafe_code))]
+
 mod auth_checks;
 mod ciba;
 mod claims;
@@ -5,9 +10,13 @@ mod client_auth;
 mod context;
 mod dcr;
 mod dcr_store;
+#[cfg(test)]
+mod diff_tests;
 mod dpop;
 mod error;
 mod es256;
+#[cfg(test)]
+mod fuzz_tests;
 mod fcm;
 mod fido;
 mod firestore;
@@ -129,6 +138,17 @@ async fn main() {
         .with_client(demo_rp)
         .with_client(mobile_rp)
         .with_client(ciba_rp);
+
+    // FAPI2 conformance 用の静的クライアント（fapi-1 = client / fapi-2 = client2）。
+    // FAPI 認定スイートは動的登録 variant を持たず静的クライアント専用なので、認定時のみ
+    // env で公開鍵（FAPI{1,2}_X/Y/KID）を与えて登録する。env 未設定の本番では登録されない
+    // （= パラメータ切替: 鍵 env を入れれば ON、外せば OFF）。private_key_jwt + PAR + PKCE + DPoP。
+    for (id, prefix) in [("fapi-1", "FAPI1"), ("fapi-2", "FAPI2")] {
+        if let Some(client) = fapi_client_from_env(id, prefix) {
+            tracing::info!("registered FAPI conformance client {id} from env");
+            provider = provider.with_client(client);
+        }
+    }
 
     // Cloud Run 上 (K_SERVICE あり) では Firestore + Resend を有効化。
     // ローカルは metadata 不達なので無効（LogMailer のまま）。
@@ -294,6 +314,7 @@ async fn mint_iat(args: &[String]) {
     let mut hosts: Vec<String> = vec![];
     let mut grants: Vec<String> = vec![];
     let mut ttl_hours: u64 = 24;
+    let mut reusable = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -309,6 +330,9 @@ async fn mint_iat(args: &[String]) {
                 Some(n) => ttl_hours = n,
                 None => fail("--ttl-hours needs a positive integer"),
             },
+            // conformance 専用: 期限内は単回消費しない（スイートがモジュール毎に多数登録するため）。
+            // 短い TTL（例 2h）と組み合わせて使うこと。
+            "--reusable" => reusable = true,
             other => fail(&format!("unknown arg {other}")),
         }
     }
@@ -333,7 +357,7 @@ async fn mint_iat(args: &[String]) {
         .unwrap()
         .as_secs();
     let expires_at = now + ttl_hours * 3600;
-    if let Err(e) = dcr_store::put_iat(&fs, &hash, &constraints, expires_at).await {
+    if let Err(e) = dcr_store::put_iat(&fs, &hash, &constraints, expires_at, reusable).await {
         eprintln!("mint: IAT 保存に失敗: {e}");
         std::process::exit(1);
     }
@@ -342,7 +366,33 @@ async fn mint_iat(args: &[String]) {
     println!("allowed_redirect_hosts: {}", hosts.join(", "));
     println!("allowed_grant_types:    {}", grants.join(", "));
     println!("expires_at:             {expires_at} (epoch, +{ttl_hours}h)");
+    println!("reusable:               {reusable}");
     eprintln!("注意: 生トークンの表示は一度だけ。この出力は Cloud Logging に残ります。");
+}
+
+/// FAPI conformance クライアントを env から組む。`{prefix}_X` `{prefix}_Y` `{prefix}_KID`
+/// が全て揃っていれば Some。揃っていなければ None（= 本番で未登録）。
+/// redirect は認定スイートの alias コールバック固定（`CONFORMANCE_FAPI_CALLBACK` で上書き可）。
+fn fapi_client_from_env(client_id: &str, prefix: &str) -> Option<Client> {
+    let x = std::env::var(format!("{prefix}_X")).ok()?;
+    let y = std::env::var(format!("{prefix}_Y")).ok()?;
+    let kid = std::env::var(format!("{prefix}_KID")).ok()?;
+    let callback = std::env::var("CONFORMANCE_FAPI_CALLBACK")
+        .unwrap_or_else(|_| "https://www.certification.openid.net/test/a/rustop-fapi2/callback".into());
+    Some(Client {
+        client_id: client_id.into(),
+        redirect_uris: vec![callback],
+        post_logout_redirect_uris: vec![],
+        token_endpoint_auth_method: "private_key_jwt".into(),
+        client_secret: None,
+        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        dpop_bound: true,
+        jwks: vec![model::JwkPub { kid, x, y }],
+        jwks_uri: None,
+        require_par: true,
+        require_pkce: true,
+        id_token_signed_response_alg: None,
+    })
 }
 
 fn fail(msg: &str) -> ! {

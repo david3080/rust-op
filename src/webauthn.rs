@@ -48,16 +48,12 @@ pub fn verify_registration(
         return Err("AT flag not set (no attested credential data)".into());
     }
     // attestedCredentialData: aaguid(16) | credIdLen(2) | credId | COSE
+    // 長さフィールドの境界計算は純関数に集約し Kani で panic 安全性を固定する（[[kani_harness]]）。
     let rest = ad.rest;
-    if rest.len() < 18 {
-        return Err("attestedCredentialData too short".into());
-    }
-    let cred_id_len = u16::from_be_bytes([rest[16], rest[17]]) as usize;
-    if rest.len() < 18 + cred_id_len {
-        return Err("credId length overflow".into());
-    }
-    let cred_id = &rest[18..18 + cred_id_len];
-    let (key, _consumed) = verify::parse_cose_key(&rest[18 + cred_id_len..])?;
+    let end = verify::attested_cred_id_end(rest)
+        .ok_or("attestedCredentialData too short or credId length overflow")?;
+    let cred_id = &rest[18..end];
+    let (key, _consumed) = verify::parse_cose_key(&rest[end..])?;
     let (x, y) = match key {
         CredKey::Es256 { x, y } => (x, y),
         _ => return Err("OIDC passkey must be ES256".into()),

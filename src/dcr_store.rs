@@ -5,7 +5,7 @@
 //! 書き込みはこのサーバ経由のみ（クライアント直書き不可＝信頼境界が DB 側で閉じている）。
 
 use crate::dcr::IatConstraints;
-use crate::firestore::{self, field_str, field_u64, Firestore};
+use crate::firestore::{self, field_bool, field_str, field_u64, Firestore};
 use crate::model::Client;
 
 const CLIENTS: &str = "clients";
@@ -54,13 +54,25 @@ pub async fn save_client(fs: &Firestore, client: &Client) -> Result<(), String> 
     }
 }
 
+/// IAT 1 件の読み出し結果（制約・期限・updateTime・reusable フラグ）。
+pub struct Iat {
+    pub constraints: IatConstraints,
+    pub expires_at: u64,
+    /// CAS 削除に使う直近の updateTime。
+    pub update_time: String,
+    /// true の場合は単回消費しない（期限内は再利用可）。conformance 専用。
+    pub reusable: bool,
+}
+
 /// Initial Access Token を dcrTokens/{hash} へ保存する（保存は **ハッシュのみ**、生は持たない）。
 /// hash は単回採番なので create_if_absent。
+/// `reusable=true` は consume_iat をスキップさせる conformance 専用フラグ（短 TTL 前提）。
 pub async fn put_iat(
     fs: &Firestore,
     hash: &str,
     constraints: &IatConstraints,
     expires_at: u64,
+    reusable: bool,
 ) -> Result<(), String> {
     let cj = serde_json::to_string(constraints).map_err(|e| format!("serialize constraints: {e}"))?;
     let created = fs
@@ -70,6 +82,7 @@ pub async fn put_iat(
             serde_json::json!({
                 "constraints": firestore::s(&cj),
                 "expires_at": firestore::int(expires_at),
+                "reusable": firestore::b(reusable),
             }),
         )
         .await?;
@@ -80,12 +93,9 @@ pub async fn put_iat(
     }
 }
 
-/// IAT を読むが消費はしない（制約・期限・updateTime を返す）。
-/// 単回消費は検証成功後に consume_iat(CAS 削除) で行う。
-pub async fn peek_iat(
-    fs: &Firestore,
-    hash: &str,
-) -> Result<Option<(IatConstraints, u64, String)>, String> {
+/// IAT を読むが消費はしない（制約・期限・updateTime・reusable を返す）。
+/// 単回消費は検証成功後に consume_iat(CAS 削除) で行う（reusable=true なら呼ばない）。
+pub async fn peek_iat(fs: &Firestore, hash: &str) -> Result<Option<Iat>, String> {
     let (fields, update_time) = match fs.get_doc_with_update_time(DCR_TOKENS, hash).await? {
         Some(x) => x,
         None => return Ok(None),
@@ -94,7 +104,8 @@ pub async fn peek_iat(
     let constraints: IatConstraints =
         serde_json::from_str(cj).map_err(|e| format!("iat constraints: {e}"))?;
     let expires_at = field_u64(&fields, "expires_at").unwrap_or(0);
-    Ok(Some((constraints, expires_at, update_time)))
+    let reusable = field_bool(&fields, "reusable").unwrap_or(false);
+    Ok(Some(Iat { constraints, expires_at, update_time, reusable }))
 }
 
 /// IAT を単回消費する（updateTime CAS 削除）。勝てば Ok(true)、並行消費・既消費は Ok(false)。

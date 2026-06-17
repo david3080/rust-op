@@ -96,6 +96,24 @@ pub fn parse_auth_data(ad: &[u8]) -> Result<AuthData<'_>, String> {
     })
 }
 
+/// attestedCredentialData の credId 終端 index を計算する純粋述語。
+/// 配置: `rest = aaguid(16) | credIdLen(2, BE) | credId(credIdLen) | COSE`。
+/// 返り値 `Some(end)` のとき `rest[18..end]` が credId、`rest[end..]` が COSE 鍵バイト列で、
+/// **どちらのスライスも OOB panic しない**ことが保証される。ヘッダ 18B 未満、または credId 長が
+/// rest を超える場合は `None`。攻撃者制御の長さフィールド + 手動 index ＝ 古典的 panic 面なので、
+/// 切り出して Kani で全入力の安全性（スライス OOB 無し・`18 + len` の桁あふれ無し）を固定する。
+pub fn attested_cred_id_end(rest: &[u8]) -> Option<usize> {
+    if rest.len() < 18 {
+        return None;
+    }
+    let cred_id_len = u16::from_be_bytes([rest[16], rest[17]]) as usize;
+    let end = 18 + cred_id_len;
+    if rest.len() < end {
+        return None;
+    }
+    Some(end)
+}
+
 pub fn check_rp_id_hash(rp_id_hash: &[u8], rp_id: &str) -> Result<(), String> {
     if rp_id_hash != Sha256::digest(rp_id.as_bytes()).as_slice() {
         return Err("rpIdHash mismatch".into());
