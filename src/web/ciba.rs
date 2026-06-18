@@ -11,6 +11,8 @@ pub(super) async fn ciba_pending_list(State(p): State<Arc<Provider>>, headers: H
         Ok(at) => at,
         Err(r) => return r,
     };
+    // 読み取り時スイープ: 期限切れ pending を履歴(expired)へ移して掃除する（掃除漏れ対策）。
+    let _ = p.ciba.sweep_expired(&at.account_id).await;
     let pending = p.ciba.list_pending(&at.account_id).await.unwrap_or_default();
     let items: Vec<serde_json::Value> = pending
         .iter()
@@ -27,6 +29,36 @@ pub(super) async fn ciba_pending_list(State(p): State<Arc<Provider>>, headers: H
                 "scope": r.scope,
                 "binding_message": r.binding_message,
                 "authorization_details": ad,
+            })
+        })
+        .collect();
+    Json(items).into_response()
+}
+
+/// 自分宛の解決済み CIBA 履歴（承認/拒否/期限切れ）。access token 認証。新しい順・最大50件。
+pub(super) async fn ciba_history(State(p): State<Arc<Provider>>, headers: HeaderMap) -> Response {
+    let at = match authenticate_token(&p, &headers, "GET", "/ciba/history", None).await {
+        Ok(at) => at,
+        Err(r) => return r,
+    };
+    // 履歴取得のついでに期限切れ pending を expired として履歴へ確定させる。
+    let _ = p.ciba.sweep_expired(&at.account_id).await;
+    let entries = p.ciba.list_history(&at.account_id, 50).await.unwrap_or_default();
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            let ad: Option<serde_json::Value> = e
+                .authorization_details
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            serde_json::json!({
+                "auth_req_id": e.auth_req_id,
+                "client_id": e.client_id,
+                "scope": e.scope,
+                "binding_message": e.binding_message,
+                "authorization_details": ad,
+                "outcome": e.outcome,
+                "resolved_at": e.resolved_at,
             })
         })
         .collect();
@@ -395,7 +427,11 @@ pub(super) async fn ciba_approve(
     let _ = ciba_req; // 検証済み。承認に進む。
     // 先勝ち: Pending のときだけ Approved へ原子的に遷移。既に承認/拒否済みなら 409。
     match p.ciba.transition_if_pending(&auth_req_id, crate::ciba::CibaStatus::Approved).await {
-        Ok(true) => {}
+        Ok(true) => {
+            // 監査履歴に「承認」を追記（ベストエフォート。失敗しても承認は成立させる）。
+            let entry = crate::ciba::CibaHistoryEntry::from_request(&ciba_req, "approved", now_secs());
+            let _ = p.ciba.record_history(&entry).await;
+        }
         Ok(false) => return (StatusCode::CONFLICT, "already handled").into_response(),
         Err(e) => {
             tracing::error!("transition: {e}");
@@ -411,8 +447,23 @@ pub(super) async fn ciba_reject(
 ) -> Response {
     // 拒否はログイン不要。auth_req_id を知る当事者（ユーザー端末/開始側）の fail-safe 操作。
     // 先勝ち: Pending のときだけ Denied へ。既に処理済みなら何もしない（冪等に 204）。
+    // 履歴記録のため要求を読んでおく（無くても拒否は冪等に成立させる）。
+    let req = p.ciba.get(&auth_req_id).await.ok().flatten();
+    // 期限切れは「拒否」で確定させない（denied と誤記録しない）。スイープが expired として
+    // 履歴に確定する。冪等に 204 を返す。
+    if req.as_ref().map(|r| r.expired()).unwrap_or(false) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
     match p.ciba.transition_if_pending(&auth_req_id, crate::ciba::CibaStatus::Denied).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(transitioned) => {
+            if transitioned {
+                if let Some(r) = &req {
+                    let entry = crate::ciba::CibaHistoryEntry::from_request(r, "denied", now_secs());
+                    let _ = p.ciba.record_history(&entry).await;
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!("transition: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()

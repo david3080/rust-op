@@ -8,6 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TTL_SECS: u64 = 300;
 const COL: &str = "cibaRequests";
+/// 解決済み要求の監査履歴（active な COL とは別。単回消費・dedup を壊さない追記専用ログ）。
+const HIST_COL: &str = "cibaHistory";
+/// 履歴の保持期間。Firestore TTL ポリシー（expireAt）のバックストップと併用する。
+const HISTORY_RETENTION_SECS: u64 = 90 * 86400;
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
@@ -106,6 +110,75 @@ impl BackchannelAuthRequest {
     }
 }
 
+/// 解決済み CIBA 要求の監査記録（承認/拒否/期限切れ）。
+#[derive(Clone)]
+pub struct CibaHistoryEntry {
+    pub auth_req_id: String,
+    pub account: String,
+    pub client_id: String,
+    pub scope: String,
+    pub binding_message: String,
+    pub authorization_details: Option<String>,
+    /// "approved" | "denied" | "expired"
+    pub outcome: String,
+    pub resolved_at: u64,
+}
+
+impl CibaHistoryEntry {
+    pub fn from_request(req: &BackchannelAuthRequest, outcome: &str, resolved_at: u64) -> Self {
+        Self {
+            auth_req_id: req.auth_req_id.0.clone(),
+            account: req.account.clone(),
+            client_id: req.client_id.clone(),
+            scope: req.scope.clone(),
+            binding_message: req.binding_message.clone(),
+            authorization_details: req.authorization_details.clone(),
+            outcome: outcome.to_string(),
+            resolved_at,
+        }
+    }
+    fn fields(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("account".into(), firestore::s(&self.account));
+        obj.insert("clientId".into(), firestore::s(&self.client_id));
+        obj.insert("scope".into(), firestore::s(&self.scope));
+        obj.insert("bindingMessage".into(), firestore::s(&self.binding_message));
+        obj.insert("outcome".into(), firestore::s(&self.outcome));
+        obj.insert("resolvedAt".into(), firestore::ts(&firestore::rfc3339(self.resolved_at)));
+        // Firestore TTL ポリシー対象フィールド（保持期間後に自動削除）。
+        obj.insert(
+            "expireAt".into(),
+            firestore::ts(&firestore::rfc3339(self.resolved_at + HISTORY_RETENTION_SECS)),
+        );
+        if let Some(ad) = &self.authorization_details {
+            obj.insert("authorizationDetails".into(), firestore::s(ad));
+        }
+        serde_json::Value::Object(obj)
+    }
+    fn from_fields(auth_req_id: String, f: &serde_json::Value) -> Self {
+        let g = |k: &str| firestore::field_str(f, k).unwrap_or("").to_string();
+        let resolved_at = f
+            .get("resolvedAt")
+            .and_then(|v| v.get("timestampValue"))
+            .and_then(|v| v.as_str())
+            .map(firestore::parse_rfc3339_secs)
+            .unwrap_or(0);
+        let authorization_details = firestore::field_str(f, "authorizationDetails")
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        Self {
+            auth_req_id,
+            account: g("account"),
+            client_id: g("clientId"),
+            scope: g("scope"),
+            binding_message: g("bindingMessage"),
+            authorization_details,
+            outcome: g("outcome"),
+            resolved_at,
+        }
+    }
+}
+
 /// CIBA バックチャネル要求の永続化。本番は Firestore、テストは In-memory。
 /// transition_if_pending / consume_if_approved は CIBA の「先勝ち」「単回消費」を担う
 /// CAS 操作で、承認/拒否の競合と並行 poll の二重発行を一意に決める。
@@ -142,6 +215,13 @@ pub trait CibaStore: Send + Sync {
             .into_iter()
             .find(|r| r.client_id == client_id))
     }
+    /// 解決済み要求を監査履歴（cibaHistory）に追記する。
+    async fn record_history(&self, entry: &CibaHistoryEntry) -> Result<(), String>;
+    /// アカウントの履歴を新しい順に最大 limit 件返す。
+    async fn list_history(&self, account: &str, limit: usize) -> Result<Vec<CibaHistoryEntry>, String>;
+    /// アカウントの期限切れ Pending を履歴(expired)へ移して削除し、件数を返す（掃除漏れ対策）。
+    /// pending/履歴の取得時に呼ぶ「読み取り時スイープ」。
+    async fn sweep_expired(&self, account: &str) -> Result<u32, String>;
 }
 
 /// (client_id, account) 単位の sliding-window レート制限。
@@ -279,6 +359,37 @@ impl CibaStore for FirestoreCibaStore {
             .filter(|r| r.status == CibaStatus::Pending && !r.expired())
             .collect())
     }
+
+    async fn record_history(&self, entry: &CibaHistoryEntry) -> Result<(), String> {
+        self.fs.set_doc(HIST_COL, &entry.auth_req_id, entry.fields()).await
+    }
+
+    async fn list_history(&self, account: &str, limit: usize) -> Result<Vec<CibaHistoryEntry>, String> {
+        let rows = self.fs.query_eq(HIST_COL, "account", account).await?;
+        let mut v: Vec<CibaHistoryEntry> = rows
+            .into_iter()
+            .map(|(id, f)| CibaHistoryEntry::from_fields(id, &f))
+            .collect();
+        v.sort_by(|a, b| b.resolved_at.cmp(&a.resolved_at));
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn sweep_expired(&self, account: &str) -> Result<u32, String> {
+        let rows = self.fs.query_eq(COL, "account", account).await?;
+        let t = now();
+        let mut n = 0u32;
+        for (id, f) in rows {
+            let req = BackchannelAuthRequest::from_fields(AuthReqId(id.clone()), &f);
+            if req.status == CibaStatus::Pending && req.expired() {
+                let entry = CibaHistoryEntry::from_request(&req, "expired", t);
+                let _ = self.record_history(&entry).await;
+                let _ = self.delete(&id).await;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
 }
 
 /// In-memory 実装（Provider のデフォルト / テスト用）。Mutex 下で状態遷移するので
@@ -287,6 +398,7 @@ impl CibaStore for FirestoreCibaStore {
 #[derive(Default)]
 pub struct MemoryCibaStore {
     map: std::sync::Mutex<std::collections::HashMap<String, BackchannelAuthRequest>>,
+    history: std::sync::Mutex<Vec<CibaHistoryEntry>>,
 }
 
 #[async_trait]
@@ -351,6 +463,45 @@ impl CibaStore for MemoryCibaStore {
             .filter(|r| r.account == account && r.status == CibaStatus::Pending && !r.expired())
             .cloned()
             .collect())
+    }
+
+    async fn record_history(&self, entry: &CibaHistoryEntry) -> Result<(), String> {
+        self.history.lock().unwrap().push(entry.clone());
+        Ok(())
+    }
+
+    async fn list_history(&self, account: &str, limit: usize) -> Result<Vec<CibaHistoryEntry>, String> {
+        let mut v: Vec<CibaHistoryEntry> = self
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.account == account)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.resolved_at.cmp(&a.resolved_at));
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn sweep_expired(&self, account: &str) -> Result<u32, String> {
+        let t = now();
+        // map ロックは clone まで。history ロックと同時保持しない（デッドロック回避）。
+        let expired: Vec<BackchannelAuthRequest> = {
+            let map = self.map.lock().unwrap();
+            map.values()
+                .filter(|r| r.account == account && r.status == CibaStatus::Pending && r.expired())
+                .cloned()
+                .collect()
+        };
+        let mut n = 0u32;
+        for req in expired {
+            let entry = CibaHistoryEntry::from_request(&req, "expired", t);
+            self.history.lock().unwrap().push(entry);
+            self.map.lock().unwrap().remove(req.auth_req_id.as_str());
+            n += 1;
+        }
+        Ok(n)
     }
 }
 
@@ -449,6 +600,29 @@ mod tests {
         assert!(s.consume_if_approved(id.as_str()).await.unwrap().is_some());
         assert!(s.consume_if_approved(id.as_str()).await.unwrap().is_none());
         assert!(s.get(id.as_str()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn history_record_and_list_newest_first() {
+        let s = MemoryCibaStore::default();
+        let mk = |id: &str, ts: u64, outcome: &str| CibaHistoryEntry {
+            auth_req_id: id.into(),
+            account: "u".into(),
+            client_id: "rp".into(),
+            scope: "openid".into(),
+            binding_message: String::new(),
+            authorization_details: None,
+            outcome: outcome.into(),
+            resolved_at: ts,
+        };
+        s.record_history(&mk("a", 100, "approved")).await.unwrap();
+        s.record_history(&mk("b", 200, "denied")).await.unwrap();
+        let h = s.list_history("u", 10).await.unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].auth_req_id, "b", "新しい順");
+        assert_eq!(h[1].auth_req_id, "a");
+        assert!(s.list_history("other", 10).await.unwrap().is_empty(), "別アカウントは混ざらない");
+        assert_eq!(s.sweep_expired("u").await.unwrap(), 0, "期限切れpendingが無ければ0");
     }
 
     #[test]
