@@ -55,6 +55,10 @@ fn custom_endpoints(i: &str) -> serde_json::Value {
         "profile": format!("{i}/me/profile"),
         "fcm_token": format!("{i}/ciba/fcm-tokens"),
         "mandate_consume": format!("{i}/oauth/mandate/consume"),
+        // 承認インボックス（fido2demo）が自分宛の pending CIBA 依頼を取得する（access token 認証）。
+        "ciba_pending": format!("{i}/ciba/pending"),
+        // 承認履歴（承認/拒否/期限切れ）。
+        "ciba_history": format!("{i}/ciba/history"),
     })
 }
 

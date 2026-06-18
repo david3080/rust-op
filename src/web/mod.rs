@@ -75,6 +75,7 @@ pub fn router(provider: Provider) -> Router {
         .route("/backchannel-authentication", post(ciba::backchannel_auth))
         .route("/ciba", get(ciba::ciba_pending))
         .route("/ciba/pending", get(ciba::ciba_pending_list))
+        .route("/ciba/history", get(ciba::ciba_history))
         .route("/ciba/fcm-tokens", post(ciba::fcm_token_register))
         .route("/ciba/{auth_req_id}/passkey-options", post(ciba::ciba_approve_options))
         .route("/ciba/{auth_req_id}/approve", post(ciba::ciba_approve))
