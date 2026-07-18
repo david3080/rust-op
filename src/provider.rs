@@ -38,7 +38,8 @@ pub struct Provider {
     /// JAR (request object) の jti 単回ストア。本番は Firestore（with_firestore で注入）。
     pub jar_jti: crate::nonce::NonceStore,
     pub clients: HashMap<String, Client>,
-    /// 順序が意味を持つので Vec。
+    /// Phase 1（client 解決 + redirect 検証後）のポリシーチェック群。相互に可換なので
+    /// 順序は自由。client 解決と redirect 検証は auth_checks::resolve_addressee に固定。
     pub checks: Vec<Arc<dyn AuthorizationCheck>>,
     pub grants: HashMap<String, Arc<dyn GrantHandler>>,
     pub client_auth: HashMap<String, Arc<dyn ClientAuthMethod>>,
@@ -50,8 +51,6 @@ pub struct Provider {
 impl Provider {
     pub fn new(issuer: impl Into<String>) -> Self {
         let checks: Vec<Arc<dyn AuthorizationCheck>> = vec![
-            Arc::new(CheckClient),
-            Arc::new(CheckRedirectUri),
             Arc::new(CheckResponseType),
             Arc::new(CheckScope),
             Arc::new(CheckPkce),

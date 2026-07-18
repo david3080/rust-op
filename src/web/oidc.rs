@@ -127,24 +127,33 @@ pub(super) async fn authorize(
         Ok(p) => p,
         Err(e) => return plain_error(&format!("invalid query: {e}")),
     };
-    let mut ctx = AuthContext::new(params);
-    ctx.request_uri = par_request_uri.clone();
-
-    if let Err(e) = run_checks(&p, &mut ctx).await {
-        return authorize_error(&p, &ctx, e);
+    // Phase 0→1: client 解決 + redirect_uri 検証。ここで失敗した場合は redirect_uri を
+    // 一切信用できないため plain 表示のみ（authorize_error は型的に呼べない）。
+    let req = match resolve_addressee(
+        &p,
+        RawAuthRequest { params, request_uri: par_request_uri.clone() },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return plain_error(&format!("{}: {}", e.code(), e.description())),
+    };
+    // Phase 1: 可換なポリシーチェック群。以降のエラーは検証済み redirect へ返せる。
+    if let Err(e) = run_checks(&p, &req).await {
+        return authorize_error(&p, &req, e);
     }
     if has_nonpar_request_uri {
         return authorize_error(
             &p,
-            &ctx,
+            &req,
             OAuthError::RequestUriNotSupported("request_uri is not supported".into()),
         );
     }
     // FAPI: PAR 必須クライアントが request_uri 経由でないなら拒否。
-    if ctx.client().require_par && !par_used {
+    if req.client.require_par && !par_used {
         return authorize_error(
             &p,
-            &ctx,
+            &req,
             OAuthError::InvalidRequest("pushed authorization request required".into()),
         );
     }
@@ -154,14 +163,12 @@ pub(super) async fn authorize(
         Some(sid) => p.store.get_session(&sid).await,
         None => None,
     };
-    match crate::interaction_policy::decide(&ctx.params, session.as_ref(), now()) {
+    match crate::interaction_policy::decide(&req.params, session.as_ref(), now()) {
         crate::interaction_policy::AuthDecision::UseSession { account_id, auth_time } => {
-            ctx.account_id = Some(account_id);
-            ctx.auth_time = Some(auth_time);
-            return issue_code(&p, &ctx).await;
+            return issue_code(&p, &req, account_id, Some(auth_time)).await;
         }
         crate::interaction_policy::AuthDecision::Error(e) => {
-            return authorize_error(&p, &ctx, e);
+            return authorize_error(&p, &req, e);
         }
         crate::interaction_policy::AuthDecision::Login => { /* fall through to interaction */ }
     }
@@ -201,19 +208,24 @@ pub(super) async fn authorize_resume(
         Ok(p) => p,
         Err(e) => return plain_error(&format!("invalid stored query: {e}")),
     };
-    let mut ctx = AuthContext::new(params);
-    ctx.request_uri = interaction.request_uri.clone();
-    if let Err(e) = run_checks(&p, &mut ctx).await {
-        return authorize_error(&p, &ctx, e);
+    let req = match resolve_addressee(
+        &p,
+        RawAuthRequest { params, request_uri: interaction.request_uri.clone() },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return plain_error(&format!("{}: {}", e.code(), e.description())),
+    };
+    if let Err(e) = run_checks(&p, &req).await {
+        return authorize_error(&p, &req, e);
     }
-    ctx.account_id = Some(account_id);
-    ctx.auth_time = interaction.auth_time;
     // 完了済み interaction を単回消費してからコード発行。失敗（既に消費＝リプレイ/二重投入）なら
     // 再発行しない（1認証=1コード、PAR request_uri の単回化も保つ）。
     if !p.store.consume_interaction(uid).await {
         return plain_error("interaction already used");
     }
-    issue_code(&p, &ctx).await
+    issue_code(&p, &req, account_id, interaction.auth_time).await
 }
 
 /// ユーザーがログイン画面で「キャンセル」した場合に、登録済み redirect_uri へ
@@ -230,22 +242,30 @@ pub(super) async fn authorize_cancel(
         Ok(p) => p,
         Err(e) => return plain_error(&format!("invalid stored query: {e}")),
     };
-    let mut ctx = AuthContext::new(params);
-    ctx.request_uri = interaction.request_uri.clone();
     // redirect_uri を検証してから error redirect する（未登録 URI には返さない）。
-    if let Err(e) = run_checks(&p, &mut ctx).await {
-        return authorize_error(&p, &ctx, e);
+    // AddressedRequest を得られない限り authorize_error は呼べない = 規律が型で強制される。
+    let req = match resolve_addressee(
+        &p,
+        RawAuthRequest { params, request_uri: interaction.request_uri.clone() },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return plain_error(&format!("{}: {}", e.code(), e.description())),
+    };
+    if let Err(e) = run_checks(&p, &req).await {
+        return authorize_error(&p, &req, e);
     }
     authorize_error(
         &p,
-        &ctx,
+        &req,
         OAuthError::AccessDenied("end-user denied the request".into()),
     )
 }
 
-async fn run_checks(p: &Provider, ctx: &mut AuthContext) -> Result<(), OAuthError> {
+async fn run_checks(p: &Provider, req: &AddressedRequest) -> Result<(), OAuthError> {
     for check in &p.checks {
-        check.check(p, ctx).await?;
+        check.check(p, req).await?;
     }
     Ok(())
 }
@@ -256,14 +276,19 @@ fn valid_resource(r: &str) -> bool {
 }
 
 /// 検証通過後、認可コードを発行して redirect_uri に返す。
-async fn issue_code(p: &Provider, ctx: &AuthContext) -> Response {
-    let redirect_uri = ctx.redirect_uri.clone().expect("redirect validated");
-    let account_id = ctx.account_id.clone().expect("account present");
-    if let Some(r) = &ctx.params.resource {
+/// `&AddressedRequest` を要求するため、redirect 検証前のコード発行は型的に不可能。
+async fn issue_code(
+    p: &Provider,
+    req: &AddressedRequest,
+    account_id: String,
+    auth_time: Option<u64>,
+) -> Response {
+    let redirect_uri = req.redirect_uri.clone();
+    if let Some(r) = &req.params.resource {
         if !valid_resource(r) {
             return authorize_error(
                 p,
-                ctx,
+                req,
                 OAuthError::InvalidTarget("resource must be an absolute URI without fragment".into()),
             );
         }
@@ -272,39 +297,39 @@ async fn issue_code(p: &Provider, ctx: &AuthContext) -> Response {
     p.store
         .save_code(AuthorizationCode {
             code: code.clone(),
-            client_id: ctx.client().client_id.clone(),
+            client_id: req.client.client_id.clone(),
             account_id,
             redirect_uri: redirect_uri.clone(),
-            scope: ctx.params.scope.clone().unwrap_or_default(),
-            nonce: ctx.params.nonce.clone(),
-            code_challenge: ctx.params.code_challenge.clone(),
-            code_challenge_method: ctx.params.code_challenge_method.clone(),
-            auth_time: ctx.auth_time.unwrap_or_else(now),
+            scope: req.params.scope.clone().unwrap_or_default(),
+            nonce: req.params.nonce.clone(),
+            code_challenge: req.params.code_challenge.clone(),
+            code_challenge_method: req.params.code_challenge_method.clone(),
+            auth_time: auth_time.unwrap_or_else(now),
             // 要求された acr_values の先頭を、満たした acr として返す（PoC）。
-            acr: ctx
+            acr: req
                 .params
                 .acr_values
                 .as_deref()
                 .and_then(|s| s.split_whitespace().next())
                 .map(|s| s.to_string()),
-            dpop_jkt: ctx.params.dpop_jkt.clone(),
-            resource: ctx.params.resource.clone(),
+            dpop_jkt: req.params.dpop_jkt.clone(),
+            resource: req.params.resource.clone(),
             expires_at: now() + 60,
         })
         .await;
 
     // 認可完了: PAR の request_uri を削除して以後の再利用を不可にする（RFC 9126）。
-    if let (Some(ru), Some(fs)) = (&ctx.request_uri, &p.firestore) {
+    if let (Some(ru), Some(fs)) = (&req.request_uri, &p.firestore) {
         crate::par::delete(fs, ru).await;
     }
 
     let mut out = vec![("code".to_string(), code)];
-    if let Some(state) = &ctx.params.state {
+    if let Some(state) = &req.params.state {
         out.push(("state".to_string(), state.clone()));
     }
     // RFC 9207: 認可レスポンスに issuer を付与（FAPI 2.0 必須）。
     out.push(("iss".to_string(), p.issuer.clone()));
-    let mode = ctx
+    let mode = req
         .params
         .response_mode
         .as_deref()
@@ -313,23 +338,22 @@ async fn issue_code(p: &Provider, ctx: &AuthContext) -> Response {
     mode.build(&redirect_uri, &out)
 }
 
-/// redirect_uri が確定していれば error を redirect で返す、なければ直接表示。
-fn authorize_error(p: &Provider, ctx: &AuthContext, e: OAuthError) -> Response {
-    if let Some(ru) = &ctx.redirect_uri {
-        let mut out = vec![
-            ("error".to_string(), e.code().to_string()),
-            ("error_description".to_string(), e.description()),
-            ("iss".to_string(), p.issuer.clone()),
-        ];
-        if let Some(state) = &ctx.params.state {
-            out.push(("state".to_string(), state.clone()));
-        }
-        let qs = serde_urlencoded::to_string(&out).unwrap_or_default();
-        let sep = if ru.contains('?') { '&' } else { '?' };
-        Redirect::to(&format!("{ru}{sep}{qs}")).into_response()
-    } else {
-        plain_error(&format!("{}: {}", e.code(), e.description()))
+/// 検証済み redirect_uri へ error を redirect で返す。`&AddressedRequest` を要求するため、
+/// 未検証 redirect への error redirect（open redirector 化）は型的に不可能。
+/// Phase 0（resolve_addressee 前後）のエラーは plain_error を使うこと。
+fn authorize_error(p: &Provider, req: &AddressedRequest, e: OAuthError) -> Response {
+    let ru = &req.redirect_uri;
+    let mut out = vec![
+        ("error".to_string(), e.code().to_string()),
+        ("error_description".to_string(), e.description()),
+        ("iss".to_string(), p.issuer.clone()),
+    ];
+    if let Some(state) = &req.params.state {
+        out.push(("state".to_string(), state.clone()));
     }
+    let qs = serde_urlencoded::to_string(&out).unwrap_or_default();
+    let sep = if ru.contains('?') { '&' } else { '?' };
+    Redirect::to(&format!("{ru}{sep}{qs}")).into_response()
 }
 /* ===== token ===== */
 
