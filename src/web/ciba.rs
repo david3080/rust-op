@@ -447,23 +447,24 @@ pub(super) async fn ciba_reject(
 ) -> Response {
     // 拒否はログイン不要。auth_req_id を知る当事者（ユーザー端末/開始側）の fail-safe 操作。
     // 先勝ち: Pending のときだけ Denied へ。既に処理済みなら何もしない（冪等に 204）。
-    // 履歴記録のため要求を読んでおく（無くても拒否は冪等に成立させる）。
+    // 履歴記録のため要求を読んでおく。
     let req = p.ciba.get(&auth_req_id).await.ok().flatten();
     // 期限切れは「拒否」で確定させない（denied と誤記録しない）。スイープが expired として
-    // 履歴に確定する。冪等に 204 を返す。
+    // 履歴に確定する。クライアントが UI を区別できるよう 409（偽の成功 204 を返さない）。
     if req.as_ref().map(|r| r.expired()).unwrap_or(false) {
-        return StatusCode::NO_CONTENT.into_response();
+        return (StatusCode::CONFLICT, "expired").into_response();
     }
     match p.ciba.transition_if_pending(&auth_req_id, crate::ciba::CibaStatus::Denied).await {
-        Ok(transitioned) => {
-            if transitioned {
-                if let Some(r) = &req {
-                    let entry = crate::ciba::CibaHistoryEntry::from_request(r, "denied", now_secs());
-                    let _ = p.ciba.record_history(&entry).await;
-                }
+        // 拒否成立。
+        Ok(true) => {
+            if let Some(r) = &req {
+                let entry = crate::ciba::CibaHistoryEntry::from_request(r, "denied", now_secs());
+                let _ = p.ciba.record_history(&entry).await;
             }
             StatusCode::NO_CONTENT.into_response()
         }
+        // 既に承認/拒否済み（または存在しない）。偽成功にせず 409 で区別させる。
+        Ok(false) => (StatusCode::CONFLICT, "already handled").into_response(),
         Err(e) => {
             tracing::error!("transition: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()

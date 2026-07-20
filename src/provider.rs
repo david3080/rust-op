@@ -5,6 +5,7 @@ use crate::auth_checks::*;
 use crate::ciba::{CibaRateLimiter, CibaStore, MemoryCibaStore};
 use crate::client_auth::*;
 use crate::dpop::{DpopVerifier, Es256Dpop};
+use crate::error::OAuthError;
 use crate::firestore::Firestore;
 use crate::grants::*;
 use crate::jws::{Es256Signer, JwsSigner};
@@ -38,7 +39,8 @@ pub struct Provider {
     /// JAR (request object) の jti 単回ストア。本番は Firestore（with_firestore で注入）。
     pub jar_jti: crate::nonce::NonceStore,
     pub clients: HashMap<String, Client>,
-    /// 順序が意味を持つので Vec。
+    /// Phase 1（client 解決 + redirect 検証後）のポリシーチェック群。相互に可換なので
+    /// 順序は自由。client 解決と redirect 検証は auth_checks::resolve_addressee に固定。
     pub checks: Vec<Arc<dyn AuthorizationCheck>>,
     pub grants: HashMap<String, Arc<dyn GrantHandler>>,
     pub client_auth: HashMap<String, Arc<dyn ClientAuthMethod>>,
@@ -50,8 +52,6 @@ pub struct Provider {
 impl Provider {
     pub fn new(issuer: impl Into<String>) -> Self {
         let checks: Vec<Arc<dyn AuthorizationCheck>> = vec![
-            Arc::new(CheckClient),
-            Arc::new(CheckRedirectUri),
             Arc::new(CheckResponseType),
             Arc::new(CheckScope),
             Arc::new(CheckPkce),
@@ -147,15 +147,21 @@ impl Provider {
         self
     }
 
-    /// alg に対応する署名鍵を返す。未指定・未対応なら既定（ES256）。
-    pub fn signer_for(&self, alg: Option<&str>) -> &Arc<dyn JwsSigner> {
+    /// alg に対応する署名鍵を返す。None（未指定）は既定（ES256）。
+    /// 未対応の alg は既定へ黙ってフォールバックせずエラーにする。フォールバックは
+    /// switch の default が新種を吸い込むのと同型の暗黙バグで、RP 側の検証失敗として
+    /// 遅れて表面化する。登録値と実際の署名 alg の不一致はここで即座に落とす。
+    pub fn signer_for(&self, alg: Option<&str>) -> Result<&Arc<dyn JwsSigner>, OAuthError> {
         match alg {
-            Some(a) if a != self.signer.alg() => self
+            None => Ok(&self.signer),
+            Some(a) if a == self.signer.alg() => Ok(&self.signer),
+            Some(a) => self
                 .extra_signers
                 .iter()
                 .find(|s| s.alg() == a)
-                .unwrap_or(&self.signer),
-            _ => &self.signer,
+                .ok_or_else(|| {
+                    OAuthError::ServerError(format!("no signer registered for alg {a}"))
+                }),
         }
     }
 
@@ -200,4 +206,22 @@ fn register_grant(m: &mut HashMap<String, Arc<dyn GrantHandler>>, g: Arc<dyn Gra
 }
 fn register_auth(m: &mut HashMap<String, Arc<dyn ClientAuthMethod>>, a: Arc<dyn ClientAuthMethod>) {
     m.insert(a.method().to_string(), a);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signer_for_rejects_unregistered_alg_instead_of_fallback() {
+        let p = Provider::new("https://op");
+        // None / 既定 alg は既定署名鍵。
+        assert!(p.signer_for(None).is_ok());
+        assert!(p.signer_for(Some("ES256")).is_ok());
+        // 未登録 alg は黙って ES256 にフォールバックせずエラー。
+        assert!(matches!(
+            p.signer_for(Some("PS256")),
+            Err(crate::error::OAuthError::ServerError(_))
+        ));
+    }
 }

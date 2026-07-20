@@ -35,7 +35,8 @@ fn has_scope(scope: &str, want: &str) -> bool {
     scope.split_whitespace().any(|s| s == want)
 }
 
-/// access token を保存し、id_token(ES256)を署名して返す。両 grant で共通。
+/// access token を保存し、id_token を署名して返す。両 grant で共通。
+/// 登録 alg に対応する署名鍵が無い場合はエラー（黙って既定にフォールバックしない）。
 #[allow(clippy::too_many_arguments)]
 async fn issue_access_and_id(
     p: &Provider,
@@ -49,7 +50,7 @@ async fn issue_access_and_id(
     id_token_alg: Option<&str>,
     resource: Option<&str>,
     authorization_details: Option<&str>,
-) -> (String, String) {
+) -> Result<(String, String), OAuthError> {
     let access_token = opaque();
     p.store
         .save_access_token(AccessToken {
@@ -87,8 +88,8 @@ async fn issue_access_and_id(
     if let Some(a) = acr {
         claims["acr"] = serde_json::json!(a);
     }
-    let id_token = p.signer_for(id_token_alg).sign(&claims).await;
-    (access_token, id_token)
+    let id_token = p.signer_for(id_token_alg)?.sign(&claims).await;
+    Ok((access_token, id_token))
 }
 
 /// at_hash: access_token の ASCII を SHA-256 し、左半分(128bit=16byte)を base64url。
@@ -215,7 +216,7 @@ impl GrantHandler for AuthorizationCodeGrant {
             code.resource.as_deref(),
             None,
         )
-        .await;
+        .await?;
         // RFC 9449 §5: DPoP proof を伴う発行では refresh token も同じ鍵に束縛する。
         let refresh_token = maybe_issue_refresh(
             p,
@@ -336,7 +337,7 @@ impl GrantHandler for RefreshTokenGrant {
         // 認証コンテキスト(acr/auth_time)は再認証しないので元の RT から引き継ぐ。
         let (access_token, id_token) =
             issue_access_and_id(p, &client.client_id, &pre.account_id, &scope, None, pre.auth_time, pre.acr.as_deref(), dpop_jkt, client.id_token_signed_response_alg.as_deref(), pre.resource.as_deref(), None)
-                .await;
+                .await?;
         // 新 RT を保存。aud(resource)/acr/auth_time/DPoP 束縛(jkt) と family_id を継承
         // （系列は chain 全体で 1 つ。再利用検知時にまとめて失効する）。
         if let Some(new_token) = &new_refresh {
@@ -425,7 +426,7 @@ impl GrantHandler for CibaGrant {
                 let token_type = if dpop_jkt.is_some() { "DPoP" } else { "Bearer" };
                 let (access_token, id_token) =
                     issue_access_and_id(p, &client.client_id, &req.account, &req.scope, None, None, None, dpop_jkt, client.id_token_signed_response_alg.as_deref(), None, req.authorization_details.as_deref())
-                        .await;
+                        .await?;
                 // 承認時の authorization_details を JSON 配列としてレスポンスへ載せる（RFC 9396）。
                 let ad_value = req
                     .authorization_details

@@ -1,7 +1,8 @@
 //! HTTP レイヤ。axum で各エンドポイントを provider のレジストリに配線する。
 
 use crate::client_auth::ClientAuthInput;
-use crate::context::AuthContext;
+use crate::auth_checks::resolve_addressee;
+use crate::context::{AddressedRequest, RawAuthRequest};
 use crate::error::OAuthError;
 use crate::model::{AuthParams, AuthorizationCode, Interaction, Session};
 use crate::provider::Provider;
