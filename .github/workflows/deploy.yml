@@ -13,8 +13,9 @@ env:
   PROJECT_ID: fido2-8b943
   REGION: asia-northeast1
   SERVICE: rust-op
-  WORKLOAD_IDENTITY_PROVIDER: projects/664496193096/locations/global/workloadIdentityPools/github-pool/providers/github-provider
-  DEPLOY_SERVICE_ACCOUNT: rust-op-deployer@fido2-8b943.iam.gserviceaccount.com
+  # 非機密の識別子。リポジトリの Settings > Secrets and variables > Actions > Variables で管理。
+  WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+  DEPLOY_SERVICE_ACCOUNT: ${{ vars.SERVICE_ACCOUNT_EMAIL }}
 
 jobs:
   test:
