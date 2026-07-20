@@ -1,0 +1,122 @@
+name: Deploy
+
+# main への push でのみ起動する。pull_request では絶対に起動しない
+# （公開リポジトリのため、フォークからの PR に WIF 認証情報を渡さないことが重要）。
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_ID: fido2-8b943
+  REGION: asia-northeast1
+  SERVICE: rust-op
+  # 非機密の識別子。リポジトリの Settings > Secrets and variables > Actions > Variables で管理。
+  WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+  DEPLOY_SERVICE_ACCOUNT: ${{ vars.SERVICE_ACCOUNT_EMAIL }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Test
+        run: cargo test --locked
+
+  # ビルド + no-traffic デプロイ + タグ付き URL へのスモークテストのみ。
+  # 本番トラフィックには一切影響しない。
+  deploy-candidate:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      candidate_url: ${{ steps.deploy.outputs.candidate_url }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - id: vars
+        run: echo "tag=rev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - id: deploy
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$SERVICE" \
+            --source . \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --no-traffic \
+            --tag "${{ steps.vars.outputs.tag }}" \
+            --quiet
+          base_url=$(gcloud run services describe "$SERVICE" \
+            --region "$REGION" --project "$PROJECT_ID" \
+            --format="value(status.address.url)")
+          host="${base_url#https://}"
+          echo "candidate_url=https://${{ steps.vars.outputs.tag }}---${host}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test candidate revision (traffic 0%)
+        run: |
+          set -euo pipefail
+          url="${{ steps.deploy.outputs.candidate_url }}"
+          for path in "/oidc/.well-known/openid-configuration" "/oidc/jwks"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${url}${path}")
+            if [[ "$code" != "200" ]]; then
+              echo "smoke test failed: ${path} -> ${code}"
+              exit 1
+            fi
+            echo "ok: ${path} -> ${code}"
+          done
+
+  # 本番昇格。production Environment の Required reviewers による手動承認を
+  # 通過するまで実行されない（passkey ログインの実機確認はここで人手が行う）。
+  promote:
+    needs: deploy-candidate
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Promote traffic to candidate revision
+        run: |
+          gcloud run services update-traffic "$SERVICE" \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --to-tags "${{ needs.deploy-candidate.outputs.tag }}=100"
+
+      - name: Cleanup old images and revisions
+        env:
+          PROJECT: fido2-8b943
+          REGION: asia-northeast1
+          SERVICE: rust-op
+          IMAGE: asia-northeast1-docker.pkg.dev/fido2-8b943/cloud-run-source-deploy/rust-op
+        run: bash scripts/cleanup_cloud_run.sh --apply
