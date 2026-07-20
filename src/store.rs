@@ -12,12 +12,17 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-/// MemoryStore が各レコードに付す絶対失効時刻(UNIX 秒)。
-/// この時刻を過ぎたエントリは取得時に None 化し(lazy)、
-/// 定期一掃(sweep_expired)で物理削除する(active)。
-/// トークン本体の寿命(署名 JWT の exp)とは独立に、ストアの容量を守るための番人。
-const DEFAULT_TTL_SECS: u64 = 900; // access token / session 既定。code/interaction は各自の expires_at を使う。
-const REFRESH_TTL_SECS: u64 = 60 * 60 * 24 * 30; // refresh は長寿命だが上限を設ける(30日)。
+/// レコード種別ごとの保持上限(UNIX 秒)。**全ストア実装が参照する唯一の定義**で、
+/// FirestoreStore の expiresAt もここを使う。バックエンドごとに数値を書くと
+/// 「片方だけ直して忘れる」ドリフトが起きるため、判断を 1 箇所に集約する。
+///
+/// これはストアの保持期間であって、トークン自体の有効期限(署名 JWT の exp や
+/// AuthorizationCode::expires_at)とは別概念。前者は容量を守る番人、後者は
+/// プロトコル上の失効。code は自身の expires_at を持つのでここには置かない。
+pub const INTERACTION_TTL_SECS: u64 = 3600; // ログイン完了までの猶予(1時間)
+pub const SESSION_TTL_SECS: u64 = 7 * 24 * 3600; // ブラウザセッション(7日)
+pub const ACCESS_TTL_SECS: u64 = 900; // access token(15分、grants の expires_in と一致)
+pub const REFRESH_TTL_SECS: u64 = 14 * 24 * 3600; // refresh token(14日)
 
 /// 値に絶対失効時刻を添えるラッパー。expires_at(UNIX 秒)を過ぎたら失効とみなす。
 struct Expiring<T> {
@@ -112,7 +117,7 @@ pub struct MemoryStore {
 #[async_trait]
 impl Store for MemoryStore {
     async fn save_interaction(&self, i: Interaction) {
-        let exp = now_secs() + DEFAULT_TTL_SECS;
+        let exp = now_secs() + INTERACTION_TTL_SECS;
         self.interactions.lock().unwrap().insert(i.uid.clone(), Expiring::new(i, exp));
     }
     async fn get_interaction(&self, uid: &str) -> Option<Interaction> {
@@ -134,7 +139,7 @@ impl Store for MemoryStore {
         }
     }
     async fn save_session(&self, s: Session) {
-        let exp = now_secs() + DEFAULT_TTL_SECS;
+        let exp = now_secs() + SESSION_TTL_SECS;
         self.sessions.lock().unwrap().insert(s.sid.clone(), Expiring::new(s, exp));
     }
     async fn get_session(&self, sid: &str) -> Option<Session> {
@@ -200,7 +205,7 @@ impl Store for MemoryStore {
         }
     }
     async fn save_access_token(&self, t: AccessToken) {
-        let exp = now_secs() + DEFAULT_TTL_SECS;
+        let exp = now_secs() + ACCESS_TTL_SECS;
         self.access_tokens.lock().unwrap().insert(t.token.clone(), Expiring::new(t, exp));
     }
     async fn get_access_token(&self, token: &str) -> Option<AccessToken> {
@@ -465,6 +470,49 @@ mod tests {
         // revoke で消える。
         s.revoke_refresh_token("RT1").await;
         assert!(s.get_refresh_token("RT1").await.is_none());
+    }
+
+    // 保持期間はレコード種別ごとに異なる。DEFAULT 一律にすると session が 15 分で
+    // 切れる/refresh が仕様より長生きする、といった不一致が起きるので固定する。
+    // FirestoreStore も同じ定数を参照しており、この表がバックエンド間の唯一の合意点。
+    #[tokio::test]
+    async fn store_ttl_is_per_record_type() {
+        let s = MemoryStore::default();
+        let base = now_secs();
+
+        s.save_session(Session { sid: "S1".into(), account_id: "a".into(), auth_time: 0 }).await;
+        let session_exp = s.sessions.lock().unwrap().get("S1").unwrap().expires_at;
+        assert!(session_exp >= base + SESSION_TTL_SECS, "session は 7 日保持(15 分ではない)");
+
+        s.save_interaction(Interaction {
+            uid: "U1".into(),
+            raw_query: String::new(),
+            account_id: None,
+            auth_time: None,
+            request_uri: None,
+        })
+        .await;
+        let inter_exp = s.interactions.lock().unwrap().get("U1").unwrap().expires_at;
+        assert!(inter_exp >= base + INTERACTION_TTL_SECS, "interaction は 1 時間保持");
+
+        s.save_access_token(at("AT1")).await;
+        let at_exp = s.access_tokens.lock().unwrap().get("AT1").unwrap().expires_at;
+        assert!(at_exp >= base + ACCESS_TTL_SECS && at_exp < base + SESSION_TTL_SECS);
+
+        s.save_refresh_token(rtok("RT1", None, false)).await;
+        let rt_exp = s.refresh_tokens.lock().unwrap().get("RT1").unwrap().expires_at;
+        assert!(rt_exp >= base + REFRESH_TTL_SECS, "refresh は 14 日保持");
+    }
+
+    // code は自身の expires_at を保持期間に流用する(二重管理しない)。
+    // interaction/session/token は構造体に期限を持たないので上の定数表を使う、という非対称の確認。
+    #[tokio::test]
+    async fn code_uses_its_own_expires_at_as_retention() {
+        let s = MemoryStore::default();
+        let mut c = code("C1");
+        c.expires_at = now_secs() + 42;
+        s.save_code(c).await;
+        assert_eq!(s.codes.lock().unwrap().get("C1").unwrap().expires_at, now_secs() + 42);
     }
 
     // 期限切れ access token は取得時に None(lazy 失効)。introspection が active 扱いしない根拠。

@@ -12,10 +12,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const INTERACTION_TTL: u64 = 3600;
-const SESSION_TTL: u64 = 7 * 24 * 3600;
-const ACCESS_TTL: u64 = 900;
-const REFRESH_TTL: u64 = 14 * 24 * 3600;
+// 保持期間は store.rs の共有定数を参照する（バックエンド間でドリフトさせない）。
+use crate::store::{
+    ACCESS_TTL_SECS as ACCESS_TTL, INTERACTION_TTL_SECS as INTERACTION_TTL,
+    REFRESH_TTL_SECS as REFRESH_TTL, SESSION_TTL_SECS as SESSION_TTL,
+};
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()

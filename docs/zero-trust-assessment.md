@@ -79,9 +79,17 @@ In-memory の `MemoryStore` は当初これらを保持せず、期限切れエ�
   `Provider::spawn_store_sweeper` が 60 秒周期で呼び、参照されないまま滞留するエントリも
   物理削除する。Firestore は TTL ポリシーで自己失効するため no-op。
 
-TTL 既定は access/session=900s、refresh=30日（回転で通常は早期失効、上限としての 30日）、
-code/interaction は各レコードの `expires_at` を流用。なお L7 の帯域・接続レートによる DoS は
-アプリ層の範囲外で、リバースプロキシ / Cloud Armor 等の責務（→ 責任分界）。
+保持期間は `store.rs` の **共有定数**（`INTERACTION_TTL_SECS`=1時間 / `SESSION_TTL_SECS`=7日 /
+`ACCESS_TTL_SECS`=900s / `REFRESH_TTL_SECS`=14日）に一本化し、FirestoreStore の `expiresAt` も
+同じ定数を参照する。バックエンドごとに数値を書くと片方だけ直して忘れるドリフトが起きるため、
+上表の TTL ポリシーの実体はこの 1 箇所だけに置く。`code` のみ自身の `expires_at` を保持期間に
+流用する（プロトコル上の失効と保持期間が一致するため二重管理しない）。
+
+なお「保持期間」はストアの容量を守る番人であって、トークン自体の有効期限（署名 JWT の `exp`）
+とは別概念。前者が長くても後者が短ければ bearer としては失効している。
+
+L7 の帯域・接続レートによる DoS はアプリ層の範囲外で、リバースプロキシ / Cloud Armor 等の
+責務（→ 責任分界）。
 
 > **2026-06-10 発見・修正（DPoP sender-binding の refresh への適用漏れ）**: refresh token が DPoP 鍵に束縛されていなかった（`RefreshToken` に jkt 無し）。public client（`token_endpoint_auth_method: none`）の refresh を窃取すると、攻撃者が自鍵の proof を作るだけで被害者アカウントの sender-bound access token を取得でき、DPoP（RFC 9449）が refresh 経路で完全バイパスされていた。`mobile-rp`/`demo-rp`（ともに public + `dpop_bound`）が該当。**修正**: `RefreshToken.jkt` を追加し発行時に束縛、`RefreshTokenGrant` で消費前に提示 proof の jkt と照合（不一致は `invalid_dpop_proof`、被害者 RT は消費しない＝DoS も防止）、ローテーションで束縛を継承、束縛なし RT は public client で拒否。回帰テスト: `grants::tests::regression_stolen_refresh_token_cannot_rebind_to_attacker_key` ほか。これは authorization_code 経路（`grants.rs:180-189` で既に jkt 照合）との非対称を解消したもの。
 
