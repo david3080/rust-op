@@ -66,6 +66,23 @@ rust-op を Anthropic「[Zero Trust for AI Agents](https://claude.com/blog/zero-
 
 → **bearer/proof 系はすべて分単位**で枠組みの bar を満たす。長命なのは refresh（14日）と session（7日）のみで、いずれも bearer access ではない。refresh は短命 access を更新する設計上の長命であり、その安全性は A1（単回消費の CAS 原子性）に依存する。
 
+#### MemoryStore の容量衛生（資源枯渇 / DoS 対策）
+
+上表の TTL は Firestore バックエンドでは `doc_expired()` により取得時に強制されるが、
+In-memory の `MemoryStore` は当初これらを保持せず、期限切れエントリが無制限に蓄積しえた
+（攻撃者が大量の /authorize・/par・/token を送るとメモリ枯渇＝DoS）。現在は二段で対処する:
+
+- **lazy 失効**: 各レコードに絶対失効時刻を付す `Expiring<T>` でラップし、取得時に期限切れなら
+  `None` を返して即座に除去する（`store.rs`）。introspection が期限切れ AT を active 扱いしない
+  根拠にもなる。
+- **active sweep**: `Store::sweep_expired`（既定 no-op、In-memory のみ実装）を
+  `Provider::spawn_store_sweeper` が 60 秒周期で呼び、参照されないまま滞留するエントリも
+  物理削除する。Firestore は TTL ポリシーで自己失効するため no-op。
+
+TTL 既定は access/session=900s、refresh=30日（回転で通常は早期失効、上限としての 30日）、
+code/interaction は各レコードの `expires_at` を流用。なお L7 の帯域・接続レートによる DoS は
+アプリ層の範囲外で、リバースプロキシ / Cloud Armor 等の責務（→ 責任分界）。
+
 > **2026-06-10 発見・修正（DPoP sender-binding の refresh への適用漏れ）**: refresh token が DPoP 鍵に束縛されていなかった（`RefreshToken` に jkt 無し）。public client（`token_endpoint_auth_method: none`）の refresh を窃取すると、攻撃者が自鍵の proof を作るだけで被害者アカウントの sender-bound access token を取得でき、DPoP（RFC 9449）が refresh 経路で完全バイパスされていた。`mobile-rp`/`demo-rp`（ともに public + `dpop_bound`）が該当。**修正**: `RefreshToken.jkt` を追加し発行時に束縛、`RefreshTokenGrant` で消費前に提示 proof の jkt と照合（不一致は `invalid_dpop_proof`、被害者 RT は消費しない＝DoS も防止）、ローテーションで束縛を継承、束縛なし RT は public client で拒否。回帰テスト: `grants::tests::regression_stolen_refresh_token_cannot_rebind_to_attacker_key` ほか。これは authorization_code 経路（`grants.rs:180-189` で既に jkt 照合）との非対称を解消したもの。
 
 ---
