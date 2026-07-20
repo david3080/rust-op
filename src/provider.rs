@@ -99,6 +99,23 @@ impl Provider {
         self
     }
 
+    /// 期限切れストアエントリの定期一掃タスクを起動する(active sweep)。
+    /// In-memory ストアが無制限に成長する DoS/資源枯渇を防ぐ。取得時の lazy 失効と
+    /// 二段構えで、参照されないまま溜まるエントリもこのタスクが物理削除する。
+    /// Firestore など TTL 自己管理のストアでは sweep_expired が no-op なので無害。
+    /// 返した JoinHandle は破棄してよい(プロセス終了まで走り続ける)。
+    pub fn spawn_store_sweeper(self: &Arc<Self>, period: std::time::Duration) -> tokio::task::JoinHandle<()> {
+        let p = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.tick().await; // 初回即時 tick を消費(起動直後の無駄掃除を避ける)
+            loop {
+                tick.tick().await;
+                p.store.sweep_expired().await;
+            }
+        })
+    }
+
     /// client_id を解決する。静的登録(HashMap)を先に見て、無ければ Firestore の
     /// DCR 登録クライアントへフォールバックする。未知なら None。
     ///

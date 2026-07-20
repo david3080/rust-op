@@ -54,6 +54,11 @@ pub fn router(provider: Provider) -> Router {
         Router::new()
     };
     let shared = Arc::new(provider);
+    // 期限切れストアの定期一掃を起動(60 秒周期)。In-memory の無制限成長=資源枯渇/DoS を防ぐ。
+    // ランタイム上でのみ起動(runtime 外から router を組む単体テストでは spawn しない)。
+    if tokio::runtime::Handle::try_current().is_ok() {
+        shared.spawn_store_sweeper(std::time::Duration::from_secs(60));
+    }
     let inner = Router::new()
         .route("/.well-known/openid-configuration", get(oidc::discovery))
         .route("/jwks", get(oidc::jwks))

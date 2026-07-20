@@ -5,6 +5,39 @@ use crate::model::*;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// UNIX 秒。MemoryStore の期限判定に使う(grants 側の now() と同一基準)。
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// MemoryStore が各レコードに付す絶対失効時刻(UNIX 秒)。
+/// この時刻を過ぎたエントリは取得時に None 化し(lazy)、
+/// 定期一掃(sweep_expired)で物理削除する(active)。
+/// トークン本体の寿命(署名 JWT の exp)とは独立に、ストアの容量を守るための番人。
+const DEFAULT_TTL_SECS: u64 = 900; // access token / session 既定。code/interaction は各自の expires_at を使う。
+const REFRESH_TTL_SECS: u64 = 60 * 60 * 24 * 30; // refresh は長寿命だが上限を設ける(30日)。
+
+/// 値に絶対失効時刻を添えるラッパー。expires_at(UNIX 秒)を過ぎたら失効とみなす。
+struct Expiring<T> {
+    value: T,
+    expires_at: u64,
+}
+impl<T> Expiring<T> {
+    fn new(value: T, expires_at: u64) -> Self {
+        Expiring { value, expires_at }
+    }
+    fn alive(&self) -> bool {
+        self.expires_at > now_secs()
+    }
+}
+
+/// HashMap から期限切れエントリを物理削除する(active sweep の実体)。
+fn retain_alive<K, V>(map: &mut HashMap<K, Expiring<V>>) {
+    let cutoff = now_secs();
+    map.retain(|_, e| e.expires_at > cutoff);
+}
 
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -50,6 +83,11 @@ pub trait Store: Send + Sync {
 
     /// sub からアカウントを解決。未登録なら自動生成する（PoC 用）。
     async fn find_account(&self, sub: &str) -> Account;
+
+    /// 期限切れエントリを物理削除する(active sweep)。既定は no-op。
+    /// In-memory 実装のみ意味を持つ(Firestore 等は TTL ポリシーで自己失効するため)。
+    /// Provider の定期タスクが呼ぶ。
+    async fn sweep_expired(&self) {}
 }
 
 /// MemoryStore 内部のコード記録。使用済みフラグと発行トークンを保持し、再利用失効に使う。
@@ -62,44 +100,81 @@ struct CodeRecord {
 
 #[derive(Default)]
 pub struct MemoryStore {
-    interactions: Mutex<HashMap<String, Interaction>>,
-    sessions: Mutex<HashMap<String, Session>>,
-    codes: Mutex<HashMap<String, CodeRecord>>,
-    access_tokens: Mutex<HashMap<String, AccessToken>>,
-    refresh_tokens: Mutex<HashMap<String, RefreshToken>>,
+    interactions: Mutex<HashMap<String, Expiring<Interaction>>>,
+    sessions: Mutex<HashMap<String, Expiring<Session>>>,
+    codes: Mutex<HashMap<String, Expiring<CodeRecord>>>,
+    access_tokens: Mutex<HashMap<String, Expiring<AccessToken>>>,
+    refresh_tokens: Mutex<HashMap<String, Expiring<RefreshToken>>>,
 }
+
+
 
 #[async_trait]
 impl Store for MemoryStore {
     async fn save_interaction(&self, i: Interaction) {
-        self.interactions.lock().unwrap().insert(i.uid.clone(), i);
+        let exp = now_secs() + DEFAULT_TTL_SECS;
+        self.interactions.lock().unwrap().insert(i.uid.clone(), Expiring::new(i, exp));
     }
     async fn get_interaction(&self, uid: &str) -> Option<Interaction> {
-        self.interactions.lock().unwrap().get(uid).cloned()
+        let mut map = self.interactions.lock().unwrap();
+        match map.get(uid) {
+            Some(e) if e.alive() => Some(e.value.clone()),
+            Some(_) => {
+                map.remove(uid); // lazy: 期限切れは取得時に除去
+                None
+            }
+            None => None,
+        }
     }
     async fn consume_interaction(&self, uid: &str) -> bool {
-        self.interactions.lock().unwrap().remove(uid).is_some()
+        // 期限切れの消費は「既に無い」と同義(false)。単回消費の意味論を保つ。
+        match self.interactions.lock().unwrap().remove(uid) {
+            Some(e) => e.alive(),
+            None => false,
+        }
     }
     async fn save_session(&self, s: Session) {
-        self.sessions.lock().unwrap().insert(s.sid.clone(), s);
+        let exp = now_secs() + DEFAULT_TTL_SECS;
+        self.sessions.lock().unwrap().insert(s.sid.clone(), Expiring::new(s, exp));
     }
     async fn get_session(&self, sid: &str) -> Option<Session> {
-        self.sessions.lock().unwrap().get(sid).cloned()
+        let mut map = self.sessions.lock().unwrap();
+        match map.get(sid) {
+            Some(e) if e.alive() => Some(e.value.clone()),
+            Some(_) => {
+                map.remove(sid);
+                None
+            }
+            None => None,
+        }
     }
     async fn delete_session(&self, sid: &str) {
         self.sessions.lock().unwrap().remove(sid);
     }
     async fn save_code(&self, c: AuthorizationCode) {
+        // code 自身の expires_at をストア TTL にも流用する(二重管理を避ける)。
+        // 再利用検知のため used 化後も expires_at までは保持する(削除しない)。
+        let exp = c.expires_at;
+        let key = c.code.clone();
         self.codes.lock().unwrap().insert(
-            c.code.clone(),
-            CodeRecord { code: c, used: false, issued_access: None, issued_refresh: None },
+            key,
+            Expiring::new(
+                CodeRecord { code: c, used: false, issued_access: None, issued_refresh: None },
+                exp,
+            ),
         );
     }
     async fn take_code(&self, code: &str) -> Option<AuthorizationCode> {
         // 失効対象を lock 内で収集し、lock 解放後にトークンマップを触る（ロック順序固定）。
         let revoke = {
             let mut codes = self.codes.lock().unwrap();
-            let rec = codes.get_mut(code)?;
+            let entry = codes.get_mut(code)?;
+            if !entry.alive() {
+                // 期限切れコードは未知と同義。lazy 削除して None。
+                codes.remove(code);
+                return None;
+            }
+            let rec = &mut entry.value;
             if rec.used {
                 let r = (rec.issued_access.take(), rec.issued_refresh.take());
                 Some(r)
@@ -119,16 +194,25 @@ impl Store for MemoryStore {
         None
     }
     async fn link_issued_tokens(&self, code: &str, access_token: &str, refresh_token: Option<&str>) {
-        if let Some(rec) = self.codes.lock().unwrap().get_mut(code) {
-            rec.issued_access = Some(access_token.to_string());
-            rec.issued_refresh = refresh_token.map(str::to_string);
+        if let Some(entry) = self.codes.lock().unwrap().get_mut(code) {
+            entry.value.issued_access = Some(access_token.to_string());
+            entry.value.issued_refresh = refresh_token.map(str::to_string);
         }
     }
     async fn save_access_token(&self, t: AccessToken) {
-        self.access_tokens.lock().unwrap().insert(t.token.clone(), t);
+        let exp = now_secs() + DEFAULT_TTL_SECS;
+        self.access_tokens.lock().unwrap().insert(t.token.clone(), Expiring::new(t, exp));
     }
     async fn get_access_token(&self, token: &str) -> Option<AccessToken> {
-        self.access_tokens.lock().unwrap().get(token).cloned()
+        let mut map = self.access_tokens.lock().unwrap();
+        match map.get(token) {
+            Some(e) if e.alive() => Some(e.value.clone()),
+            Some(_) => {
+                map.remove(token); // lazy 失効: introspection 等が期限切れを active 扱いしない
+                None
+            }
+            None => None,
+        }
     }
     async fn revoke_access_token(&self, token: &str) {
         self.access_tokens.lock().unwrap().remove(token);
@@ -136,18 +220,27 @@ impl Store for MemoryStore {
     async fn consume_mandate_if_unused(&self, token: &str) -> Result<bool, String> {
         let mut map = self.access_tokens.lock().unwrap();
         match map.get_mut(token) {
-            Some(at) if !at.mandate_consumed => {
-                at.mandate_consumed = true;
+            Some(e) if e.alive() && !e.value.mandate_consumed => {
+                e.value.mandate_consumed = true;
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
     async fn save_refresh_token(&self, t: RefreshToken) {
-        self.refresh_tokens.lock().unwrap().insert(t.token.clone(), t);
+        let exp = now_secs() + REFRESH_TTL_SECS;
+        self.refresh_tokens.lock().unwrap().insert(t.token.clone(), Expiring::new(t, exp));
     }
     async fn get_refresh_token(&self, token: &str) -> Option<RefreshToken> {
-        self.refresh_tokens.lock().unwrap().get(token).cloned()
+        let mut map = self.refresh_tokens.lock().unwrap();
+        match map.get(token) {
+            Some(e) if e.alive() => Some(e.value.clone()),
+            Some(_) => {
+                map.remove(token);
+                None
+            }
+            None => None,
+        }
     }
     async fn revoke_refresh_token(&self, token: &str) {
         self.refresh_tokens.lock().unwrap().remove(token);
@@ -155,9 +248,9 @@ impl Store for MemoryStore {
     async fn mark_refresh_used(&self, token: &str, replaced_by: Option<&str>) -> bool {
         let mut map = self.refresh_tokens.lock().unwrap();
         match map.get_mut(token) {
-            Some(rt) if !rt.used => {
-                rt.used = true;
-                rt.replaced_by = replaced_by.map(str::to_string);
+            Some(e) if e.alive() && !e.value.used => {
+                e.value.used = true;
+                e.value.replaced_by = replaced_by.map(str::to_string);
                 true
             }
             _ => false,
@@ -172,11 +265,21 @@ impl Store for MemoryStore {
             if guard > 64 {
                 break; // 系列長の安全上限（壊れた replaced_by ループ対策）
             }
-            cur = map.remove(&t).and_then(|rt| rt.replaced_by);
+            cur = map.remove(&t).and_then(|e| e.value.replaced_by);
         }
     }
     async fn find_account(&self, sub: &str) -> Account {
         account_for(sub)
+    }
+
+    /// 全マップから期限切れを物理削除(retain_alive の実体)。ロックは各マップ毎に
+    /// 短時間で取得・解放し、保持順序を固定してデッドロックを避ける。
+    async fn sweep_expired(&self) {
+        retain_alive(&mut self.interactions.lock().unwrap());
+        retain_alive(&mut self.sessions.lock().unwrap());
+        retain_alive(&mut self.codes.lock().unwrap());
+        retain_alive(&mut self.access_tokens.lock().unwrap());
+        retain_alive(&mut self.refresh_tokens.lock().unwrap());
     }
 }
 
@@ -362,6 +465,62 @@ mod tests {
         // revoke で消える。
         s.revoke_refresh_token("RT1").await;
         assert!(s.get_refresh_token("RT1").await.is_none());
+    }
+
+    // 期限切れ access token は取得時に None(lazy 失効)。introspection が active 扱いしない根拠。
+    #[tokio::test]
+    async fn expired_access_token_is_none_on_get() {
+        let s = MemoryStore::default();
+        // 過去に失効するエントリを直接投入(save は now+TTL になるため内部 API で細工)。
+        s.access_tokens
+            .lock()
+            .unwrap()
+            .insert("AT_OLD".into(), Expiring::new(at("AT_OLD"), now_secs().saturating_sub(1)));
+        assert!(s.get_access_token("AT_OLD").await.is_none());
+        // lazy 削除されている(マップから消える)。
+        assert!(!s.access_tokens.lock().unwrap().contains_key("AT_OLD"));
+    }
+
+    // 生きている access token は取得できる(誤って消さない)。
+    #[tokio::test]
+    async fn live_access_token_survives() {
+        let s = MemoryStore::default();
+        s.save_access_token(at("AT_NEW")).await; // now + 900s
+        assert!(s.get_access_token("AT_NEW").await.is_some());
+    }
+
+    // active sweep は期限切れだけを物理削除し、生存エントリは残す。
+    #[tokio::test]
+    async fn sweep_removes_only_expired() {
+        let s = MemoryStore::default();
+        s.save_access_token(at("LIVE")).await; // 生存
+        s.access_tokens
+            .lock()
+            .unwrap()
+            .insert("DEAD".into(), Expiring::new(at("DEAD"), now_secs().saturating_sub(1)));
+        s.sweep_expired().await;
+        assert!(s.access_tokens.lock().unwrap().contains_key("LIVE"));
+        assert!(!s.access_tokens.lock().unwrap().contains_key("DEAD"));
+    }
+
+    // 期限切れ interaction の消費は false(単回消費の意味論を壊さない)。
+    #[tokio::test]
+    async fn expired_interaction_consume_is_false() {
+        let s = MemoryStore::default();
+        s.interactions.lock().unwrap().insert(
+            "U_OLD".into(),
+            Expiring::new(
+                Interaction {
+                    uid: "U_OLD".into(),
+                    raw_query: String::new(),
+                    account_id: Some("a".into()),
+                    auth_time: None,
+                    request_uri: None,
+                },
+                now_secs().saturating_sub(1),
+            ),
+        );
+        assert!(!s.consume_interaction("U_OLD").await);
     }
 
     #[tokio::test]
