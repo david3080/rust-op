@@ -1,5 +1,10 @@
 //! Firestore 最小クライアント（REST + metadata サーバのアクセストークン）。
 //! Cloud Run のデフォルト SA で 1 ドキュメント単位の set/get/delete のみ提供する。
+//!
+//! `FIRESTORE_EMULATOR_HOST`（例: `127.0.0.1:8180`）が設定されていれば、公式 SDK 群と同じ
+//! 慣習に従いエミュレータへ向く（`firebase emulators:start --only firestore` 等が export する
+//! 値をそのまま使える）。エミュレータ実行時は metadata サーバへは一切アクセスしない
+//! （ローカルに metadata サーバは存在せず、実 GCP にも絶対に飛ばさないための分岐）。
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -10,6 +15,7 @@ pub struct Firestore {
     project: String,
     http: reqwest::Client,
     token: Mutex<Option<(String, Instant)>>,
+    emulator_host: Option<String>,
 }
 
 /// 型付きフィールド値のヘルパー（Firestore REST の Value 表現）。
@@ -109,6 +115,19 @@ impl Firestore {
             project: project.into(),
             http: reqwest::Client::new(),
             token: Mutex::new(None),
+            emulator_host: std::env::var("FIRESTORE_EMULATOR_HOST").ok(),
+        }
+    }
+
+    /// テスト専用: プロセス全体のグローバル状態である環境変数を触らずに、任意のホストへ向ける。
+    /// 並行実行されるテストが FIRESTORE_EMULATOR_HOST の set/unset で競合するのを避けるため。
+    #[cfg(test)]
+    pub(crate) fn new_for_test(project: impl Into<String>, emulator_host: impl Into<String>) -> Self {
+        Self {
+            project: project.into(),
+            http: reqwest::Client::new(),
+            token: Mutex::new(None),
+            emulator_host: Some(emulator_host.into()),
         }
     }
 
@@ -117,6 +136,11 @@ impl Firestore {
     }
 
     pub(crate) async fn token(&self) -> Result<String, String> {
+        // エミュレータは Authorization の中身を検証しない。ここで即 return することで
+        // metadata サーバへの到達を試みない（ローカルには無いので失敗するだけ）。
+        if self.emulator_host.is_some() {
+            return Ok("owner".to_string());
+        }
         {
             let g = self.token.lock().unwrap();
             if let Some((t, exp)) = g.as_ref() {
@@ -140,12 +164,28 @@ impl Firestore {
         Ok(tok)
     }
 
+    // エミュレータ設定時は http://{host} へ、それ以外は実 Firestore へ。REST パス形状は同一。
+    fn base_url(&self) -> String {
+        self.base_url_or("firestore.googleapis.com")
+    }
+
+    /// Firestore 以外の Google API（fcm.rs 等）向け。エミュレータ設定時は同じテスト用サーバへ、
+    /// それ以外は指定した実ホストへ向ける。`Firestore` は project/token を一元管理する薄い
+    /// ハブとして使われているため、外部 API 呼び出し側もここ経由でホスト切替を再利用する。
+    pub(crate) fn base_url_or(&self, real_host: &str) -> String {
+        match &self.emulator_host {
+            Some(host) => format!("http://{host}"),
+            None => format!("https://{real_host}"),
+        }
+    }
+
     // ドキュメント URL にはドキュメント ID が入る。ID は accounts/profiles では email/sub（＝PII）。
     // reqwest の Error::Display は URL を ` for url (...)` として必ず付加する（0.12 系）ため、
     // この URL を使う送受信エラーは必ず `e.without_url()` でログから ID を落とす。
     fn doc_url(&self, col: &str, id: &str) -> String {
         format!(
-            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/{}/{}",
+            "{}/v1/projects/{}/databases/(default)/documents/{}/{}",
+            self.base_url(),
             self.project,
             col,
             enc(id),
@@ -315,7 +355,8 @@ impl Firestore {
     ) -> Result<Vec<(String, Value)>, String> {
         let tok = self.token().await?;
         let url = format!(
-            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents:runQuery",
+            "{}/v1/projects/{}/databases/(default)/documents:runQuery",
+            self.base_url(),
             self.project
         );
         let body = json!({
@@ -439,8 +480,209 @@ pub fn field_str<'a>(fields: &'a Value, name: &str) -> Option<&'a str> {
     fields.get(name)?.get("stringValue")?.as_str()
 }
 
+/// firestore.rs / fcm.rs のクライアント側ロジック（プリコンディションの送信・レスポンス解釈・
+/// 送信先ホストの切替）を検証するための最小フェイクサーバ。`firestore::tests` と `fcm::tests`
+/// の双方から再利用するため、`mod tests` の外に置く。
+///
+/// なぜ実 Firestore エミュレータを使わないか: 手元の Firestore エミュレータは
+/// `currentDocument.updateTime` による楽観ロック CAS を正しく実装していない
+/// （RFC3339 文字列を数値バージョンとして誤解釈し、常に FAILED_PRECONDITION になる。
+/// `currentDocument.exists=false` の CAS は正常動作することを curl で確認済み）。
+/// CIBA 承認・リフレッシュトークンのローテーション検知・RAR mandate の単回消費など、
+/// この「先勝ち」機構に依存するコードの安全性は本番の生 Firestore が正しく実装している
+/// 前提に立っており、その前提自体はここでは検証しない（Google の REST API 契約として
+/// 別途信頼する）。ここで検証するのは「クライアント側(このクレート)がプリコンディションを
+/// 正しく送り、勝敗のレスポンスを正しく解釈するか」「fcm.rs が Firestore とは別ホストへ
+/// 正しく POST するか」という、実際にこのコードベースがバグを混入しうる部分に限定する。
+#[cfg(test)]
+pub(crate) mod fake_firestore {
+    use axum::extract::{Path, Query, State};
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct Doc {
+        fields: Value,
+        update_time: u64,
+    }
+
+    #[derive(Default)]
+    pub struct FakeState {
+        docs: Mutex<HashMap<(String, String), Doc>>,
+        next_version: Mutex<u64>,
+        /// fcm.rs の send() が投げた message body をそのまま記録する（identifier 一貫性の検証用）。
+        fcm_sent: Mutex<Vec<Value>>,
+    }
+
+    impl FakeState {
+        fn next(&self) -> u64 {
+            let mut n = self.next_version.lock().unwrap();
+            *n += 1;
+            *n
+        }
+
+        pub fn fcm_sent_messages(&self) -> Vec<Value> {
+            self.fcm_sent.lock().unwrap().clone()
+        }
+    }
+
+    fn version_str(v: u64) -> String {
+        format!("v{v}")
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    struct Precondition {
+        #[serde(rename = "currentDocument.updateTime")]
+        update_time: Option<String>,
+        #[serde(rename = "currentDocument.exists")]
+        exists: Option<String>,
+    }
+
+    async fn get_doc(
+        State(st): State<Arc<FakeState>>,
+        Path((_project, col, id)): Path<(String, String, String)>,
+    ) -> Response {
+        let docs = st.docs.lock().unwrap();
+        match docs.get(&(col, id)) {
+            Some(d) => {
+                Json(json!({ "fields": d.fields, "updateTime": version_str(d.update_time) }))
+                    .into_response()
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn patch_doc(
+        State(st): State<Arc<FakeState>>,
+        Path((_project, col, id)): Path<(String, String, String)>,
+        Query(pre): Query<Precondition>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let mut docs = st.docs.lock().unwrap();
+        let key = (col, id);
+        if let Some(want) = &pre.exists {
+            let want_exists = want == "true";
+            if docs.contains_key(&key) != want_exists {
+                return (StatusCode::CONFLICT, "precondition failed: exists").into_response();
+            }
+        }
+        if let Some(want_ut) = &pre.update_time {
+            match docs.get(&key) {
+                Some(d) if version_str(d.update_time) == *want_ut => {}
+                _ => {
+                    return (StatusCode::BAD_REQUEST, "precondition failed: updateTime")
+                        .into_response()
+                }
+            }
+        }
+        let fields = body.get("fields").cloned().unwrap_or_else(|| json!({}));
+        let v = st.next();
+        docs.insert(key, Doc { fields: fields.clone(), update_time: v });
+        Json(json!({ "fields": fields, "updateTime": version_str(v) })).into_response()
+    }
+
+    async fn delete_doc(
+        State(st): State<Arc<FakeState>>,
+        Path((_project, col, id)): Path<(String, String, String)>,
+        Query(pre): Query<Precondition>,
+    ) -> Response {
+        let mut docs = st.docs.lock().unwrap();
+        let key = (col, id);
+        if let Some(want_ut) = &pre.update_time {
+            match docs.get(&key) {
+                Some(d) if version_str(d.update_time) == *want_ut => {}
+                _ => {
+                    return (StatusCode::BAD_REQUEST, "precondition failed: updateTime")
+                        .into_response()
+                }
+            }
+        }
+        docs.remove(&key);
+        StatusCode::OK.into_response()
+    }
+
+    /// fcm.rs::send() が叩く `POST /v1/projects/{project}/messages:send` を模す。
+    /// 実際に外部へは送らず、message body を記録して 200 を返すだけ。
+    async fn fcm_send(
+        State(st): State<Arc<FakeState>>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        st.fcm_sent.lock().unwrap().push(body);
+        Json(json!({ "name": "projects/fake/messages/1" })).into_response()
+    }
+
+    /// ランダムな空きポートで起動し `(host:port, 状態ハンドル)` を返す。プロセス終了まで
+    /// 生き続ける（テストプロセス全体で共有されるわけではなく、テストごとに専用サーバを1つ立てる）。
+    pub async fn spawn() -> (String, Arc<FakeState>) {
+        let state = Arc::new(FakeState::default());
+        let app = Router::new()
+            .route(
+                "/v1/projects/{project}/databases/(default)/documents/{col}/{id}",
+                get(get_doc).patch(patch_doc).delete(delete_doc),
+            )
+            .route("/v1/projects/{project}/messages:send", post(fcm_send))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("127.0.0.1:{}", addr.port()), state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_defaults_to_real_firestore_when_env_unset() {
+        // このファイル内の他テストは new_for_test に統一済みで env を set しないため、
+        // remove_var だけなら並行実行される他テストと競合しない。
+        std::env::remove_var("FIRESTORE_EMULATOR_HOST");
+        let real = Firestore::new("proj");
+        assert_eq!(real.base_url(), "https://firestore.googleapis.com");
+        assert!(real.emulator_host.is_none());
+    }
+
+    #[test]
+    fn base_url_switches_to_emulator_host() {
+        // new_for_test はプロセス全体のグローバル状態(環境変数)を触らないので、
+        // 他の並行実行テストと競合しない。
+        let emu = Firestore::new_for_test("proj", "127.0.0.1:8180");
+        assert_eq!(emu.base_url(), "http://127.0.0.1:8180");
+    }
+
+    #[tokio::test]
+    async fn emulator_token_is_dummy_and_skips_metadata_server() {
+        let fs = Firestore::new_for_test("proj", "127.0.0.1:8180");
+        // metadata サーバ(http://metadata.google.internal)へは到達不能な環境でも
+        // エミュレータ経路なら即座に固定トークンが返る(到達を試みていないことの間接証拠)。
+        let tok = fs.token().await.unwrap();
+        assert_eq!(tok, "owner");
+    }
+
+    /// 実際に `firebase emulators:start --only firestore` を起動した状態で
+    /// `FIRESTORE_EMULATOR_HOST=127.0.0.1:<port> cargo test -- --ignored` で実行する。
+    /// 通常の `cargo test` では走らない（エミュレータ常駐を前提にしないため）。
+    #[tokio::test]
+    #[ignore]
+    async fn emulator_roundtrip_set_get_delete() {
+        let host = std::env::var("FIRESTORE_EMULATOR_HOST")
+            .expect("set FIRESTORE_EMULATOR_HOST to run this test, e.g. 127.0.0.1:8180");
+        let _ = host;
+        let fs = Firestore::new("test-emu-probe");
+        fs.set_doc("probeCol", "doc1", json!({ "hello": s("world") })).await.unwrap();
+        let got = fs.get_doc("probeCol", "doc1").await.unwrap().unwrap();
+        assert_eq!(field_str(&got, "hello"), Some("world"));
+        fs.delete_doc("probeCol", "doc1").await.unwrap();
+        assert!(fs.get_doc("probeCol", "doc1").await.unwrap().is_none());
+    }
+
     // ドキュメント URL に埋まる ID（accounts/profiles では email = PII）が送受信エラーの
     // ログ文字列へ漏れないことを固定する。without_url を {e} に戻すと落ちる回帰ロック。
     #[tokio::test]
@@ -457,5 +699,62 @@ mod tests {
         let scrubbed = format!("get: {}", err.without_url());
         assert!(!scrubbed.contains("a%40b.com"), "scrubbed leaked %40 form: {scrubbed}");
         assert!(!scrubbed.contains("a@b.com"), "scrubbed leaked raw form: {scrubbed}");
+    }
+
+    #[tokio::test]
+    async fn set_doc_if_unchanged_wins_on_match_and_loses_on_stale_update_time() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        fs.set_doc("col", "id1", json!({ "v": int(1) })).await.unwrap();
+        let (_, update_time) = fs.get_doc_with_update_time("col", "id1").await.unwrap().unwrap();
+
+        let won = fs
+            .set_doc_if_unchanged("col", "id1", json!({ "v": int(2) }), &update_time)
+            .await
+            .unwrap();
+        assert!(won, "matching updateTime should win the CAS");
+        let (fields, _) = fs.get_doc_with_update_time("col", "id1").await.unwrap().unwrap();
+        assert_eq!(field_u64(&fields, "v"), Some(2));
+
+        // update_time は既に古い(上の書き込みで進んだ)ので、同じ値で再挑戦すると負ける。
+        let lost = fs
+            .set_doc_if_unchanged("col", "id1", json!({ "v": int(3) }), &update_time)
+            .await
+            .unwrap();
+        assert!(!lost, "stale updateTime should lose the CAS");
+        let (fields, _) = fs.get_doc_with_update_time("col", "id1").await.unwrap().unwrap();
+        assert_eq!(field_u64(&fields, "v"), Some(2), "loser must not overwrite the winner's value");
+    }
+
+    #[tokio::test]
+    async fn create_if_absent_succeeds_once_then_loses_race() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        let first = fs.create_if_absent("col", "id2", json!({ "v": int(1) })).await.unwrap();
+        assert!(first);
+        let second = fs.create_if_absent("col", "id2", json!({ "v": int(99) })).await.unwrap();
+        assert!(!second, "create_if_absent on an existing doc must lose");
+        let (fields, _) = fs.get_doc_with_update_time("col", "id2").await.unwrap().unwrap();
+        assert_eq!(field_u64(&fields, "v"), Some(1), "loser must not overwrite");
+    }
+
+    #[tokio::test]
+    async fn delete_doc_if_unchanged_wins_on_match_and_loses_on_stale_update_time() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        fs.set_doc("col", "id3", json!({ "v": int(1) })).await.unwrap();
+        let (_, stale_update_time) = fs.get_doc_with_update_time("col", "id3").await.unwrap().unwrap();
+        // 間に別の書き込みが割り込み updateTime が進む状況を模す
+        // (CIBA の承認と拒否が競合するケースなど)。
+        fs.set_doc("col", "id3", json!({ "v": int(2) })).await.unwrap();
+
+        let lost = fs.delete_doc_if_unchanged("col", "id3", &stale_update_time).await.unwrap();
+        assert!(!lost, "stale updateTime must lose the delete CAS");
+        assert!(fs.get_doc("col", "id3").await.unwrap().is_some(), "doc must survive a lost CAS delete");
+
+        let (_, fresh_update_time) = fs.get_doc_with_update_time("col", "id3").await.unwrap().unwrap();
+        let won = fs.delete_doc_if_unchanged("col", "id3", &fresh_update_time).await.unwrap();
+        assert!(won, "matching updateTime must win the delete CAS");
+        assert!(fs.get_doc("col", "id3").await.unwrap().is_none());
     }
 }

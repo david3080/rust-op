@@ -87,4 +87,24 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         assert!(s.claim("x", Duration::from_millis(20)).await); // TTL 経過で再claim可
     }
+
+    #[tokio::test]
+    async fn firestore_claim_is_single_use() {
+        let (host, _state) = crate::firestore::fake_firestore::spawn().await;
+        let fs = Arc::new(Firestore::new_for_test("proj", host));
+        let s = NonceStore::firestore(fs);
+        assert!(s.claim("jti-1", Duration::from_secs(300)).await); // 初出
+        assert!(!s.claim("jti-1", Duration::from_secs(300)).await); // 再claim=replay
+        assert!(s.claim("jti-2", Duration::from_secs(300)).await); // 別keyは独立
+    }
+
+    #[tokio::test]
+    async fn firestore_claim_fails_closed_on_store_error() {
+        // 到達不能ホスト(127.0.0.1:1、他テストでも「確実に閉じたポート」として使用)への
+        // 接続失敗は Err になり、fail-closed で false(拒否)を返す。fail-open して
+        // Firestore 障害中にリプレイ防止が黙って無効化されることを防ぐ契約のロック。
+        let fs = Arc::new(Firestore::new_for_test("proj", "127.0.0.1:1"));
+        let s = NonceStore::firestore(fs);
+        assert!(!s.claim("jti-1", Duration::from_secs(300)).await);
+    }
 }

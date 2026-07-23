@@ -128,3 +128,123 @@ pub async fn revoke_client(fs: &Firestore, client_id: &str) -> Result<bool, Stri
     }
     Ok(existed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::firestore::fake_firestore;
+    use crate::model::Client;
+
+    fn constraints() -> IatConstraints {
+        IatConstraints {
+            allowed_redirect_hosts: vec!["rp.example.com".into()],
+            allowed_grant_types: vec!["authorization_code".into()],
+        }
+    }
+
+    fn client(id: &str) -> Client {
+        Client {
+            client_id: id.to_string(),
+            redirect_uris: vec!["https://rp.example.com/cb".into()],
+            post_logout_redirect_uris: vec![],
+            token_endpoint_auth_method: "private_key_jwt".into(),
+            client_secret: None,
+            grant_types: vec!["authorization_code".into()],
+            dpop_bound: true,
+            jwks: vec![],
+            jwks_uri: None,
+            require_par: true,
+            require_pkce: true,
+            id_token_signed_response_alg: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_then_load_client_roundtrips() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        save_client(&fs, &client("dcr-1")).await.unwrap();
+        let loaded = load_client(&fs, "dcr-1").await.unwrap();
+        assert_eq!(loaded.client_id, "dcr-1");
+        assert_eq!(loaded.token_endpoint_auth_method, "private_key_jwt");
+
+        assert!(load_client(&fs, "unknown").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_client_rejects_client_id_collision() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        save_client(&fs, &client("dcr-dup")).await.unwrap();
+        // 万一同じ client_id が再度採番されても、create_if_absent が既存を上書きしない
+        // （静かな破壊を防ぐ設計。dcr_store.rs の save_client のコメント通り）。
+        let second = client("dcr-dup");
+        let err = save_client(&fs, &second).await.unwrap_err();
+        assert!(err.contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn consume_iat_succeeds_once_then_rejects_reuse() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        let hash = "hash-1";
+
+        put_iat(&fs, hash, &constraints(), 9_999_999_999, false).await.unwrap();
+        let iat = peek_iat(&fs, hash).await.unwrap().unwrap();
+        assert_eq!(iat.constraints.allowed_redirect_hosts, vec!["rp.example.com"]);
+        assert!(!iat.reusable);
+
+        // 検証成功後の単回消費(CAS 削除)。
+        let consumed = consume_iat(&fs, hash, &iat.update_time).await.unwrap();
+        assert!(consumed, "初回消費は勝つ");
+
+        // 同じトークンでの再利用(リプレイ)は、ドキュメントが既に消えているため負ける。
+        let replay = consume_iat(&fs, hash, &iat.update_time).await.unwrap();
+        assert!(!replay, "消費済み IAT の再利用は拒否される");
+        assert!(peek_iat(&fs, hash).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn consume_iat_loses_when_update_time_is_stale() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        let hash = "hash-2";
+
+        put_iat(&fs, hash, &constraints(), 9_999_999_999, false).await.unwrap();
+        let stale = peek_iat(&fs, hash).await.unwrap().unwrap();
+        // 間に別のリクエストが割り込んで再書き込みされた状況を模す(実際には put_iat は
+        // create_if_absent なので同一ドキュメントの再書き込みは通常起きないが、
+        // updateTime CAS 自体の防御が効くことを確認する)。
+        let fresh = peek_iat(&fs, hash).await.unwrap().unwrap();
+        assert_eq!(stale.update_time, fresh.update_time, "この時点では同一のはず");
+
+        // 明らかに古い(存在しない)updateTime を渡すと必ず負ける。
+        let lost = consume_iat(&fs, hash, "v-does-not-exist").await.unwrap();
+        assert!(!lost);
+        assert!(peek_iat(&fs, hash).await.unwrap().is_some(), "負けた場合は削除されない");
+    }
+
+    #[tokio::test]
+    async fn put_iat_rejects_hash_collision() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        put_iat(&fs, "dup-hash", &constraints(), 1, false).await.unwrap();
+        let err = put_iat(&fs, "dup-hash", &constraints(), 2, false).await.unwrap_err();
+        assert!(err.contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn revoke_client_deletes_and_reports_existence() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        assert!(!revoke_client(&fs, "nope").await.unwrap(), "存在しないクライアントは false");
+
+        save_client(&fs, &client("dcr-rev")).await.unwrap();
+        assert!(revoke_client(&fs, "dcr-rev").await.unwrap());
+        assert!(load_client(&fs, "dcr-rev").await.is_none(), "失効後は解決できない");
+        assert!(!revoke_client(&fs, "dcr-rev").await.unwrap(), "二重失効は false(冪等)");
+    }
+}

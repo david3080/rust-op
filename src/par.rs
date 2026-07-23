@@ -70,3 +70,67 @@ pub async fn delete(fs: &Firestore, request_uri: &str) {
         fs.delete_doc(COL, id).await.ok();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::firestore::fake_firestore;
+
+    #[tokio::test]
+    async fn create_then_peek_roundtrips_and_is_non_destructive() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        let uri = create(&fs, "client-1", "response_type=code&scope=openid").await.unwrap();
+        assert!(uri.0.starts_with(URN_PREFIX));
+
+        // peek は削除しない(認可完了前は何度でも読める)。
+        let first = peek(&fs, &uri.0).await.unwrap().unwrap();
+        assert_eq!(first, ("client-1".to_string(), "response_type=code&scope=openid".to_string()));
+        let second = peek(&fs, &uri.0).await.unwrap();
+        assert!(second.is_some(), "peek はドキュメントを消費しない");
+    }
+
+    #[tokio::test]
+    async fn delete_makes_request_uri_unusable() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        let uri = create(&fs, "client-1", "p=1").await.unwrap();
+        delete(&fs, &uri.0).await;
+        assert!(peek(&fs, &uri.0).await.unwrap().is_none(), "delete 後は再利用できない");
+    }
+
+    #[tokio::test]
+    async fn peek_rejects_expired_request() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        // create() を経由せず、既に期限切れの expiresAt を直接書き込む
+        // (期限判定は firestore.rules の TTL ではなくこのコード自身が行うため、直接検証できる)。
+        let id = "expired-id-000000000000000000";
+        fs.set_doc(
+            COL,
+            id,
+            serde_json::json!({
+                "clientId": firestore::s("client-1"),
+                "params": firestore::s("p=1"),
+                "expiresAt": firestore::ts(&firestore::rfc3339(0)), // 1970年、確実に期限切れ
+            }),
+        )
+        .await
+        .unwrap();
+
+        let uri = format!("{URN_PREFIX}{id}");
+        assert!(peek(&fs, &uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn peek_rejects_malformed_request_uri() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        assert!(peek(&fs, "not-a-valid-uri").await.unwrap().is_none());
+        assert!(peek(&fs, &format!("{URN_PREFIX}short")).await.unwrap().is_none(), "20文字未満のIDは拒否");
+    }
+}
