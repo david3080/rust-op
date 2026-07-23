@@ -128,7 +128,7 @@ pub(super) async fn login_passkey_options(
             _ => (serde_json::json!([]), String::new()),
         }
     };
-    let challenge = match crate::registration::create_webauthn_challenge(fs, &chal_email, crate::registration::ChallengeKind::Auth, &uid).await {
+    let challenge = match crate::registration::create_webauthn_challenge(fs, &chal_email, crate::registration::ChallengeKind::Auth, &uid, "").await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("create challenge: {e}");
@@ -159,7 +159,7 @@ pub(super) async fn login_passkey_verify(
         Some(c) => c,
         None => return (StatusCode::BAD_REQUEST, "no challenge").into_response(),
     };
-    let (email, kind, uid2) = match crate::registration::consume_webauthn_challenge(fs, &challenge).await {
+    let (email, kind, uid2, _) = match crate::registration::consume_webauthn_challenge(fs, &challenge).await {
         Ok(Some(t)) => t,
         Ok(None) => return (StatusCode::BAD_REQUEST, "challenge invalid/expired").into_response(),
         Err(e) => {
@@ -171,15 +171,25 @@ pub(super) async fn login_passkey_verify(
         return (StatusCode::BAD_REQUEST, "challenge context mismatch").into_response();
     }
     // discoverable（challenge の email が空）なら assertion の userHandle で解決。
-    // userHandle = registration 時の user.id = base64url(email)。
-    let email = req
+    // userHandle = registration 時の user.id = account_id(UUID)。account_id → email を逆引きする。
+    let email = match req
         .response
         .user_handle
         .as_deref()
         .filter(|s| !s.is_empty())
-        .and_then(|uh| crate::es256::b64url_decode(uh).ok())
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or(email);
+    {
+        Some(uh) => {
+            let account_id = crate::es256::b64url_decode(uh)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default();
+            match crate::registration::find_email_by_account_id(fs, &account_id).await {
+                Ok(Some(e)) => e,
+                _ => return (StatusCode::BAD_REQUEST, "cannot resolve user").into_response(),
+            }
+        }
+        None => email,
+    };
     if email.is_empty() {
         return (StatusCode::BAD_REQUEST, "cannot resolve user").into_response();
     }
@@ -212,11 +222,15 @@ pub(super) async fn login_passkey_verify(
             return (StatusCode::UNAUTHORIZED, format!("passkey verify failed: {e}")).into_response();
         }
     }
+    if cred.account_id.is_empty() {
+        // 移行前（accountId 未発行）のアカウント。再登録が必要。
+        return (StatusCode::BAD_REQUEST, "account needs re-registration").into_response();
+    }
     let interaction = match p.store.get_interaction(&uid).await {
         Some(i) => i,
         None => return (StatusCode::BAD_REQUEST, "interaction not found").into_response(),
     };
-    let account = p.store.find_account(&email).await;
+    let account = p.store.find_account(&cred.account_id).await;
     let (jar, resume) = finalize_login(&p, jar, interaction, account.sub).await;
     (jar, Json(serde_json::json!({ "redirect": resume }))).into_response()
 }

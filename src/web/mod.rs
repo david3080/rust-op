@@ -26,6 +26,8 @@ mod login;
 mod oidc;
 mod pages;
 mod register;
+#[cfg(test)]
+mod emulator_tests;
 
 const SID_COOKIE: &str = "sid";
 

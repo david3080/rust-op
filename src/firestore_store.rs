@@ -366,7 +366,8 @@ impl Store for FirestoreStore {
     }
 
     async fn find_account(&self, sub: &str) -> Account {
-        // 保存済みの編集可能 claim（profiles/{email}）。未保存なら空。
+        // sub は account_id(UUID)。profiles/{sub} は accountId をキーとして保存済み編集可能 claim を持つ
+        // （profile_get/profile_put が at.account_id をそのまま渡すため、re-key 不要で自然に対応する）。
         let saved = crate::registration::get_profile(&self.fs, sub)
             .await
             .unwrap_or_default();
@@ -374,8 +375,9 @@ impl Store for FirestoreStore {
         // 未設定 claim はダミーで埋めず欠落させる（OP は“真の属性”だけを主張する）。
         let mut claims: HashMap<String, Value> = HashMap::new();
         claims.insert("sub".to_string(), json!(sub));
-        if sub.contains('@') {
-            claims.insert("email".to_string(), json!(sub));
+        // sub(account_id) から email を逆引き（accountsByUuid）。取れた場合のみ email claim を出す。
+        if let Ok(Some(email)) = crate::registration::find_email_by_account_id(&self.fs, sub).await {
+            claims.insert("email".to_string(), json!(email));
             // 登録時にメール確認を経ている（registration の email-challenge/verify）。
             claims.insert("email_verified".to_string(), json!(true));
         }

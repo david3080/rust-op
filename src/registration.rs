@@ -1,7 +1,10 @@
 //! メール確認つき passkey 登録の永続化。Firestore を使う。
 //! - emailChallenges/{token}: メール所有確認待ち（email, expiresAt）。30分・単回。
-//! - webauthnChallenges/{challenge}: passkey セレモニーのチャレンジ（email, kind, uid, expiresAt）。5分・単回。
-//! - accounts/{email}: 確認済みユーザー + passkey（credentialId, pubX, pubY, signCount, ...）。
+//! - webauthnChallenges/{challenge}: passkey セレモニーのチャレンジ（email, kind, uid, accountId, expiresAt）。5分・単回。
+//! - accounts/{email}: 確認済みユーザー + passkey（accountId, credentialId, pubX, pubY, signCount, ...）。
+//! - accountsByUuid/{accountId}: accounts/{email} への逆引き（email のみ）。discoverable な
+//!   passkey ログイン（userHandle = accountId しか分からない）で email を引くために使う。
+//!   sub/account_id は email ではなく accountId（登録時に発行する UUID v4）。
 
 use crate::firestore::{self, Firestore};
 use crate::jws::b64url;
@@ -114,6 +117,7 @@ pub async fn create_webauthn_challenge(
     email: &str,
     kind: ChallengeKind,
     uid: &str,
+    account_id: &str,
 ) -> Result<String, String> {
     let challenge = random_token();
     fs.set_doc(
@@ -123,6 +127,7 @@ pub async fn create_webauthn_challenge(
             "email": firestore::s(email),
             "kind": firestore::s(kind.as_str()),
             "uid": firestore::s(uid),
+            "accountId": firestore::s(account_id),
             "expiresAt": firestore::ts(&firestore::rfc3339(now() + CEREMONY_TTL_SECS)),
         }),
     )
@@ -130,11 +135,12 @@ pub async fn create_webauthn_challenge(
     Ok(challenge)
 }
 
-/// (email, kind, uid) を単回消費で返す。kind が未知なら None。
+/// (email, kind, uid, accountId) を単回消費で返す。kind が未知なら None。
+/// accountId は ChallengeKind::Reg のときのみ意味を持つ（登録時に払い出した/再利用する UUID）。
 pub async fn consume_webauthn_challenge(
     fs: &Firestore,
     challenge: &str,
-) -> Result<Option<(String, ChallengeKind, String)>, String> {
+) -> Result<Option<(String, ChallengeKind, String, String)>, String> {
     if !token_ok(challenge) {
         return Ok(None);
     }
@@ -152,24 +158,36 @@ pub async fn consume_webauthn_challenge(
     };
     let email = firestore::field_str(&fields, "email").unwrap_or("").to_string();
     let uid = firestore::field_str(&fields, "uid").unwrap_or("").to_string();
-    Ok(Some((email, kind, uid)))
+    let account_id = firestore::field_str(&fields, "accountId").unwrap_or("").to_string();
+    Ok(Some((email, kind, uid, account_id)))
 }
 
 /* ===== passkey 認証情報 ===== */
 
 pub struct Credential {
+    pub account_id: String,
     pub credential_id: String,
     pub pub_x: String,
     pub pub_y: String,
     pub sign_count: u32,
 }
 
-pub async fn save_credential(fs: &Firestore, email: &str, c: &RegOutcome) -> Result<(), String> {
+/// account_id は呼び出し側が払い出す（新規登録なら新規 UUID、既存 passkey 追加なら既存値の再利用）。
+/// accounts/{email} を先に書き、逆引き accountsByUuid/{account_id} を後で書く。
+/// 逆引きの書き込みが失敗しても登録自体は失敗させない（email 入力でのログインは影響を受けない、
+/// discoverable ログインのみ縮退する）。
+pub async fn save_credential(
+    fs: &Firestore,
+    email: &str,
+    account_id: &str,
+    c: &RegOutcome,
+) -> Result<(), String> {
     fs.set_doc(
         "accounts",
         email,
         json!({
             "email": firestore::s(email),
+            "accountId": firestore::s(account_id),
             "credentialId": firestore::s(&c.credential_id),
             "pubX": firestore::s(&c.pub_x),
             "pubY": firestore::s(&c.pub_y),
@@ -178,7 +196,14 @@ pub async fn save_credential(fs: &Firestore, email: &str, c: &RegOutcome) -> Res
             "createdAt": firestore::ts(&firestore::rfc3339(now())),
         }),
     )
-    .await
+    .await?;
+    if let Err(e) = fs
+        .set_doc("accountsByUuid", account_id, json!({ "email": firestore::s(email) }))
+        .await
+    {
+        tracing::error!("accountsByUuid index write failed for account_id={account_id}: {e}");
+    }
+    Ok(())
 }
 
 pub async fn get_credential(fs: &Firestore, email: &str) -> Result<Option<Credential>, String> {
@@ -197,6 +222,7 @@ pub async fn get_credential(fs: &Firestore, email: &str) -> Result<Option<Creden
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
     Ok(Some(Credential {
+        account_id: firestore::field_str(&fields, "accountId").unwrap_or("").to_string(),
         credential_id,
         pub_x: firestore::field_str(&fields, "pubX").unwrap_or("").to_string(),
         pub_y: firestore::field_str(&fields, "pubY").unwrap_or("").to_string(),
@@ -206,12 +232,14 @@ pub async fn get_credential(fs: &Firestore, email: &str) -> Result<Option<Creden
 
 pub async fn update_sign_count(fs: &Firestore, email: &str, n: u32) -> Result<(), String> {
     // 既存ドキュメントを取り直して signCount だけ更新（PATCH は全 fields 置換のため）。
+    // accountId は既存値をそのまま引き継ぐ（再生成しない）。
     if let Some(c) = get_credential(fs, email).await? {
         fs.set_doc(
             "accounts",
             email,
             json!({
                 "email": firestore::s(email),
+                "accountId": firestore::s(&c.account_id),
                 "credentialId": firestore::s(&c.credential_id),
                 "pubX": firestore::s(&c.pub_x),
                 "pubY": firestore::s(&c.pub_y),
@@ -222,6 +250,18 @@ pub async fn update_sign_count(fs: &Firestore, email: &str, n: u32) -> Result<()
         .await?;
     }
     Ok(())
+}
+
+/// accountId(UUID) -> email の逆引き。discoverable ログイン（userHandle=accountId のみ判明）で使う。
+pub async fn find_email_by_account_id(
+    fs: &Firestore,
+    account_id: &str,
+) -> Result<Option<String>, String> {
+    let fields = match fs.get_doc("accountsByUuid", account_id).await? {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    Ok(firestore::field_str(&fields, "email").map(|s| s.to_string()))
 }
 
 /* ===== ユーザープロフィール（編集可能 claim、passkey とは別 collection） ===== */

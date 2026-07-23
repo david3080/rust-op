@@ -196,14 +196,16 @@ pub(super) async fn backchannel_auth(
         None => None,
     };
     // login_hint は passkey 登録済みアカウントであること（未登録は即拒否）。
-    match crate::registration::get_credential(fs, &login_hint).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return OAuthError::InvalidRequest("unknown user_id".into()).into_response(),
+    // account_id は以後、CIBA 要求本体・発行トークンの sub・FCM 宛先解決すべてに使う
+    // （login_hint = email は RP 起点のヒントとして dedup/レート制限のキーにのみ残す）。
+    let account_id = match crate::registration::get_credential(fs, &login_hint).await {
+        Ok(Some(c)) if !c.account_id.is_empty() => c.account_id,
+        Ok(_) => return OAuthError::InvalidRequest("unknown user_id".into()).into_response(),
         Err(e) => {
             tracing::error!("get_credential: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
         }
-    }
+    };
     // dedup: 同 (client_id, account) に未解決の pending があれば、新規発行も push もせず
     // 既存の auth_req_id を返す（冪等）。連発時の端末スパム抑止。
     match p.ciba.find_pending_for(&client.client_id, &login_hint).await {
@@ -237,11 +239,12 @@ pub(super) async fn backchannel_auth(
         )
             .into_response();
     }
-    match p.ciba.create(&client.client_id, &login_hint, &scope, &binding, authorization_details.as_deref()).await {
+    match p.ciba.create(&client.client_id, &account_id, &scope, &binding, authorization_details.as_deref()).await {
         Ok(id) => {
             // FCM で iPhone に承認要求を通知（Cloud Run suspend を避けるため await）。
             // token 未登録/送信失敗でも Web 承認は可能なのでベストエフォート。
-            let _ = crate::fcm::send_ciba_request(fs, &login_hint, &client.client_id, &scope, &binding, id.as_str(), authorization_details.as_deref()).await;
+            // fcm::save_token は at.account_id（UUID）で保存するため、宛先解決も account_id で行う。
+            let _ = crate::fcm::send_ciba_request(fs, &account_id, &client.client_id, &scope, &binding, id.as_str(), authorization_details.as_deref()).await;
             (
                 [(header::CACHE_CONTROL, "no-store")],
                 Json(serde_json::json!({ "auth_req_id": id.0, "expires_in": 300, "interval": 2 })),
@@ -339,21 +342,27 @@ pub(super) async fn ciba_approve_options(
         Some(f) => f,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    // 承認主体は CIBA 要求の account（login_hint ユーザー）から決まる。アプリへの
+    // 承認主体は CIBA 要求の account（account_id/UUID）から決まる。アプリへの
     // ログインは不要で、パスキー assertion（UV 必須）が本人性を証明する。
+    // passkey の資格情報は accounts/{email} 側にあるため、account_id → email を逆引きしてから引く。
     let req = match p.ciba.get(&auth_req_id).await {
         Ok(Some(r)) if !r.expired() => r,
         _ => return (StatusCode::NOT_FOUND, "request not found").into_response(),
     };
-    let cred = match crate::registration::get_credential(fs, &req.account).await {
+    let email = match crate::registration::find_email_by_account_id(fs, &req.account).await {
+        Ok(Some(e)) => e,
+        _ => return (StatusCode::BAD_REQUEST, "no passkey").into_response(),
+    };
+    let cred = match crate::registration::get_credential(fs, &email).await {
         Ok(Some(c)) => c,
         _ => return (StatusCode::BAD_REQUEST, "no passkey").into_response(),
     };
     let challenge = match crate::registration::create_webauthn_challenge(
         fs,
-        &req.account,
+        &email,
         crate::registration::ChallengeKind::CibaApprove,
         &auth_req_id,
+        "",
     )
     .await
     {
@@ -388,21 +397,23 @@ pub(super) async fn ciba_approve(
         Some(c) => c,
         None => return (StatusCode::BAD_REQUEST, "no challenge").into_response(),
     };
-    let (email, kind, uid) = match crate::registration::consume_webauthn_challenge(fs, &challenge).await {
+    let (email, kind, uid, _) = match crate::registration::consume_webauthn_challenge(fs, &challenge).await {
         Ok(Some(t)) => t,
         _ => return (StatusCode::BAD_REQUEST, "challenge invalid/expired").into_response(),
     };
     if kind != crate::registration::ChallengeKind::CibaApprove || uid != auth_req_id {
         return (StatusCode::BAD_REQUEST, "challenge context mismatch").into_response();
     }
-    let account = email; // チャレンジ発行時に束縛されたユーザー = 承認主体。
+    // チャレンジ発行時に束縛されたユーザー（email）= 承認主体。CIBA 要求側は account_id(UUID)
+    // で管理しているため、email → account_id に変換してから照合する。
+    let cred = match crate::registration::get_credential(fs, &email).await {
+        Ok(Some(c)) if !c.account_id.is_empty() => c,
+        _ => return (StatusCode::BAD_REQUEST, "no passkey").into_response(),
+    };
+    let account = cred.account_id.clone();
     let ciba_req = match p.ciba.get(&auth_req_id).await {
         Ok(Some(r)) if r.account == account && !r.expired() => r,
         _ => return (StatusCode::NOT_FOUND, "request not found").into_response(),
-    };
-    let cred = match crate::registration::get_credential(fs, &account).await {
-        Ok(Some(c)) => c,
-        _ => return (StatusCode::BAD_REQUEST, "no passkey").into_response(),
     };
     if cred.credential_id != req.id {
         return (StatusCode::BAD_REQUEST, "credential id mismatch").into_response();
@@ -420,7 +431,7 @@ pub(super) async fn ciba_approve(
         true, // CIBA 承認は UV(生体/PIN) 必須
     ) {
         Ok(n) => {
-            let _ = crate::registration::update_sign_count(fs, &account, n).await;
+            let _ = crate::registration::update_sign_count(fs, &email, n).await;
         }
         Err(e) => return (StatusCode::UNAUTHORIZED, format!("passkey verify failed: {e}")).into_response(),
     }

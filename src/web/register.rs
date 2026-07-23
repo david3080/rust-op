@@ -271,22 +271,30 @@ pub(super) async fn register_passkey_options(
             return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
         }
     };
-    let challenge = match crate::registration::create_webauthn_challenge(fs, &email, crate::registration::ChallengeKind::Reg, "").await {
+    // 既存 passkey の再登録なら account_id を再利用、新規なら払い出す。
+    // WebAuthn user.id は sub と同じ不透明な account_id にする（email を含めない）。
+    let existing = crate::registration::get_credential(fs, &email).await.ok().flatten();
+    let account_id = existing
+        .as_ref()
+        .map(|c| c.account_id.clone())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let challenge = match crate::registration::create_webauthn_challenge(fs, &email, crate::registration::ChallengeKind::Reg, "", &account_id).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("create challenge: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
         }
     };
-    let exclude: Vec<serde_json::Value> = match crate::registration::get_credential(fs, &email).await {
-        Ok(Some(c)) => vec![serde_json::json!({"type":"public-key","id":c.credential_id})],
-        _ => vec![],
+    let exclude: Vec<serde_json::Value> = match &existing {
+        Some(c) => vec![serde_json::json!({"type":"public-key","id":c.credential_id})],
+        None => vec![],
     };
     Json(serde_json::json!({
         "challenge": challenge,
         "rp": { "id": p.rp_id(), "name": "rust-op" },
         "user": {
-            "id": crate::webauthn::b64e(email.as_bytes()),
+            "id": crate::webauthn::b64e(account_id.as_bytes()),
             "name": email,
             "displayName": email,
         },
@@ -336,7 +344,7 @@ pub(super) async fn register_passkey_verify(
         Some(c) => c,
         None => return (StatusCode::BAD_REQUEST, "no challenge").into_response(),
     };
-    let (email2, kind, _) = match crate::registration::consume_webauthn_challenge(fs, &challenge).await {
+    let (email2, kind, _, account_id) = match crate::registration::consume_webauthn_challenge(fs, &challenge).await {
         Ok(Some(t)) => t,
         Ok(None) => return (StatusCode::BAD_REQUEST, "challenge invalid/expired").into_response(),
         Err(e) => {
@@ -344,7 +352,7 @@ pub(super) async fn register_passkey_verify(
             return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
         }
     };
-    if kind != crate::registration::ChallengeKind::Reg || email2 != email1 {
+    if kind != crate::registration::ChallengeKind::Reg || email2 != email1 || account_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "challenge context mismatch").into_response();
     }
     let outcome = match crate::webauthn::verify_registration(
@@ -360,7 +368,7 @@ pub(super) async fn register_passkey_verify(
             return (StatusCode::BAD_REQUEST, format!("registration failed: {e}")).into_response();
         }
     };
-    if let Err(e) = crate::registration::save_credential(fs, &email1, &outcome).await {
+    if let Err(e) = crate::registration::save_credential(fs, &email1, &account_id, &outcome).await {
         tracing::error!("save_credential: {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
     }
