@@ -150,13 +150,19 @@ async fn main() {
         }
     }
 
-    // Cloud Run 上 (K_SERVICE あり) では Firestore + Resend を有効化。
-    // ローカルは metadata 不達なので無効（LogMailer のまま）。
-    if std::env::var("K_SERVICE").is_ok() {
+    // Cloud Run 上 (K_SERVICE あり) では Firestore + KMS/Secret Manager + Resend を有効化。
+    // ローカルで FIRESTORE_EMULATOR_HOST のみ設定されている場合は、Firestore 関連の配線
+    // （Store/CibaStore/DPoP/private_key_jwt/registration 直叩き）だけをエミュレータへ向けて
+    // 有効化する。KMS・Secret Manager・Resend は実 GCP 前提なので K_SERVICE 限定のまま
+    // （ローカルは Provider::new の既定 ephemeral 鍵 + LogMailer で動かす）。
+    let use_firestore =
+        std::env::var("K_SERVICE").is_ok() || std::env::var("FIRESTORE_EMULATOR_HOST").is_ok();
+    if use_firestore {
         let project = std::env::var("GCLOUD_PROJECT")
             .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
             .unwrap_or_else(|_| "fido2-8b943".into());
         let fs = std::sync::Arc::new(firestore::Firestore::new(project));
+        if std::env::var("K_SERVICE").is_ok() {
         // 署名鍵 ES256: KMS_ES256_KEY があれば Cloud KMS（秘密鍵をプロセスに展開しない）、
         // 無ければ Secret Manager の固定鍵。本番(K_SERVICE)ではどちらからも正規鍵を
         // ロードできなければ起動を中止する（起動ごとの一時鍵での縮退運用を禁止）。
@@ -252,7 +258,10 @@ async fn main() {
             );
             std::process::exit(1);
         }
+        } // K_SERVICE 限定(KMS/Secret Manager 署名鍵)ここまで。
+
         // jti リプレイ防止を Firestore に分散化（インスタンス跨ぎで単回を保証）。
+        // ここから下は use_firestore（K_SERVICE または FIRESTORE_EMULATOR_HOST）で共通。
         provider =
             provider.with_dpop(std::sync::Arc::new(dpop::Es256Dpop::with_store(fs.clone())));
         provider.client_auth.insert(
