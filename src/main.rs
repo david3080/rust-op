@@ -131,13 +131,31 @@ async fn main() {
         id_token_signed_response_alg: None,
     };
 
-    // demo-rp / mobile-rp / ciba-rp は実アプリ用で常時登録。
+    // qm-rp: FAPI 2.0 厳格設定を満たせない外部 RP 用の静的クライアント
+    // （client_secret_basic + PKCE のみ。PAR/DPoP は非対応）。
+    let qm_rp = Client {
+        client_id: "qm-rp".into(),
+        redirect_uris: vec!["http://127.0.0.1:8082/auth/callback".into()],
+        post_logout_redirect_uris: vec!["http://127.0.0.1:8082/".into()],
+        token_endpoint_auth_method: "client_secret_basic".into(),
+        client_secret: Some(secret_from_env("QM_RP_SECRET")),
+        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        dpop_bound: false,
+        jwks: vec![],
+        jwks_uri: None,
+        require_par: false,
+        require_pkce: true, // qm は S256 を送るので有効化できる
+        id_token_signed_response_alg: None,
+    };
+
+    // demo-rp / mobile-rp / ciba-rp / qm-rp は実アプリ用で常時登録。
     // ciba-rp は実 CIBA バックエンド（client_secret_basic, DPoP 任意）。
     let mut provider = Provider::new(issuer.clone())
         .with_base_path(base_path.clone())
         .with_client(demo_rp)
         .with_client(mobile_rp)
-        .with_client(ciba_rp);
+        .with_client(ciba_rp)
+        .with_client(qm_rp);
 
     // FAPI2 conformance 用の静的クライアント（fapi-1 = client / fapi-2 = client2）。
     // FAPI 認定スイートは動的登録 variant を持たず静的クライアント専用なので、認定時のみ
