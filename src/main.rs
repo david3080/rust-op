@@ -89,8 +89,12 @@ async fn main() {
     // 静的 conformance クライアントのシークレットは env から注入する（ソースに平文を残さない）。
     // 未設定時は起動毎のランダム値にフォールバックし、既知シークレットを世に晒さない
     // （= env 未設定の本番では当該クライアントは事実上利用不能になる）。
-    let secret_from_env =
-        |key: &str| std::env::var(key).unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
+    // Client.client_secret には平文でなくハッシュ(dcr::hash_token)だけを保持させる
+    // （DCR発行クライアントと同じ契約。プロセスメモリ上のClientから平文を除く）。
+    let secret_from_env = |key: &str| {
+        let raw = std::env::var(key).unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
+        dcr::hash_token(&raw)
+    };
 
     // demo-rp: public client + PKCE。redirect_uri は内蔵コールバックページ。
     let demo_rp = Client {

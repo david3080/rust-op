@@ -66,6 +66,13 @@ impl ClientAuthMethod for NoneAuth {
 }
 
 /// token_endpoint_auth_method = client_secret_basic。
+///
+/// Client.client_secret は平文ではなく [`crate::dcr::hash_token`] によるハッシュを保持する
+/// 契約（現状これを満たすのは main.rs が読み込み時にハッシュ化する静的クライアントのみ。
+/// `dcr::validate_registration` は private_key_jwt 専用設計で client_secret を発行しない
+/// ため、DCR登録クライアント経由でこの認証方式に到達することは今のところない）。
+/// ここでは提示された secret を同じ関数でハッシュ化してから比較するため、平文の secret が
+/// `Client` 構造体やログに残らない。
 pub struct ClientSecretBasic;
 #[async_trait]
 impl ClientAuthMethod for ClientSecretBasic {
@@ -81,8 +88,9 @@ impl ClientAuthMethod for ClientSecretBasic {
             .resolve_client(id)
             .await
             .ok_or_else(|| OAuthError::InvalidClient(format!("unknown client {id}")))?;
+        let presented_hash = crate::dcr::hash_token(secret);
         match &client.client_secret {
-            Some(s) if secret_eq(s, secret) => Ok(client),
+            Some(stored_hash) if secret_eq(stored_hash, &presented_hash) => Ok(client),
             _ => Err(OAuthError::InvalidClient("bad client secret".into())),
         }
     }
@@ -221,12 +229,15 @@ mod tests {
         Provider::new(ISS)
     }
 
+    /// secret には平文の期待値を渡す。Client.client_secret にはそのハッシュだけを積む
+    /// （本番の main.rs / DCR 発行と同じ契約）。テストコードは平文の secret をそのまま
+    /// Basic 認証の入力に使えばよい。
     fn secret_client(id: &str, secret: &str, method: &str) -> Client {
         Client {
             client_id: id.into(),
             redirect_uris: vec![],
             token_endpoint_auth_method: method.into(),
-            client_secret: Some(secret.into()),
+            client_secret: Some(crate::dcr::hash_token(secret)),
             grant_types: vec![],
             post_logout_redirect_uris: vec![],
             dpop_bound: false,
@@ -260,6 +271,32 @@ mod tests {
             .authenticate(&p, &input(None, None, Some(("ghost", "x"))))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn secret_basic_correct_secret_authenticates() {
+        let p = provider().with_client(secret_client("rp", "hunter2", "client_secret_basic"));
+        let ok = ClientSecretBasic
+            .authenticate(&p, &input(None, None, Some(("rp", "hunter2"))))
+            .await;
+        assert!(ok.is_ok());
+    }
+
+    #[tokio::test]
+    async fn secret_basic_wrong_secret_rejected() {
+        let p = provider().with_client(secret_client("rp", "hunter2", "client_secret_basic"));
+        let err = ClientSecretBasic
+            .authenticate(&p, &input(None, None, Some(("rp", "wrong"))))
+            .await;
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn secret_client_helper_never_stores_plaintext() {
+        // client_secret フィールドには平文でなくハッシュが入る契約そのものを固定する回帰テスト。
+        let c = secret_client("rp", "hunter2", "client_secret_basic");
+        assert_ne!(c.client_secret.as_deref(), Some("hunter2"));
+        assert_eq!(c.client_secret.as_deref(), Some(crate::dcr::hash_token("hunter2").as_str()));
     }
 
     #[tokio::test]
