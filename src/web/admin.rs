@@ -10,10 +10,13 @@ pub(super) async fn require_admin(p: &Provider, jar: &CookieJar) -> Result<Strin
         .firestore
         .as_ref()
         .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "admin console unavailable").into_response())?;
-    if crate::admin_store::is_admin(fs, &account_id).await {
-        Ok(account_id)
-    } else {
-        Err((StatusCode::FORBIDDEN, "admin only").into_response())
+    match crate::admin_store::is_admin(fs, &account_id).await {
+        Ok(true) => Ok(account_id),
+        Ok(false) => Err((StatusCode::FORBIDDEN, "admin only").into_response()),
+        Err(e) => {
+            tracing::error!("require_admin: is_admin check failed for {account_id}: {e}");
+            Err((StatusCode::SERVICE_UNAVAILABLE, "admin check failed").into_response())
+        }
     }
 }
 

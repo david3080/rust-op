@@ -185,10 +185,7 @@ async fn main() {
     let use_firestore =
         std::env::var("K_SERVICE").is_ok() || std::env::var("FIRESTORE_EMULATOR_HOST").is_ok();
     if use_firestore {
-        let project = std::env::var("GCLOUD_PROJECT")
-            .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
-            .unwrap_or_else(|_| "fido2-8b943".into());
-        let fs = std::sync::Arc::new(firestore::Firestore::new(project));
+        let fs = std::sync::Arc::new(firestore::Firestore::new(resolve_project()));
         if std::env::var("K_SERVICE").is_ok() {
         // 署名鍵 ES256: KMS_ES256_KEY があれば Cloud KMS（秘密鍵をプロセスに展開しない）、
         // 無ければ Secret Manager の固定鍵。本番(K_SERVICE)ではどちらからも正規鍵を
@@ -379,10 +376,7 @@ async fn mint_iat(args: &[String]) {
         grants = vec!["authorization_code".into(), "refresh_token".into()];
     }
 
-    let project = std::env::var("GCLOUD_PROJECT")
-        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
-        .unwrap_or_else(|_| "fido2-8b943".into());
-    let fs = firestore::Firestore::new(project);
+    let fs = firestore::Firestore::new(resolve_project());
     let constraints = dcr::IatConstraints {
         allowed_redirect_hosts: hosts.clone(),
         allowed_grant_types: grants.clone(),
@@ -436,6 +430,14 @@ fn fail(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// 管理者用サブコマンド/Firestore配線が使う GCP プロジェクトIDの解決。
+/// GCLOUD_PROJECT → GOOGLE_CLOUD_PROJECT → 既定値("fido2-8b943")の順。
+fn resolve_project() -> String {
+    std::env::var("GCLOUD_PROJECT")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .unwrap_or_else(|_| "fido2-8b943".into())
+}
+
 /// 管理者用クライアント revoke（制御つき DCR）。
 ///
 /// `rust-op revoke-client <client_id>`
@@ -450,10 +452,7 @@ async fn revoke_client(args: &[String]) {
             std::process::exit(2);
         }
     };
-    let project = std::env::var("GCLOUD_PROJECT")
-        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
-        .unwrap_or_else(|_| "fido2-8b943".into());
-    let fs = firestore::Firestore::new(project);
+    let fs = firestore::Firestore::new(resolve_project());
     match dcr_store::revoke_client(&fs, &client_id).await {
         Ok(true) => println!("revoked: {client_id}（新規認可・refresh は即停止、発行済み AT は ≤15 分で失効）"),
         Ok(false) => {
@@ -467,12 +466,15 @@ async fn revoke_client(args: &[String]) {
     }
 }
 
+/// --email の値を、accounts コレクションのキー（web/register.rs が signup 時に
+/// 適用する trim + to_lowercase）と同じ正規化をかけて返す。ここで揃えないと、大文字/
+/// 前後空白混じりのメール指定が accounts/{email} に一致せず「account not found」になる。
 fn parse_email_arg(cmd: &str, args: &[String]) -> String {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--email" {
             if let Some(v) = it.next() {
-                return v.clone();
+                return v.trim().to_lowercase();
             }
         }
     }
@@ -488,23 +490,19 @@ fn parse_email_arg(cmd: &str, args: &[String]) -> String {
 /// 対象は先に passkey 登録済みであること。mint/revoke-client 同様 GCP 内実行前提。
 async fn grant_admin_cmd(args: &[String]) {
     let email = parse_email_arg("grant-admin", args);
-    let project = std::env::var("GCLOUD_PROJECT")
-        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
-        .unwrap_or_else(|_| "fido2-8b943".into());
-    let fs = firestore::Firestore::new(project);
-    let account_id = match registration::get_credential(&fs, &email).await {
-        Ok(Some(c)) => c.account_id,
-        Ok(None) => {
-            eprintln!("grant-admin: account not found: {email}（先に passkey 登録を済ませてください）");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("grant-admin: account lookup failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    let fs = firestore::Firestore::new(resolve_project());
+    let account_id = resolve_account_id("grant-admin", &fs, &email).await;
     match admin_store::grant_admin(&fs, &account_id, "cli").await {
-        Ok(()) => println!("granted: {email} (account_id={account_id})"),
+        Ok(admin_store::GrantAdminResult::Granted) => {
+            println!("granted: {email} (account_id={account_id})")
+        }
+        Ok(admin_store::GrantAdminResult::AlreadyAdmin) => {
+            println!("already admin: {email} (account_id={account_id})")
+        }
+        Ok(admin_store::GrantAdminResult::Conflict) => {
+            eprintln!("grant-admin: 他の書き込みと競合しました。もう一度実行してください: {email}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("grant-admin: 失敗: {e}");
             std::process::exit(1);
@@ -512,26 +510,36 @@ async fn grant_admin_cmd(args: &[String]) {
     }
 }
 
+/// email から account_id を引く（grant-admin/revoke-admin 共通）。
+/// accountId フィールドが空/欠落の壊れたドキュメントを、空文字列の account_id のまま
+/// admin_store へ渡さないようここで弾く（空文字列は他のどのセッションの account_id とも
+/// 一致しないはずだが、不正な入力を admin_store 層まで運ばない防御として明示的に検査する）。
+async fn resolve_account_id(cmd: &str, fs: &firestore::Firestore, email: &str) -> String {
+    let account_id = match registration::get_credential(fs, email).await {
+        Ok(Some(c)) => c.account_id,
+        Ok(None) => {
+            eprintln!("{cmd}: account not found: {email}（先に passkey 登録を済ませてください）");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{cmd}: account lookup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if account_id.trim().is_empty() {
+        eprintln!("{cmd}: account record for {email} has no accountId (破損データの可能性)");
+        std::process::exit(1);
+    }
+    account_id
+}
+
 /// 管理者権限の剥奪。最後の1人は拒否される（[`admin_store::revoke_admin`] 参照）。
 ///
 /// `rust-op revoke-admin --email <email>`
 async fn revoke_admin_cmd(args: &[String]) {
     let email = parse_email_arg("revoke-admin", args);
-    let project = std::env::var("GCLOUD_PROJECT")
-        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
-        .unwrap_or_else(|_| "fido2-8b943".into());
-    let fs = firestore::Firestore::new(project);
-    let account_id = match registration::get_credential(&fs, &email).await {
-        Ok(Some(c)) => c.account_id,
-        Ok(None) => {
-            eprintln!("revoke-admin: account not found: {email}");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("revoke-admin: account lookup failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    let fs = firestore::Firestore::new(resolve_project());
+    let account_id = resolve_account_id("revoke-admin", &fs, &email).await;
     match admin_store::revoke_admin(&fs, &account_id).await {
         Ok(admin_store::RevokeAdminResult::Revoked) => {
             println!("revoked: {email} (account_id={account_id})")
@@ -542,6 +550,10 @@ async fn revoke_admin_cmd(args: &[String]) {
         }
         Ok(admin_store::RevokeAdminResult::LastAdminGuard) => {
             eprintln!("revoke-admin: 拒否: 最後の管理者は剥奪できません: {email}");
+            std::process::exit(1);
+        }
+        Ok(admin_store::RevokeAdminResult::Conflict) => {
+            eprintln!("revoke-admin: 他の書き込みと競合しました。もう一度実行してください: {email}");
             std::process::exit(1);
         }
         Err(e) => {
