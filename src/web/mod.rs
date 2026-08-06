@@ -21,6 +21,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::Instrument;
 use uuid::Uuid;
 
+mod admin;
 mod ciba;
 mod login;
 mod oidc;
@@ -33,6 +34,14 @@ const SID_COOKIE: &str = "sid";
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// sid cookie からログイン済み account_id を引く（SSO セッション）。
+/// OAuth の access token 認証（authenticate_token）とは別系統: ブラウザの画面系
+/// エンドポイント（CIBA 承認画面・管理画面）が使う。
+async fn session_account(p: &Provider, jar: &CookieJar) -> Option<String> {
+    let sid = jar.get(SID_COOKIE)?.value().to_string();
+    p.store.get_session(&sid).await.map(|s| s.account_id)
 }
 
 /// FIDO2 Conformance 用の /fido/* エンドポイントを公開するか。テスト専用。
@@ -88,6 +97,8 @@ pub fn router(provider: Provider) -> Router {
         .route("/ciba/{auth_req_id}/passkey-options", post(ciba::ciba_approve_options))
         .route("/ciba/{auth_req_id}/approve", post(ciba::ciba_approve))
         .route("/ciba/{auth_req_id}/reject", post(ciba::ciba_reject))
+        // 管理者向け（sid セッション + admins/{account_id} の存在で判定）。
+        .route("/admin/whoami", get(admin::whoami))
         // メール確認つきユーザー登録（Web HTML フロー + ネイティブ JSON API）。
         // OAuth の「クライアント登録(DCR)」と区別するため /signup/* に置く。
         .route("/signup", get(register::register_form).post(register::register_submit))

@@ -1,10 +1,5 @@
 use super::*;
 
-async fn session_account(p: &Provider, jar: &CookieJar) -> Option<String> {
-    let sid = jar.get(SID_COOKIE)?.value().to_string();
-    p.store.get_session(&sid).await.map(|s| s.account_id)
-}
-
 /// プロフィール画面のポーリング用: 自分宛の pending CIBA 依頼一覧（access token 認証）。
 pub(super) async fn ciba_pending_list(State(p): State<Arc<Provider>>, headers: HeaderMap) -> Response {
     let at = match authenticate_token(&p, &headers, "GET", "/ciba/pending", None).await {

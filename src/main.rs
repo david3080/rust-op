@@ -3,6 +3,7 @@
 // from_utf8_unchecked を使うため、cargo kani 時だけ forbid を外す。
 #![cfg_attr(not(kani), forbid(unsafe_code))]
 
+mod admin_store;
 mod auth_checks;
 mod ciba;
 mod claims;
@@ -56,6 +57,14 @@ async fn main() {
         }
         Some("revoke-client") => {
             revoke_client(&argv[2..]).await;
+            return;
+        }
+        Some("grant-admin") => {
+            grant_admin_cmd(&argv[2..]).await;
+            return;
+        }
+        Some("revoke-admin") => {
+            revoke_admin_cmd(&argv[2..]).await;
             return;
         }
         _ => {}
@@ -453,6 +462,90 @@ async fn revoke_client(args: &[String]) {
         }
         Err(e) => {
             eprintln!("revoke-client: 失敗: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_email_arg(cmd: &str, args: &[String]) -> String {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--email" {
+            if let Some(v) = it.next() {
+                return v.clone();
+            }
+        }
+    }
+    eprintln!("{cmd}: usage: rust-op {cmd} --email <email>");
+    std::process::exit(2);
+}
+
+/// 管理者権限の付与（初回シード含む）。
+///
+/// `rust-op grant-admin --email <email>`
+///
+/// accounts/{email} から account_id を引いて admins/{account_id} に書く（[`admin_store::grant_admin`]）。
+/// 対象は先に passkey 登録済みであること。mint/revoke-client 同様 GCP 内実行前提。
+async fn grant_admin_cmd(args: &[String]) {
+    let email = parse_email_arg("grant-admin", args);
+    let project = std::env::var("GCLOUD_PROJECT")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .unwrap_or_else(|_| "fido2-8b943".into());
+    let fs = firestore::Firestore::new(project);
+    let account_id = match registration::get_credential(&fs, &email).await {
+        Ok(Some(c)) => c.account_id,
+        Ok(None) => {
+            eprintln!("grant-admin: account not found: {email}（先に passkey 登録を済ませてください）");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("grant-admin: account lookup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    match admin_store::grant_admin(&fs, &account_id, "cli").await {
+        Ok(()) => println!("granted: {email} (account_id={account_id})"),
+        Err(e) => {
+            eprintln!("grant-admin: 失敗: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 管理者権限の剥奪。最後の1人は拒否される（[`admin_store::revoke_admin`] 参照）。
+///
+/// `rust-op revoke-admin --email <email>`
+async fn revoke_admin_cmd(args: &[String]) {
+    let email = parse_email_arg("revoke-admin", args);
+    let project = std::env::var("GCLOUD_PROJECT")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .unwrap_or_else(|_| "fido2-8b943".into());
+    let fs = firestore::Firestore::new(project);
+    let account_id = match registration::get_credential(&fs, &email).await {
+        Ok(Some(c)) => c.account_id,
+        Ok(None) => {
+            eprintln!("revoke-admin: account not found: {email}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("revoke-admin: account lookup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    match admin_store::revoke_admin(&fs, &account_id).await {
+        Ok(admin_store::RevokeAdminResult::Revoked) => {
+            println!("revoked: {email} (account_id={account_id})")
+        }
+        Ok(admin_store::RevokeAdminResult::NotAdmin) => {
+            eprintln!("revoke-admin: not an admin: {email}");
+            std::process::exit(1);
+        }
+        Ok(admin_store::RevokeAdminResult::LastAdminGuard) => {
+            eprintln!("revoke-admin: 拒否: 最後の管理者は剥奪できません: {email}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("revoke-admin: 失敗: {e}");
             std::process::exit(1);
         }
     }
