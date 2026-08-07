@@ -139,6 +139,7 @@ mod tests {
         IatConstraints {
             allowed_redirect_hosts: vec!["rp.example.com".into()],
             allowed_grant_types: vec!["authorization_code".into()],
+            profile: crate::dcr::ClientProfile::ConfidentialKey,
         }
     }
 

@@ -219,6 +219,52 @@ async fn login_discoverable(p: &Arc<Provider>, account_id: &str, key: &SigningKe
     );
 }
 
+/// DCR登録エンドポイント(oidc::register)が ConfidentialSecret プロファイルの IAT を
+/// 正しく処理し、生成した client_secret をレスポンスへ一度だけ平文で載せつつ、
+/// Firestore にはハッシュのみを保存することを実HTTPハンドラ経由で検証する。
+/// dcr.rs の単体テストは validate_registration の戻り値を直接見るのみで、
+/// raw_client_secret が register() ハンドラ経由で実際に配線されているかは見ていなかった。
+#[tokio::test]
+#[ignore]
+async fn register_confidential_secret_returns_raw_secret_once() {
+    let p = test_provider();
+    let fs = p.firestore.as_ref().unwrap();
+
+    let constraints = crate::dcr::IatConstraints {
+        allowed_redirect_hosts: vec!["rp.example.com".into()],
+        allowed_grant_types: vec!["authorization_code".into()],
+        profile: crate::dcr::ClientProfile::ConfidentialSecret,
+    };
+    let (raw_iat, iat_hash) = crate::dcr::gen_random_token();
+    let expires_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+    crate::dcr_store::put_iat(fs, &iat_hash, &constraints, expires_at, false).await.unwrap();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, format!("Bearer {raw_iat}").parse().unwrap());
+    let body = json!({ "redirect_uris": ["https://rp.example.com/cb"] }).to_string();
+
+    let resp = oidc::register(State(p.clone()), headers, body).await;
+    let status = resp.status();
+    let resp_body = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "register failed: {resp_body:?}");
+    assert_eq!(resp_body["token_endpoint_auth_method"], "client_secret_basic");
+    assert_eq!(resp_body["client_secret_expires_at"], 0);
+    let raw_secret = resp_body["client_secret"]
+        .as_str()
+        .expect("ConfidentialSecretはclient_secretを平文で返す");
+
+    // 保存されているのはハッシュのみ(レスポンスで返した平文そのものではない)。
+    let client_id = resp_body["client_id"].as_str().unwrap();
+    let stored = crate::dcr_store::load_client(fs, client_id)
+        .await
+        .expect("client should be saved");
+    assert_eq!(
+        stored.client_secret.as_deref(),
+        Some(crate::dcr::hash_token(raw_secret).as_str())
+    );
+    assert_ne!(stored.client_secret.as_deref(), Some(raw_secret));
+}
+
 #[tokio::test]
 #[ignore]
 async fn register_then_login_uses_account_id_not_email() {

@@ -763,8 +763,11 @@ pub(super) async fn userinfo_post(State(p): State<Arc<Provider>>, headers: Heade
 
 /* ===== Dynamic Client Registration (RFC 7591, IAT 制御つき) ===== */
 
-/// POST /oauth/register。Initial Access Token(Bearer) を単回消費し、制約内の
-/// private_key_jwt クライアントを Firestore に登録する。
+/// POST /oauth/register。Initial Access Token(Bearer) を単回消費し、制約内のクライアントを
+/// Firestore に登録する。認証方式(token_endpoint_auth_method)は RP のリクエストではなく
+/// IAT に埋め込まれた [`crate::dcr::ClientProfile`] で決まる（Public/ConfidentialSecret/
+/// ConfidentialKey）。ConfidentialSecret の場合のみ、生成した client_secret を登録
+/// レスポンスへ一度だけ平文で載せる（保存は常にハッシュのみ）。
 ///
 /// 消費順序: peek(削除しない) → 期限 → validate → consume_iat(CAS 削除=単回) →
 /// save_client。検証失敗では IAT を消費しないので RP はメタデータを直して再試行できる。
@@ -851,11 +854,12 @@ pub(super) async fn register(
     };
 
     let client_id = format!("dcr-{}", uuid::Uuid::new_v4().simple());
-    let client = match crate::dcr::validate_registration(&client_id, &req, &iat.constraints) {
-        Ok(c) => c,
+    let outcome = match crate::dcr::validate_registration(&client_id, &req, &iat.constraints) {
+        Ok(o) => o,
         // 検証失敗では IAT を消費しない（メタデータ修正後に再試行可能）。
         Err(e) => return dcr_error(StatusCode::BAD_REQUEST, e.code(), &e.description()),
     };
+    let client = outcome.client;
 
     // 単回消費: 検証成功後にだけ CAS 削除する。負け＝並行/再利用なので拒否。
     // reusable IAT は消費せず残す（期限内は再登録可能。conformance 専用）。
@@ -886,7 +890,7 @@ pub(super) async fn register(
     (
         StatusCode::CREATED,
         [(header::CACHE_CONTROL, "no-store")],
-        Json(register_response(&client)),
+        Json(register_response(&client, outcome.raw_client_secret.as_deref())),
     )
         .into_response()
 }
@@ -908,7 +912,10 @@ fn json_string_array(v: &serde_json::Value, key: &str) -> Vec<String> {
 }
 
 /// RFC 7591 §3.2.1 client information response（登録済みメタデータをエコー）。
-fn register_response(c: &crate::model::Client) -> serde_json::Value {
+/// raw_client_secret は ConfidentialSecret プロファイルの場合のみ Some
+/// （登録レスポンスに一度だけ平文を載せる。RFC 7591 §3.2.1 の client_secret）。
+/// Client 自体にはハッシュしか無いので、平文はここで別に受け取る。
+fn register_response(c: &crate::model::Client, raw_client_secret: Option<&str>) -> serde_json::Value {
     let mut resp = serde_json::json!({
         "client_id": c.client_id,
         "client_id_issued_at": now(),
@@ -919,6 +926,12 @@ fn register_response(c: &crate::model::Client) -> serde_json::Value {
     });
     if let Some(uri) = &c.jwks_uri {
         resp["jwks_uri"] = serde_json::json!(uri);
+    }
+    if let Some(secret) = raw_client_secret {
+        resp["client_secret"] = serde_json::json!(secret);
+        // RFC 7591 §3.2.1: client_secret を返す場合は必須。secret のローテーション/失効を
+        // 実装していないため 0（=失効しない）で固定する。
+        resp["client_secret_expires_at"] = serde_json::json!(0);
     }
     resp
 }

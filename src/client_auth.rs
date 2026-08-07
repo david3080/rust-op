@@ -67,10 +67,10 @@ impl ClientAuthMethod for NoneAuth {
 
 /// token_endpoint_auth_method = client_secret_basic。
 ///
-/// Client.client_secret は平文ではなく [`crate::dcr::hash_token`] によるハッシュを保持する
-/// 契約（現状これを満たすのは main.rs が読み込み時にハッシュ化する静的クライアントのみ。
-/// `dcr::validate_registration` は private_key_jwt 専用設計で client_secret を発行しない
-/// ため、DCR登録クライアント経由でこの認証方式に到達することは今のところない）。
+/// Client.client_secret は平文ではなく [`crate::dcr::hash_token`] によるハッシュを保持する契約。
+/// main.rs の静的クライアントは読み込み時にハッシュ化し、DCR の ConfidentialSecret プロファイル
+/// (`dcr::validate_registration`) は生成した secret を登録レスポンスで一度だけ平文で返しつつ
+/// 保存はハッシュのみ行う——経路は違っても「平文は Client 構造体に残らない」契約は共通。
 /// ここでは提示された secret を同じ関数でハッシュ化してから比較するため、平文の secret が
 /// `Client` 構造体やログに残らない。
 pub struct ClientSecretBasic;

@@ -342,7 +342,12 @@ async fn main() {
 
 /// 管理者用 Initial Access Token 発行（制御つき DCR）。
 ///
-/// `rust-op mint --redirect-host <host> [--redirect-host ...] [--grant <gt> ...] [--ttl-hours N]`
+/// `rust-op mint --redirect-host <host> [--redirect-host ...] [--grant <gt> ...]
+///     [--profile public|confidential-secret|confidential-key] [--ttl-hours N]`
+///
+/// --profile は発行するクライアントの認証方式を固定する（省略時 confidential-key = 従来唯一の
+/// 挙動、private_key_jwt/FAPI2相当）。RP 側がリクエストで選ぶものではない——弱いプロファイルへの
+/// 自己ダウングレードを防ぐため、管理者が mint 時に決める（[`dcr::ClientProfile`] 参照）。
 ///
 /// Firestore へは Cloud Run のメタデータ SA で書くため **GCP 内（Cloud Run job 等）での実行を前提**
 /// にする。生 IAT は stdout に一度だけ出すが、**この出力は実行ジョブのログ(Cloud Logging)に残る**。
@@ -352,6 +357,7 @@ async fn mint_iat(args: &[String]) {
     let mut grants: Vec<String> = vec![];
     let mut ttl_hours: u64 = 24;
     let mut reusable = false;
+    let mut profile = dcr::ClientProfile::ConfidentialKey;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -362,6 +368,12 @@ async fn mint_iat(args: &[String]) {
             "--grant" => match it.next() {
                 Some(v) => grants.push(v.clone()),
                 None => fail("--grant needs a value"),
+            },
+            "--profile" => match it.next().map(String::as_str) {
+                Some("public") => profile = dcr::ClientProfile::Public,
+                Some("confidential-secret") => profile = dcr::ClientProfile::ConfidentialSecret,
+                Some("confidential-key") => profile = dcr::ClientProfile::ConfidentialKey,
+                _ => fail("--profile needs one of: public, confidential-secret, confidential-key"),
             },
             "--ttl-hours" => match it.next().and_then(|v| v.parse().ok()) {
                 Some(n) => ttl_hours = n,
@@ -384,8 +396,9 @@ async fn mint_iat(args: &[String]) {
     let constraints = dcr::IatConstraints {
         allowed_redirect_hosts: hosts.clone(),
         allowed_grant_types: grants.clone(),
+        profile,
     };
-    let (raw, hash) = dcr::gen_initial_access_token();
+    let (raw, hash) = dcr::gen_random_token();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -397,6 +410,7 @@ async fn mint_iat(args: &[String]) {
     }
     println!("initial_access_token:   {raw}");
     println!("token_hash:             {hash}");
+    println!("profile:                {profile:?}");
     println!("allowed_redirect_hosts: {}", hosts.join(", "));
     println!("allowed_grant_types:    {}", grants.join(", "));
     println!("expires_at:             {expires_at} (epoch, +{ttl_hours}h)");
