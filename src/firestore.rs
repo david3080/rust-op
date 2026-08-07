@@ -5,6 +5,10 @@
 //! 慣習に従いエミュレータへ向く（`firebase emulators:start --only firestore` 等が export する
 //! 値をそのまま使える）。エミュレータ実行時は metadata サーバへは一切アクセスしない
 //! （ローカルに metadata サーバは存在せず、実 GCP にも絶対に飛ばさないための分岐）。
+//!
+//! `FIRESTORE_DATABASE_ID`（例: `staging`）が設定されていれば、`(default)` ではなく
+//! その名前付きデータベースへ向く。本番と検証環境で同一プロジェクト内の別データベースを
+//! 使い分け、staging での動作確認が本番データに一切触れないようにするための分離。
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -13,6 +17,7 @@ use std::time::{Duration, Instant};
 
 pub struct Firestore {
     project: String,
+    database: String,
     http: reqwest::Client,
     token: Mutex<Option<(String, Instant)>>,
     emulator_host: Option<String>,
@@ -109,10 +114,24 @@ fn enc(id: &str) -> String {
         .collect()
 }
 
+/// 空文字列(未設定同然)を "(default)" へフォールバックせず素通しすると databases// の
+/// ような壊れた URL になり全リクエストが失敗するため、空も未設定扱いにする。
+/// env を直接読まない純粋関数にしているのは、値を変えたテストで set_var（並行テスト間で
+/// 競合する）を使わずに済ませるため。
+fn resolve_database(raw: Result<String, std::env::VarError>) -> String {
+    raw.ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "(default)".into())
+}
+
 impl Firestore {
     pub fn new(project: impl Into<String>) -> Self {
+        let project = project.into();
+        let database = resolve_database(std::env::var("FIRESTORE_DATABASE_ID"));
+        // grant-admin 等の管理系CLIは起動が一瞬で終わり tracing 初期化前に走るため、
+        // どの project/database へ書き込んだかが分かる唯一の手段として常に出す。
+        eprintln!("firestore: project={project} database={database}");
         Self {
-            project: project.into(),
+            project,
+            database,
             http: reqwest::Client::new(),
             token: Mutex::new(None),
             emulator_host: std::env::var("FIRESTORE_EMULATOR_HOST").ok(),
@@ -125,6 +144,7 @@ impl Firestore {
     pub(crate) fn new_for_test(project: impl Into<String>, emulator_host: impl Into<String>) -> Self {
         Self {
             project: project.into(),
+            database: "(default)".into(),
             http: reqwest::Client::new(),
             token: Mutex::new(None),
             emulator_host: Some(emulator_host.into()),
@@ -184,9 +204,10 @@ impl Firestore {
     // この URL を使う送受信エラーは必ず `e.without_url()` でログから ID を落とす。
     fn doc_url(&self, col: &str, id: &str) -> String {
         format!(
-            "{}/v1/projects/{}/databases/(default)/documents/{}/{}",
+            "{}/v1/projects/{}/databases/{}/documents/{}/{}",
             self.base_url(),
             self.project,
+            self.database,
             col,
             enc(id),
         )
@@ -355,9 +376,10 @@ impl Firestore {
     ) -> Result<Vec<(String, Value)>, String> {
         let tok = self.token().await?;
         let url = format!(
-            "{}/v1/projects/{}/databases/(default)/documents:runQuery",
+            "{}/v1/projects/{}/databases/{}/documents:runQuery",
             self.base_url(),
-            self.project
+            self.project,
+            self.database
         );
         let body = json!({
             "structuredQuery": {
@@ -638,6 +660,13 @@ pub(crate) mod fake_firestore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_database_falls_back_on_missing_or_empty() {
+        assert_eq!(resolve_database(Err(std::env::VarError::NotPresent)), "(default)");
+        assert_eq!(resolve_database(Ok(String::new())), "(default)");
+        assert_eq!(resolve_database(Ok("staging".into())), "staging");
+    }
 
     #[test]
     fn base_url_defaults_to_real_firestore_when_env_unset() {
