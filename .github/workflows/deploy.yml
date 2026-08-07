@@ -6,13 +6,19 @@ on:
   push:
     branches: [main]
 
+# 連続 push でジョブが並行動作すると、promote 承認待ちの間に後続 push が staging を
+# 上書きし、レビュアーが確認したものと違うビルドが昇格されうる。キューイングして
+# 常に1本ずつ処理する（実行中のものを kill はしない）。
+concurrency:
+  group: rust-op-deploy
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 env:
-  PROJECT_ID: fido2-8b943
+  PROJECT: fido2-8b943
   REGION: asia-northeast1
-  SERVICE: rust-op
   # 非機密の識別子。リポジトリの Settings > Secrets and variables > Actions > Variables で管理。
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
   DEPLOY_SERVICE_ACCOUNT: ${{ vars.SERVICE_ACCOUNT_EMAIL }}
@@ -29,24 +35,21 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  # ビルド + no-traffic デプロイ + タグ付き URL へのスモークテストのみ。
-  # 本番トラフィックには一切影響しない。
-  deploy-candidate:
+  # rust-op-staging (test.sonrisa.co.jp) へ100%トラフィックでビルド+デプロイし、
+  # 機械的なスモークテストを行う。WebAuthn/passkeyの実機確認は人間がこのURLに対して行う
+  # （promote の手動承認ゲートが、それが済んだことの証跡になる）。
+  deploy-staging:
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     outputs:
-      tag: ${{ steps.vars.outputs.tag }}
-      candidate_url: ${{ steps.deploy.outputs.candidate_url }}
+      staging_image: ${{ steps.deploy.outputs.staging_image }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-
-      - id: vars
-        run: echo "tag=rev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - id: auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -59,36 +62,20 @@ jobs:
       - id: deploy
         run: |
           set -euo pipefail
-          gcloud run deploy "$SERVICE" \
-            --source . \
-            --region "$REGION" \
-            --project "$PROJECT_ID" \
-            --no-traffic \
-            --tag "${{ steps.vars.outputs.tag }}" \
-            --quiet
-          base_url=$(gcloud run services describe "$SERVICE" \
-            --region "$REGION" --project "$PROJECT_ID" \
-            --format="value(status.address.url)")
-          host="${base_url#https://}"
-          echo "candidate_url=https://${{ steps.vars.outputs.tag }}---${host}" >> "$GITHUB_OUTPUT"
+          # コマンド置換で丸ごと出力を溜め込むと、失敗時にgcloudのビルドログ等が
+          # CIログへ一切出ないままステップが落ちるため、tee で流しつつ抽出する。
+          bash scripts/deploy_staging.sh --apply | tee /tmp/deploy_staging.log
+          echo "staging_image=$(grep '^STAGING_IMAGE=' /tmp/deploy_staging.log | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke test candidate revision (traffic 0%)
-        run: |
-          set -euo pipefail
-          url="${{ steps.deploy.outputs.candidate_url }}"
-          for path in "/oidc/.well-known/openid-configuration" "/oidc/jwks"; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "${url}${path}")
-            if [[ "$code" != "200" ]]; then
-              echo "smoke test failed: ${path} -> ${code}"
-              exit 1
-            fi
-            echo "ok: ${path} -> ${code}"
-          done
+      - name: Cleanup old images and revisions
+        run: bash scripts/cleanup_cloud_run.sh --apply
 
   # 本番昇格。production Environment の Required reviewers による手動承認を
-  # 通過するまで実行されない（passkey ログインの実機確認はここで人手が行う）。
+  # 通過するまで実行されない（passkey ログインの実機確認は staging 側で人手が行う）。
+  # 再ビルドはせず、staging で検証済みのイメージをそのまま本番へ、本番の(入れ替え前の)
+  # イメージをそのまま staging へデプロイする（scripts/promote.sh）。
   promote:
-    needs: deploy-candidate
+    needs: deploy-staging
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -106,17 +93,9 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
-      - name: Promote traffic to candidate revision
+      - name: Promote staging image to production, swap previous production onto staging
         run: |
-          gcloud run services update-traffic "$SERVICE" \
-            --region "$REGION" \
-            --project "$PROJECT_ID" \
-            --to-tags "${{ needs.deploy-candidate.outputs.tag }}=100"
+          bash scripts/promote.sh --apply --staging-image "${{ needs.deploy-staging.outputs.staging_image }}"
 
       - name: Cleanup old images and revisions
-        env:
-          PROJECT: fido2-8b943
-          REGION: asia-northeast1
-          SERVICE: rust-op
-          IMAGE: asia-northeast1-docker.pkg.dev/fido2-8b943/cloud-run-source-deploy/rust-op
         run: bash scripts/cleanup_cloud_run.sh --apply
