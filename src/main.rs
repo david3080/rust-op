@@ -91,6 +91,10 @@ async fn main() {
             enable_account_cmd(&argv[2..]).await;
             return;
         }
+        Some("migrate-static-clients") => {
+            migrate_static_clients_cmd(&argv[2..]).await;
+            return;
+        }
         _ => {}
     }
 
@@ -110,79 +114,16 @@ async fn main() {
         dcr::hash_token(&raw)
     };
 
-    // demo-rp: public client + PKCE。redirect_uri は内蔵コールバックページ。
-    let demo_rp = Client {
-        client_id: "demo-rp".into(),
-        redirect_uris: vec![format!("{issuer}/callback")],
-        post_logout_redirect_uris: vec![format!("{issuer}/")],
-        token_endpoint_auth_method: "none".into(),
-        client_secret: None,
-        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
-        dpop_bound: true,
-        jwks: vec![],
-            jwks_uri: None,
-        require_par: false,
-        require_pkce: false,
-        id_token_signed_response_alg: None,
-    };
-
-    // Flutter ネイティブアプリ fido2demo（public + PKCE, custom scheme, DPoP）。
-    let mobile_rp = Client {
-        client_id: "mobile-rp".into(),
-        redirect_uris: vec!["jp.co.sonrisa.fido2demo://callback".into()],
-        post_logout_redirect_uris: vec!["jp.co.sonrisa.fido2demo://logout".into()],
-        token_endpoint_auth_method: "none".into(),
-        client_secret: None,
-        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
-        dpop_bound: true,
-        jwks: vec![],
-            jwks_uri: None,
-        require_par: false,
-        require_pkce: false,
-        id_token_signed_response_alg: None,
-    };
-
-    // CIBA Consumption Device 用クライアント（poll, client_secret_basic）。
-    let ciba_rp = Client {
-        client_id: "ciba-rp".into(),
-        redirect_uris: vec![],
-        post_logout_redirect_uris: vec![],
-        token_endpoint_auth_method: "client_secret_basic".into(),
-        client_secret: Some(secret_from_env("CIBA_RP_SECRET")),
-        grant_types: vec!["urn:openid:params:grant-type:ciba".into()],
-        dpop_bound: false,
-        jwks: vec![],
-            jwks_uri: None,
-        require_par: false,
-        require_pkce: false,
-        id_token_signed_response_alg: None,
-    };
-
-    // qm-rp: FAPI 2.0 厳格設定を満たせない外部 RP 用の静的クライアント
-    // （client_secret_basic + PKCE のみ。PAR/DPoP は非対応）。
-    let qm_rp = Client {
-        client_id: "qm-rp".into(),
-        redirect_uris: vec!["http://127.0.0.1:8082/auth/callback".into()],
-        post_logout_redirect_uris: vec!["http://127.0.0.1:8082/".into()],
-        token_endpoint_auth_method: "client_secret_basic".into(),
-        client_secret: Some(secret_from_env("QM_RP_SECRET")),
-        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
-        dpop_bound: false,
-        jwks: vec![],
-        jwks_uri: None,
-        require_par: false,
-        require_pkce: true, // qm は S256 を送るので有効化できる
-        id_token_signed_response_alg: None,
-    };
-
     // demo-rp / mobile-rp / ciba-rp / qm-rp は実アプリ用で常時登録。
     // ciba-rp は実 CIBA バックエンド（client_secret_basic, DPoP 任意）。
-    let mut provider = Provider::new(issuer.clone())
-        .with_base_path(base_path.clone())
-        .with_client(demo_rp)
-        .with_client(mobile_rp)
-        .with_client(ciba_rp)
-        .with_client(qm_rp);
+    let mut provider = Provider::new(issuer.clone()).with_base_path(base_path.clone());
+    for c in static_app_clients(
+        &issuer,
+        secret_from_env("CIBA_RP_SECRET"),
+        secret_from_env("QM_RP_SECRET"),
+    ) {
+        provider = provider.with_client(c);
+    }
 
     // FAPI2 conformance 用の静的クライアント（fapi-1 = client / fapi-2 = client2）。
     // FAPI 認定スイートは動的登録 variant を持たず静的クライアント専用なので、認定時のみ
@@ -432,6 +373,77 @@ async fn mint_iat(args: &[String]) {
     eprintln!("注意: 生トークンの表示は一度だけ。この出力は Cloud Logging に残ります。");
 }
 
+/// demo-rp/mobile-rp/ciba-rp/qm-rp の定義。main() の起動時登録
+/// (Step5 完了後は削除予定) と migrate_static_clients_cmd の両方から参照する単一の
+/// 定義源（定義がずれると、移行後 Firestore 上のクライアントとここの記憶が食い違う）。
+/// ciba_rp_secret_hash/qm_rp_secret_hash は既にハッシュ済み（dcr::hash_token通過後）の
+/// 値を渡すこと（ここでは平文を一切扱わない）。
+fn static_app_clients(issuer: &str, ciba_rp_secret_hash: String, qm_rp_secret_hash: String) -> Vec<Client> {
+    vec![
+        // demo-rp: public client + PKCE。redirect_uri は内蔵コールバックページ。
+        Client {
+            client_id: "demo-rp".into(),
+            redirect_uris: vec![format!("{issuer}/callback")],
+            post_logout_redirect_uris: vec![format!("{issuer}/")],
+            token_endpoint_auth_method: "none".into(),
+            client_secret: None,
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+            dpop_bound: true,
+            jwks: vec![],
+            jwks_uri: None,
+            require_par: false,
+            require_pkce: false,
+            id_token_signed_response_alg: None,
+        },
+        // Flutter ネイティブアプリ fido2demo（public + PKCE, custom scheme, DPoP）。
+        Client {
+            client_id: "mobile-rp".into(),
+            redirect_uris: vec!["jp.co.sonrisa.fido2demo://callback".into()],
+            post_logout_redirect_uris: vec!["jp.co.sonrisa.fido2demo://logout".into()],
+            token_endpoint_auth_method: "none".into(),
+            client_secret: None,
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+            dpop_bound: true,
+            jwks: vec![],
+            jwks_uri: None,
+            require_par: false,
+            require_pkce: false,
+            id_token_signed_response_alg: None,
+        },
+        // CIBA Consumption Device 用クライアント（poll, client_secret_basic）。
+        Client {
+            client_id: "ciba-rp".into(),
+            redirect_uris: vec![],
+            post_logout_redirect_uris: vec![],
+            token_endpoint_auth_method: "client_secret_basic".into(),
+            client_secret: Some(ciba_rp_secret_hash),
+            grant_types: vec!["urn:openid:params:grant-type:ciba".into()],
+            dpop_bound: false,
+            jwks: vec![],
+            jwks_uri: None,
+            require_par: false,
+            require_pkce: false,
+            id_token_signed_response_alg: None,
+        },
+        // qm-rp: FAPI 2.0 厳格設定を満たせない外部 RP 用の静的クライアント
+        // （client_secret_basic + PKCE のみ。PAR/DPoP は非対応）。
+        Client {
+            client_id: "qm-rp".into(),
+            redirect_uris: vec!["http://127.0.0.1:8082/auth/callback".into()],
+            post_logout_redirect_uris: vec!["http://127.0.0.1:8082/".into()],
+            token_endpoint_auth_method: "client_secret_basic".into(),
+            client_secret: Some(qm_rp_secret_hash),
+            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+            dpop_bound: false,
+            jwks: vec![],
+            jwks_uri: None,
+            require_par: false,
+            require_pkce: true, // qm は S256 を送るので有効化できる
+            id_token_signed_response_alg: None,
+        },
+    ]
+}
+
 /// FAPI conformance クライアントを env から組む。`{prefix}_X` `{prefix}_Y` `{prefix}_KID`
 /// が全て揃っていれば Some。揃っていなければ None（= 本番で未登録）。
 /// redirect は認定スイートの alias コールバック固定（`CONFORMANCE_FAPI_CALLBACK` で上書き可）。
@@ -654,5 +666,125 @@ async fn enable_account_cmd(args: &[String]) {
             eprintln!("enable-account: 失敗: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// 環境変数を必須として取得する。未設定/空でもフォールバックしない
+/// （migrate_static_clients_cmd 専用。ORIGIN が未設定のまま実行すると、
+/// main() 自体はローカル開発向けに `http://localhost:8080` へ静かにフォールバックするが、
+/// 移行コマンドでこれをやると誤った redirect_uris を本番Firestoreへ永続化してしまう。
+/// dcr_store::save_client は create_if_absent のため、後から静かに上書き修正することもできず
+/// 手動削除が要る事故になる。フォールバックせず即座に失敗させ、正しい値を明示させる）。
+fn require_env(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "migrate-static-clients: 環境変数 {name} が必要です（未設定時のフォールバックは行いません）"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Secret Manager から取得したclient_secretをハッシュ化する。取得できた値がたまたま
+/// 同名の環境変数にも設定されていれば一致を確認する: 本コマンドはSecret Managerを直接
+/// 読むが、main() のサーバ起動パスは Cloud Run の env 注入(secretKeyRef)経由で同じ
+/// Secretを読む。両者の取得経路が食い違うと、静的登録を削除した後に client_secret_basic
+/// 認証が音もなく壊れる(save_client は create_if_absent のため事後修正もFirestore側の
+/// 手動削除が要る)。ローカル実行では通常env var未設定なので、その場合はSecret Manager
+/// の値をそのまま信頼する。
+async fn secret_hash_from_manager_verified(fs: &firestore::Firestore, name: &'static str) -> String {
+    let raw = match fs.access_secret(name).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            eprintln!("migrate-static-clients: Secret Manager に {name} が見つかりません");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("migrate-static-clients: {name} の取得に失敗: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Ok(env_val) = std::env::var(name) {
+        if env_val != raw {
+            eprintln!(
+                "migrate-static-clients: 環境変数 {name} と Secret Manager の値が一致しません。どちらが正か確認してください。"
+            );
+            std::process::exit(1);
+        }
+    }
+    dcr::hash_token(&raw)
+}
+
+/// 静的登録されている demo-rp/mobile-rp/ciba-rp/qm-rp を Firestore(clients/)へ一度きり移行する
+/// (Step5)。実行後、resolve_client は静的Map(main()の登録)→Firestoreの順にフォールバックする
+/// ため、この移行が完了していれば main() 側の .with_client 登録を安全に削除できる
+/// （削除は移行の成功確認後、別途行う）。
+///
+/// client_secret は Secret Manager の CIBA_RP_SECRET/QM_RP_SECRET の**現在値**をハッシュ化して
+/// 保存する（新規生成しない。既存の外部RP統合(QM等)のsecretをローテーションさせないため）。
+///
+/// ドライランは Firestore の現状（各client_idが既にあるか）だけ確認する。Secret Manager
+/// へは触れないため、Secret Manager の IAM 権限が無くても事前確認できる。
+///
+/// `rust-op migrate-static-clients`          # ドライラン
+/// `rust-op migrate-static-clients --apply`  # 実行
+///
+/// dcr_store::save_client は create_if_absent なので、既に移行済みのclient_idに対する
+/// 再実行は上書きせずエラーになる（静かな上書きを防ぐ。再移行したい場合はFirestore側の
+/// ドキュメントを先に削除すること）。書き込み後は即座に読み戻して意図通りの内容が
+/// 保存されたか検証する。1件でも失敗・不一致があれば exit(1) する
+/// （eprintln だけで exit 0 のままだと、これを起点に静的登録を削除する後続作業が
+/// 「全件成功した」と誤認して本番の認証を壊しかねない）。
+async fn migrate_static_clients_cmd(args: &[String]) {
+    let apply = args.iter().any(|a| a == "--apply");
+    let fs = firestore::Firestore::new(resolve_project());
+
+    if !apply {
+        println!("[dry-run] project={}", fs.project());
+        for id in ["demo-rp", "mobile-rp", "ciba-rp", "qm-rp"] {
+            let status = if dcr_store::load_client(&fs, id).await.is_some() {
+                "既にFirestoreに存在（--apply はこの client_id をエラーにします）"
+            } else {
+                "未移行（--apply で移行されます）"
+            };
+            println!("  {id}: {status}");
+        }
+        return;
+    }
+
+    let origin = require_env("ORIGIN");
+    let base_path = std::env::var("BASE_PATH").unwrap_or_default();
+    let issuer = format!("{origin}{base_path}");
+    let ciba_rp_secret_hash = secret_hash_from_manager_verified(&fs, "CIBA_RP_SECRET").await;
+    let qm_rp_secret_hash = secret_hash_from_manager_verified(&fs, "QM_RP_SECRET").await;
+
+    let mut had_error = false;
+    for c in static_app_clients(&issuer, ciba_rp_secret_hash, qm_rp_secret_hash) {
+        let expected_json = serde_json::to_string(&c).unwrap();
+        match dcr_store::save_client(&fs, &c).await {
+            Ok(()) => match dcr_store::load_client(&fs, &c.client_id).await {
+                Some(saved) if serde_json::to_string(&saved).unwrap() == expected_json => {
+                    println!("migrated (verified): {}", c.client_id)
+                }
+                Some(_) => {
+                    eprintln!("migrate-static-clients: {}: 書き込み後の読み戻しが一致しません", c.client_id);
+                    had_error = true;
+                }
+                None => {
+                    eprintln!("migrate-static-clients: {}: 書き込み後に読み戻せません", c.client_id);
+                    had_error = true;
+                }
+            },
+            Err(e) => {
+                eprintln!("migrate-static-clients: {}: {e}", c.client_id);
+                had_error = true;
+            }
+        }
+    }
+    if had_error {
+        eprintln!("migrate-static-clients: 一部のクライアントで失敗しました。上記を確認してください。");
+        std::process::exit(1);
     }
 }
