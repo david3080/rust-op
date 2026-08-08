@@ -104,26 +104,13 @@ async fn main() {
     let base_path = std::env::var("BASE_PATH").unwrap_or_default();
     let issuer = format!("{origin}{base_path}");
 
-    // 静的 conformance クライアントのシークレットは env から注入する（ソースに平文を残さない）。
-    // 未設定時は起動毎のランダム値にフォールバックし、既知シークレットを世に晒さない
-    // （= env 未設定の本番では当該クライアントは事実上利用不能になる）。
-    // Client.client_secret には平文でなくハッシュ(dcr::hash_token)だけを保持させる
-    // （DCR発行クライアントと同じ契約。プロセスメモリ上のClientから平文を除く）。
-    let secret_from_env = |key: &str| {
-        let raw = std::env::var(key).unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
-        dcr::hash_token(&raw)
-    };
-
-    // demo-rp / mobile-rp / ciba-rp / qm-rp は実アプリ用で常時登録。
-    // ciba-rp は実 CIBA バックエンド（client_secret_basic, DPoP 任意）。
+    // demo-rp / mobile-rp / ciba-rp / qm-rp は Step5 の移行(migrate-static-clients)で
+    // Firestore(clients/)へ移り、resolve_client の静的Map→Firestoreフォールバック経由で
+    // 解決される（static_app_clients は移行コマンド専用の定義源として main.rs 側に残す）。
+    // このため Firestore が未配線のローカル実行(FIRESTORE_EMULATOR_HOST 未設定)では
+    // これらのクライアントは解決できない点に注意（demo-rp 等の動作確認には
+    // FIRESTORE_EMULATOR_HOST を設定し migrate-static-clients を流し込んでおくこと）。
     let mut provider = Provider::new(issuer.clone()).with_base_path(base_path.clone());
-    for c in static_app_clients(
-        &issuer,
-        secret_from_env("CIBA_RP_SECRET"),
-        secret_from_env("QM_RP_SECRET"),
-    ) {
-        provider = provider.with_client(c);
-    }
 
     // FAPI2 conformance 用の静的クライアント（fapi-1 = client / fapi-2 = client2）。
     // FAPI 認定スイートは動的登録 variant を持たず静的クライアント専用なので、認定時のみ
@@ -373,9 +360,9 @@ async fn mint_iat(args: &[String]) {
     eprintln!("注意: 生トークンの表示は一度だけ。この出力は Cloud Logging に残ります。");
 }
 
-/// demo-rp/mobile-rp/ciba-rp/qm-rp の定義。main() の起動時登録
-/// (Step5 完了後は削除予定) と migrate_static_clients_cmd の両方から参照する単一の
-/// 定義源（定義がずれると、移行後 Firestore 上のクライアントとここの記憶が食い違う）。
+/// demo-rp/mobile-rp/ciba-rp/qm-rp の定義。Step5 完了により main() はこれを直接使わなく
+/// なり（resolve_client の Firestore フォールバックで解決する）、migrate_static_clients_cmd
+/// 専用の定義源として残る（再移行・検証時にここを見れば「あるべき姿」がわかる）。
 /// ciba_rp_secret_hash/qm_rp_secret_hash は既にハッシュ済み（dcr::hash_token通過後）の
 /// 値を渡すこと（ここでは平文を一切扱わない）。
 fn static_app_clients(issuer: &str, ciba_rp_secret_hash: String, qm_rp_secret_hash: String) -> Vec<Client> {
@@ -689,10 +676,11 @@ fn require_env(name: &str) -> String {
 
 /// Secret Manager から取得したclient_secretをハッシュ化する。取得できた値がたまたま
 /// 同名の環境変数にも設定されていれば一致を確認する: 本コマンドはSecret Managerを直接
-/// 読むが、main() のサーバ起動パスは Cloud Run の env 注入(secretKeyRef)経由で同じ
-/// Secretを読む。両者の取得経路が食い違うと、静的登録を削除した後に client_secret_basic
-/// 認証が音もなく壊れる(save_client は create_if_absent のため事後修正もFirestore側の
-/// 手動削除が要る)。ローカル実行では通常env var未設定なので、その場合はSecret Manager
+/// 読む唯一の経路（Step5完了によりmain()はCIBA_RP_SECRET/QM_RP_SECRETを一切読まなくなり、
+/// これらのclient_secretはFirestoreに保存済みのハッシュのみを唯一の正とする）。それでも
+/// 念のため、たまたま同名の環境変数が設定されていれば一致を確認する（食い違いに気づかず
+/// 誤ったハッシュをFirestoreへ書き込むと、save_client が create_if_absent のため事後修正も
+/// 手動削除が要る）。ローカル実行では通常env var未設定なので、その場合はSecret Manager
 /// の値をそのまま信頼する。
 async fn secret_hash_from_manager_verified(fs: &firestore::Firestore, name: &'static str) -> String {
     let raw = match fs.access_secret(name).await {
@@ -717,16 +705,21 @@ async fn secret_hash_from_manager_verified(fs: &firestore::Firestore, name: &'st
     dcr::hash_token(&raw)
 }
 
-/// 静的登録されている demo-rp/mobile-rp/ciba-rp/qm-rp を Firestore(clients/)へ一度きり移行する
-/// (Step5)。実行後、resolve_client は静的Map(main()の登録)→Firestoreの順にフォールバックする
-/// ため、この移行が完了していれば main() 側の .with_client 登録を安全に削除できる
-/// （削除は移行の成功確認後、別途行う）。
+/// demo-rp/mobile-rp/ciba-rp/qm-rp を Firestore(clients/)へ一度きり移行する(Step5)。
+/// main() は既にこれらの静的登録(.with_client)を持たず、resolve_client の Firestore
+/// フォールバックのみで解決する。**そのため、このコマンドを対象のFirestoreデータベースへ
+/// 実行し終える前に新しいバイナリをデプロイすると、そのデータベースを向いているサービスは
+/// これら4クライアントを一切解決できなくなる**（本番/stagingでそれぞれ別のFirestore
+/// データベースを使う構成では、両方に対して実行すること。デプロイ順序を守るための
+/// 自動チェックはコード側にもCI/CD側にも無いため、運用上の手順として徹底する必要がある）。
 ///
 /// client_secret は Secret Manager の CIBA_RP_SECRET/QM_RP_SECRET の**現在値**をハッシュ化して
 /// 保存する（新規生成しない。既存の外部RP統合(QM等)のsecretをローテーションさせないため）。
 ///
 /// ドライランは Firestore の現状（各client_idが既にあるか）だけ確認する。Secret Manager
-/// へは触れないため、Secret Manager の IAM 権限が無くても事前確認できる。
+/// へは触れないため、Secret Manager の IAM 権限が無くても事前確認できる
+/// （逆に --apply は常に Secret Manager アクセスが要る。FIRESTORE_EMULATOR_HOST を立てた
+/// だけのローカル実行では --apply できない）。
 ///
 /// `rust-op migrate-static-clients`          # ドライラン
 /// `rust-op migrate-static-clients --apply`  # 実行
