@@ -265,6 +265,48 @@ async fn register_confidential_secret_returns_raw_secret_once() {
     assert_ne!(stored.client_secret.as_deref(), Some(raw_secret));
 }
 
+/// account_admin::disable_account で凍結したアカウントが、実HTTPハンドラ(login_passkey_verify)
+/// 経由でログインを拒否されることを検証する。login.rs 側の disabled チェックの配線確認。
+#[tokio::test]
+#[ignore]
+async fn disabled_account_cannot_login() {
+    let p = test_provider();
+    let email = format!("probe-{}@example.com", uuid::Uuid::new_v4());
+    let (key, _cred_id, _account_id) = register_test_account(&p, &email).await;
+
+    let fs = p.firestore.as_ref().unwrap();
+    let out = crate::account_admin::disable_account(fs, "test", &email).await.unwrap();
+    assert!(matches!(out, crate::account_admin::DisableOutcome::Disabled { .. }));
+
+    let uid = uuid::Uuid::new_v4().to_string();
+    p.store
+        .save_interaction(Interaction {
+            uid: uid.clone(),
+            raw_query: String::new(),
+            account_id: None,
+            auth_time: None,
+            request_uri: None,
+        })
+        .await;
+
+    let opts_req: login::LoginPkOptionsReq = serde_json::from_value(json!({ "email": email })).unwrap();
+    let opts = login::login_passkey_options(State(p.clone()), Path(uid.clone()), Json(opts_req)).await;
+    assert_eq!(opts.status(), StatusCode::OK, "options自体は通す(disabled状態を先出ししない)");
+    let opts_json = body_json(opts).await;
+    let challenge = opts_json["challenge"].as_str().unwrap().to_string();
+
+    let (ad, sig, cdj) = make_auth_ceremony(&key, 0, &challenge, &p.origin(), &p.rp_id(), false);
+    let verify_req: AuthVerifyReq = serde_json::from_value(json!({
+        "id": crate::webauthn::b64e(b"probe-credential-id"),
+        "response": { "clientDataJSON": cdj, "authenticatorData": ad, "signature": sig, "userHandle": null },
+    }))
+    .unwrap();
+    let verify =
+        login::login_passkey_verify(State(p.clone()), CookieJar::default(), Path(uid.clone()), Json(verify_req))
+            .await;
+    assert_eq!(verify.status(), StatusCode::FORBIDDEN, "disabled account should be rejected");
+}
+
 #[tokio::test]
 #[ignore]
 async fn register_then_login_uses_account_id_not_email() {

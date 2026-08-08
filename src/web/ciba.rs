@@ -193,8 +193,10 @@ pub(super) async fn backchannel_auth(
     // login_hint は passkey 登録済みアカウントであること（未登録は即拒否）。
     // account_id は以後、CIBA 要求本体・発行トークンの sub・FCM 宛先解決すべてに使う
     // （login_hint = email は RP 起点のヒントとして dedup/レート制限のキーにのみ残す）。
+    // disabled なアカウントは unknown と同じ扱いにする(別分岐にしない): 凍結先へ push を
+    // 送って pending 要求を作る無駄を避けつつ、認証済みRPへも「unknown」以上の情報は返さない。
     let account_id = match crate::registration::get_credential(fs, &login_hint).await {
-        Ok(Some(c)) if !c.account_id.is_empty() => c.account_id,
+        Ok(Some(c)) if !c.account_id.is_empty() && !c.disabled => c.account_id,
         Ok(_) => return OAuthError::InvalidRequest("unknown user_id".into()).into_response(),
         Err(e) => {
             tracing::error!("get_credential: {e}");
@@ -429,6 +431,13 @@ pub(super) async fn ciba_approve(
             let _ = crate::registration::update_sign_count(fs, &email, n).await;
         }
         Err(e) => return (StatusCode::UNAUTHORIZED, format!("passkey verify failed: {e}")).into_response(),
+    }
+    // disabled チェックは署名検証の後: login.rs と同じ理由で、実 passkey を持たない
+    // 第三者に凍結状態を判別させるオラクルにしないため、正規の所有者だと確認できてから
+    // 初めて拒否理由を返す。
+    if cred.disabled {
+        tracing::warn!(event = "ciba_approve_blocked_disabled", sub = %super::pseudonymize_sub(&cred.account_id));
+        return (StatusCode::FORBIDDEN, "account disabled").into_response();
     }
     let _ = ciba_req; // 検証済み。承認に進む。
     // 先勝ち: Pending のときだけ Approved へ原子的に遷移。既に承認/拒否済みなら 409。

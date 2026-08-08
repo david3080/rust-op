@@ -3,7 +3,9 @@
 // from_utf8_unchecked を使うため、cargo kani 時だけ forbid を外す。
 #![cfg_attr(not(kani), forbid(unsafe_code))]
 
+mod account_admin;
 mod admin_store;
+mod audit_log;
 mod auth_checks;
 mod ciba;
 mod claims;
@@ -48,6 +50,20 @@ use provider::Provider;
 
 #[tokio::main]
 async fn main() {
+    // ログ: Cloud Run では構造化 JSON（Cloud Logging がフィールド解析→log-based metric/alert）。
+    // ローカルは人間可読のまま。管理者サブコマンドの分岐より前に初期化する:
+    // 以前はサーバ起動パスの直前で初期化していたため、サブコマンド(mint/disable-account等)
+    // 内の tracing::error!/warn! がサブスクライバ未設置のまま呼ばれ、実行時に完全に
+    // 握りつぶされていた(server起動パスの request handler には影響しない——そちらは
+    // 元々この初期化より後にしか到達しないため)。
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    if std::env::var("K_SERVICE").is_ok() {
+        tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
     // 管理者用サブコマンド（out-of-band）。サーバ起動前に分岐する。
     let argv: Vec<String> = std::env::args().collect();
     match argv.get(1).map(String::as_str) {
@@ -67,17 +83,15 @@ async fn main() {
             revoke_admin_cmd(&argv[2..]).await;
             return;
         }
+        Some("disable-account") => {
+            disable_account_cmd(&argv[2..]).await;
+            return;
+        }
+        Some("enable-account") => {
+            enable_account_cmd(&argv[2..]).await;
+            return;
+        }
         _ => {}
-    }
-
-    // ログ: Cloud Run では構造化 JSON（Cloud Logging がフィールド解析→log-based metric/alert）。
-    // ローカルは人間可読のまま。
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
-    if std::env::var("K_SERVICE").is_ok() {
-        tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     // ORIGIN = スキーム+ホスト（例 https://oidc.sonrisa.co.jp）。
@@ -512,6 +526,7 @@ async fn grant_admin_cmd(args: &[String]) {
     let account_id = resolve_account_id("grant-admin", &fs, &email).await;
     match admin_store::grant_admin(&fs, &account_id, "cli").await {
         Ok(admin_store::GrantAdminResult::Granted) => {
+            audit_log::record(&fs, "cli", "grant_admin", &account_id, &format!("email={email}")).await;
             println!("granted: {email} (account_id={account_id})")
         }
         Ok(admin_store::GrantAdminResult::AlreadyAdmin) => {
@@ -560,6 +575,7 @@ async fn revoke_admin_cmd(args: &[String]) {
     let account_id = resolve_account_id("revoke-admin", &fs, &email).await;
     match admin_store::revoke_admin(&fs, &account_id).await {
         Ok(admin_store::RevokeAdminResult::Revoked) => {
+            audit_log::record(&fs, "cli", "revoke_admin", &account_id, &format!("email={email}")).await;
             println!("revoked: {email} (account_id={account_id})")
         }
         Ok(admin_store::RevokeAdminResult::NotAdmin) => {
@@ -576,6 +592,66 @@ async fn revoke_admin_cmd(args: &[String]) {
         }
         Err(e) => {
             eprintln!("revoke-admin: 失敗: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// アカウントの凍結。新規ログイン/CIBA承認を拒否し、既存の SSO セッションを破棄する
+/// （access/refresh token は対象外。TTL が短くローテーションするため。
+/// [`account_admin::disable_account`] 参照）。
+///
+/// `rust-op disable-account --email <email>`
+async fn disable_account_cmd(args: &[String]) {
+    let email = parse_email_arg("disable-account", args);
+    let fs = firestore::Firestore::new(resolve_project());
+    let report = |label: &str, counts: &account_admin::RevocationCounts| {
+        println!(
+            "{label}: {email} (sessions={} access_tokens={} refresh_tokens={})",
+            counts.sessions, counts.access_tokens, counts.refresh_tokens
+        );
+        if !counts.query_errors.is_empty() {
+            // disabled フラグ自体は既に立っているので新規ログインは止まるが、失効できたか
+            // 不明なセッション/トークンが残っている可能性がある旨を明示し、exit(1) で
+            // 「完全ではない」ことを気付けるようにする(disable自体は成立している)。
+            eprintln!(
+                "WARNING: 以下は検索自体に失敗し、失効できたか不明です（存在しない=0件、ではありません）: {:?}",
+                counts.query_errors
+            );
+            std::process::exit(1);
+        }
+    };
+    match account_admin::disable_account(&fs, "cli", &email).await {
+        Ok(account_admin::DisableOutcome::Disabled(counts)) => report("disabled", &counts),
+        Ok(account_admin::DisableOutcome::AlreadyDisabled(counts)) => {
+            report("already disabled", &counts)
+        }
+        Ok(account_admin::DisableOutcome::NotFound) => {
+            eprintln!("disable-account: account not found: {email}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("disable-account: 失敗: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// アカウント凍結の解除。
+///
+/// `rust-op enable-account --email <email>`
+async fn enable_account_cmd(args: &[String]) {
+    let email = parse_email_arg("enable-account", args);
+    let fs = firestore::Firestore::new(resolve_project());
+    match account_admin::enable_account(&fs, "cli", &email).await {
+        Ok(account_admin::EnableOutcome::Enabled) => println!("enabled: {email}"),
+        Ok(account_admin::EnableOutcome::AlreadyEnabled) => println!("already enabled: {email}"),
+        Ok(account_admin::EnableOutcome::NotFound) => {
+            eprintln!("enable-account: account not found: {email}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("enable-account: 失敗: {e}");
             std::process::exit(1);
         }
     }

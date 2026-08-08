@@ -231,6 +231,32 @@ impl Firestore {
         }
     }
 
+    /// 指定した1フィールドだけを部分更新する(updateMask)。他のフィールドには一切触れない。
+    /// `set_doc` は毎回全フィールドを送る全体置換のため、同じドキュメントへ複数の書き込み経路が
+    /// 並行して「読む→1フィールドだけ変える→全体を書き戻す」をやると、後勝ちの書き込みが
+    /// 相手の変更（別フィールド）を丸ごと巻き戻す事故になる。updateTime による楽観ロックCASで
+    /// 守る手もあるが、実 Firestore エミュレータは updateTime の一致判定を正しく実装しておらず
+    /// 常に precondition failed になる（curl で確認済み。exists 判定は正常）ため、ここでは
+    /// フィールド単位の部分更新そのもので競合を起こさない設計にする。ドキュメントが存在しない
+    /// 場合はエラーにする（新規作成はしない。呼び出し側は既存ドキュメントの更新用に使うこと）。
+    pub async fn update_field(&self, col: &str, id: &str, field: &str, value: Value) -> Result<(), String> {
+        let tok = self.token().await?;
+        let r = self
+            .http
+            .patch(self.doc_url(col, id))
+            .query(&[("updateMask.fieldPaths", field), ("currentDocument.exists", "true")])
+            .bearer_auth(tok)
+            .json(&json!({ "fields": { field: value } }))
+            .send()
+            .await
+            .map_err(|e| format!("update_field: {}", e.without_url()))?;
+        if r.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("update_field {} {}", r.status(), r.text().await.unwrap_or_default()))
+        }
+    }
+
     /// ドキュメントの fields を返す（無ければ None）。
     pub async fn get_doc(&self, col: &str, id: &str) -> Result<Option<Value>, String> {
         let tok = self.token().await?;
@@ -562,6 +588,10 @@ pub(crate) mod fake_firestore {
         update_time: Option<String>,
         #[serde(rename = "currentDocument.exists")]
         exists: Option<String>,
+        /// Firestore::update_field が使う部分更新。実装が単一フィールドしか送らないため
+        /// Vec ではなく単一値として受ける（複数フィールドのマスクは今のところ未使用）。
+        #[serde(rename = "updateMask.fieldPaths")]
+        update_mask_field: Option<String>,
     }
 
     async fn get_doc(
@@ -603,8 +633,21 @@ pub(crate) mod fake_firestore {
         }
         let fields = body.get("fields").cloned().unwrap_or_else(|| json!({}));
         let v = st.next();
-        docs.insert(key, Doc { fields: fields.clone(), update_time: v });
-        Json(json!({ "fields": fields, "updateTime": version_str(v) })).into_response()
+        // updateMask 指定時は、既存ドキュメントの他フィールドを残したまま該当フィールドだけ
+        // 差し替える(部分更新)。指定が無ければ従来通り全体置換。
+        let merged = if let Some(field) = &pre.update_mask_field {
+            let mut base = docs.get(&key).map(|d| d.fields.clone()).unwrap_or_else(|| json!({}));
+            if let Some(obj) = base.as_object_mut() {
+                if let Some(new_val) = fields.get(field) {
+                    obj.insert(field.clone(), new_val.clone());
+                }
+            }
+            base
+        } else {
+            fields
+        };
+        docs.insert(key, Doc { fields: merged.clone(), update_time: v });
+        Json(json!({ "fields": merged, "updateTime": version_str(v) })).into_response()
     }
 
     async fn delete_doc(
@@ -637,6 +680,32 @@ pub(crate) mod fake_firestore {
         Json(json!({ "name": "projects/fake/messages/1" })).into_response()
     }
 
+    /// `Firestore::query_eq` が叩く `POST .../documents:runQuery` を模す。単一の
+    /// fieldFilter(EQUAL, stringValue) のみサポート（実装側が送るのはこの形だけ）。
+    async fn run_query(
+        State(st): State<Arc<FakeState>>,
+        Path(_project): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let sq = &body["structuredQuery"];
+        let col = sq["from"][0]["collectionId"].as_str().unwrap_or("").to_string();
+        let field = sq["where"]["fieldFilter"]["field"]["fieldPath"].as_str().unwrap_or("").to_string();
+        let want = sq["where"]["fieldFilter"]["value"]["stringValue"].as_str().unwrap_or("").to_string();
+        let docs = st.docs.lock().unwrap();
+        let rows: Vec<Value> = docs
+            .iter()
+            .filter(|((c, _id), _)| *c == col)
+            .filter(|(_, d)| {
+                d.fields.get(&field).and_then(|v| v.get("stringValue")).and_then(|v| v.as_str())
+                    == Some(want.as_str())
+            })
+            .map(|((c, id), d)| {
+                json!({ "document": { "name": format!("projects/fake/databases/(default)/documents/{c}/{id}"), "fields": d.fields } })
+            })
+            .collect();
+        Json(rows).into_response()
+    }
+
     /// ランダムな空きポートで起動し `(host:port, 状態ハンドル)` を返す。プロセス終了まで
     /// 生き続ける（テストプロセス全体で共有されるわけではなく、テストごとに専用サーバを1つ立てる）。
     pub async fn spawn() -> (String, Arc<FakeState>) {
@@ -647,6 +716,10 @@ pub(crate) mod fake_firestore {
                 get(get_doc).patch(patch_doc).delete(delete_doc),
             )
             .route("/v1/projects/{project}/messages:send", post(fcm_send))
+            .route(
+                "/v1/projects/{project}/databases/(default)/documents:runQuery",
+                post(run_query),
+            )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

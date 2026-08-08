@@ -170,18 +170,26 @@ pub struct Credential {
     pub pub_x: String,
     pub pub_y: String,
     pub sign_count: u32,
+    /// 管理者による凍結フラグ。true ならログイン/CIBA承認を拒否する
+    /// （[`crate::account_admin`] 参照）。欠落時は false（既存アカウントは凍結されていない）。
+    pub disabled: bool,
 }
 
 /// account_id は呼び出し側が払い出す（新規登録なら新規 UUID、既存 passkey 追加なら既存値の再利用）。
 /// accounts/{email} を先に書き、逆引き accountsByUuid/{account_id} を後で書く。
 /// 逆引きの書き込みが失敗しても登録自体は失敗させない（email 入力でのログインは影響を受けない、
 /// discoverable ログインのみ縮退する）。
+///
+/// 既存アカウントの disabled 状態を引き継ぐ: 全フィールド置換の書き込みなので、ここで
+/// 明示的に引き継がないと、凍結済みアカウントが passkey を作り直す（機種変更/再登録）
+/// だけで凍結が消えてしまう（disabled を持たない新フィールド集合で上書きされるため）。
 pub async fn save_credential(
     fs: &Firestore,
     email: &str,
     account_id: &str,
     c: &RegOutcome,
 ) -> Result<(), String> {
+    let disabled = get_credential(fs, email).await?.map(|existing| existing.disabled).unwrap_or(false);
     fs.set_doc(
         "accounts",
         email,
@@ -194,6 +202,7 @@ pub async fn save_credential(
             "signCount": { "integerValue": c.sign_count.to_string() },
             "verified": firestore::b(true),
             "createdAt": firestore::ts(&firestore::rfc3339(now())),
+            "disabled": firestore::b(disabled),
         }),
     )
     .await?;
@@ -227,29 +236,26 @@ pub async fn get_credential(fs: &Firestore, email: &str) -> Result<Option<Creden
         pub_x: firestore::field_str(&fields, "pubX").unwrap_or("").to_string(),
         pub_y: firestore::field_str(&fields, "pubY").unwrap_or("").to_string(),
         sign_count,
+        disabled: firestore::field_bool(&fields, "disabled").unwrap_or(false),
     }))
 }
 
+/// signCount だけを部分更新する（`Firestore::update_field`）。全フィールド置換の
+/// read-modify-write だと、並行して走る `set_disabled` の書き込みと競合したとき
+/// 後勝ちの側が相手の変更（disabled フラグ）を丸ごと巻き戻す事故になる
+/// （両者が同じ accounts/{email} ドキュメントを取り合うため）。部分更新なら
+/// 互いのフィールドに触れないのでこの競合が原理的に起きない。
 pub async fn update_sign_count(fs: &Firestore, email: &str, n: u32) -> Result<(), String> {
-    // 既存ドキュメントを取り直して signCount だけ更新（PATCH は全 fields 置換のため）。
-    // accountId は既存値をそのまま引き継ぐ（再生成しない）。
-    if let Some(c) = get_credential(fs, email).await? {
-        fs.set_doc(
-            "accounts",
-            email,
-            json!({
-                "email": firestore::s(email),
-                "accountId": firestore::s(&c.account_id),
-                "credentialId": firestore::s(&c.credential_id),
-                "pubX": firestore::s(&c.pub_x),
-                "pubY": firestore::s(&c.pub_y),
-                "signCount": { "integerValue": n.to_string() },
-                "verified": firestore::b(true),
-            }),
-        )
-        .await?;
-    }
-    Ok(())
+    fs.update_field("accounts", email, "signCount", json!({ "integerValue": n.to_string() })).await
+}
+
+/// disabled フラグだけを部分更新する（[`update_sign_count`] と同じ理由で全体置換にしない）。
+/// account_admin::disable_account/enable_account から呼ばれる。呼び出し側が事前に
+/// get_credential でアカウントの存在を確認している前提（重複読み取りを避けるため、
+/// ここでは再確認しない。存在しなければ update_field が currentDocument.exists 制約で
+/// エラーを返す）。
+pub async fn set_disabled(fs: &Firestore, email: &str, disabled: bool) -> Result<(), String> {
+    fs.update_field("accounts", email, "disabled", firestore::b(disabled)).await
 }
 
 /// accountId(UUID) -> email の逆引き。discoverable ログイン（userHandle=accountId のみ判明）で使う。

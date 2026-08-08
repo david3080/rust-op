@@ -222,6 +222,13 @@ pub(super) async fn login_passkey_verify(
             return (StatusCode::UNAUTHORIZED, format!("passkey verify failed: {e}")).into_response();
         }
     }
+    // disabled チェックは署名検証の後: これより前に判定を分岐させると、実 passkey を
+    // 持たない第三者でも「このアカウントは凍結されているか」を判別できるオラクルになる。
+    // 署名を検証し終えた=正規の所有者だと確認できてから初めて拒否理由を返す。
+    if cred.disabled {
+        tracing::warn!(event = "login_blocked_disabled", sub = %super::pseudonymize_sub(&cred.account_id));
+        return (StatusCode::FORBIDDEN, "account disabled").into_response();
+    }
     if cred.account_id.is_empty() {
         // 移行前（accountId 未発行）のアカウント。再登録が必要。
         return (StatusCode::BAD_REQUEST, "account needs re-registration").into_response();
