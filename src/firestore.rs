@@ -54,6 +54,24 @@ pub fn field_ts_secs(fields: &Value, name: &str) -> Option<u64> {
     ))
 }
 
+/// runQuery のレスポンス(`[{document:{name,fields}}, ...]` 形式)をパースする共通処理。
+/// query_eq / list_recent_ordered の両方から使う。
+fn parse_run_query_response(arr: &Value) -> Vec<(String, Value)> {
+    arr.as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let doc = row.get("document")?;
+                    let name = doc.get("name")?.as_str()?;
+                    let id = name.rsplit('/').next()?.to_string();
+                    let fields = doc.get("fields").cloned().unwrap_or(json!({}));
+                    Some((id, fields))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// RFC3339 (UTC, 秒精度) を epoch 秒から組み立てる。chrono を入れずに済ます。
 pub fn rfc3339(epoch_secs: u64) -> String {
     // 1970-01-01 起点の日付計算。
@@ -431,20 +449,111 @@ impl Firestore {
             return Err(format!("query {}", r.status()));
         }
         let arr: Value = r.json().await.map_err(|e| format!("query json: {e}"))?;
-        Ok(arr
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| {
-                        let doc = row.get("document")?;
-                        let name = doc.get("name")?.as_str()?;
-                        let id = name.rsplit('/').next()?.to_string();
-                        let fields = doc.get("fields").cloned().unwrap_or(json!({}));
-                        Some((id, fields))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(parse_run_query_response(&arr))
+    }
+
+    /// 直近N件を新しい順で返す(runQueryのorderBy+limit)。単調増加しうる唯一のコレクション
+    /// auditLog専用（他のコレクションは数十件規模を想定しており list_collection で足りる）。
+    /// 全件取得してからソートするのではなく、Firestore側で絞ってから返す。
+    /// order_field は秒精度なので、同一秒に複数件書き込まれるとタイが起きる。__name__
+    /// (ドキュメントID)を副次キーにして、limit境界の結果が呼び出しごとに変わらないようにする。
+    pub async fn list_recent_ordered(
+        &self,
+        col: &str,
+        order_field: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, Value)>, String> {
+        let tok = self.token().await?;
+        let url = format!(
+            "{}/v1/projects/{}/databases/{}/documents:runQuery",
+            self.base_url(),
+            self.project,
+            self.database
+        );
+        let body = json!({
+            "structuredQuery": {
+                "from": [{ "collectionId": col }],
+                "orderBy": [
+                    { "field": { "fieldPath": order_field }, "direction": "DESCENDING" },
+                    { "field": { "fieldPath": "__name__" }, "direction": "DESCENDING" }
+                ],
+                "limit": limit
+            }
+        });
+        let r = self
+            .http
+            .post(url)
+            .bearer_auth(tok)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("query: {e}"))?;
+        if !r.status().is_success() {
+            return Err(format!("query {}", r.status()));
+        }
+        let arr: Value = r.json().await.map_err(|e| format!("query json: {e}"))?;
+        Ok(parse_run_query_response(&arr))
+    }
+
+    /// コレクション内の全ドキュメントを列挙する(nextPageTokenを内部でループ処理)。
+    /// 数十件規模のコレクション(accounts/clients/dcrTokens)向け。単調増加しうる
+    /// auditLogには使わない(list_recent_orderedを使うこと)。
+    pub async fn list_collection(&self, col: &str) -> Result<Vec<(String, Value, String)>, String> {
+        // 「数十件規模」という利用想定に対して十分すぎる余裕を持たせつつ、テストで複数ページの
+        // ループ動作を現実的なドキュメント数で再現できる大きさにする。
+        const PAGE_SIZE: u32 = 100;
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let tok = self.token().await?;
+            let url = format!(
+                "{}/v1/projects/{}/databases/{}/documents/{}",
+                self.base_url(),
+                self.project,
+                self.database,
+                col
+            );
+            // pageToken は不透明なトークンで '+' '=' 等を含みうるため、生の文字列連結ではなく
+            // reqwest の .query() に通して正しく percent-encode させる(update_field と同じ流儀)。
+            let mut query: Vec<(&str, String)> = vec![("pageSize", PAGE_SIZE.to_string())];
+            if let Some(pt) = &page_token {
+                query.push(("pageToken", pt.clone()));
+            }
+            let r = self
+                .http
+                .get(url)
+                .query(&query)
+                .bearer_auth(tok)
+                .send()
+                .await
+                .map_err(|e| format!("list: {}", e.without_url()))?;
+            if !r.status().is_success() {
+                return Err(format!("list {}", r.status()));
+            }
+            let j: Value = r.json().await.map_err(|e| format!("list json: {}", e.without_url()))?;
+            for doc in j.get("documents").and_then(|v| v.as_array()).into_iter().flatten() {
+                let name = match doc.get("name").and_then(|v| v.as_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let id = match name.rsplit('/').next() {
+                    Some(i) => i.to_string(),
+                    None => continue,
+                };
+                let fields = doc.get("fields").cloned().unwrap_or(json!({}));
+                let update_time = doc.get("updateTime").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                out.push((id, fields, update_time));
+            }
+            page_token = j
+                .get("nextPageToken")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Secret Manager の最新バージョンを読む（metadata トークンを流用）。
@@ -680,8 +789,9 @@ pub(crate) mod fake_firestore {
         Json(json!({ "name": "projects/fake/messages/1" })).into_response()
     }
 
-    /// `Firestore::query_eq` が叩く `POST .../documents:runQuery` を模す。単一の
-    /// fieldFilter(EQUAL, stringValue) のみサポート（実装側が送るのはこの形だけ）。
+    /// `Firestore::query_eq` / `list_recent_ordered` が叩く `POST .../documents:runQuery` を模す。
+    /// 単一の fieldFilter(EQUAL, stringValue)、および orderBy(1件)+limit の組み合わせのみ
+    /// サポート（実装側が送るのはこの2パターンだけ）。
     async fn run_query(
         State(st): State<Arc<FakeState>>,
         Path(_project): Path<String>,
@@ -689,21 +799,123 @@ pub(crate) mod fake_firestore {
     ) -> Response {
         let sq = &body["structuredQuery"];
         let col = sq["from"][0]["collectionId"].as_str().unwrap_or("").to_string();
-        let field = sq["where"]["fieldFilter"]["field"]["fieldPath"].as_str().unwrap_or("").to_string();
-        let want = sq["where"]["fieldFilter"]["value"]["stringValue"].as_str().unwrap_or("").to_string();
         let docs = st.docs.lock().unwrap();
-        let rows: Vec<Value> = docs
-            .iter()
-            .filter(|((c, _id), _)| *c == col)
-            .filter(|(_, d)| {
+
+        let mut matching: Vec<(&(String, String), &Doc)> =
+            docs.iter().filter(|((c, _id), _)| *c == col).collect();
+
+        if let Some(filter) = sq.get("where") {
+            let field = filter["fieldFilter"]["field"]["fieldPath"].as_str().unwrap_or("").to_string();
+            let want = filter["fieldFilter"]["value"]["stringValue"].as_str().unwrap_or("").to_string();
+            matching.retain(|(_, d)| {
                 d.fields.get(&field).and_then(|v| v.get("stringValue")).and_then(|v| v.as_str())
                     == Some(want.as_str())
-            })
+            });
+        }
+
+        if let Some(order_list) = sq.get("orderBy").and_then(|v| v.as_array()) {
+            let orders: Vec<(String, bool)> = order_list
+                .iter()
+                .map(|o| {
+                    (
+                        o["field"]["fieldPath"].as_str().unwrap_or("").to_string(),
+                        o["direction"].as_str() == Some("DESCENDING"),
+                    )
+                })
+                .collect();
+            // 複数 orderBy を先頭から順に比較し、同点のときだけ次のキーへ進む
+            // (list_recent_ordered が送る __name__ タイブレークを再現するため)。
+            matching.sort_by(|a, b| {
+                for (field, desc) in &orders {
+                    let ord = if field == "__name__" {
+                        (a.0 .1).cmp(&b.0 .1)
+                    } else {
+                        field_sort_key(&a.1.fields, field).cmp(&field_sort_key(&b.1.fields, field))
+                    };
+                    let ord = if *desc { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        if let Some(limit) = sq.get("limit").and_then(|v| v.as_u64()) {
+            matching.truncate(limit as usize);
+        }
+
+        let rows: Vec<Value> = matching
+            .iter()
             .map(|((c, id), d)| {
                 json!({ "document": { "name": format!("projects/fake/databases/(default)/documents/{c}/{id}"), "fields": d.fields } })
             })
             .collect();
         Json(rows).into_response()
+    }
+
+    /// orderBy 用の並べ替えキー(文字列)。timestampValue(RFC3339、辞書順で時刻順に一致)を
+    /// 優先し、無ければ stringValue にフォールバックする（audit_log の `at` フィールド用途で
+    /// 十分。他の型のソートは今のところ不要）。
+    fn field_sort_key(fields: &Value, field: &str) -> String {
+        let v = match fields.get(field) {
+            Some(v) => v,
+            None => return String::new(),
+        };
+        v.get("timestampValue")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.get("stringValue").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    struct ListQuery {
+        #[serde(rename = "pageSize")]
+        page_size: Option<usize>,
+        #[serde(rename = "pageToken")]
+        page_token: Option<String>,
+    }
+
+    /// `Firestore::list_collection` が叩く `GET .../documents/{col}` を模す。
+    /// pageToken は「消費済み件数」を文字列化しただけの単純なオフセットで、実 Firestore の
+    /// 不透明トークンとは形が違うが、list_collection 側は中身を解釈せずそのまま次のリクエスト
+    /// へ渡すだけなので、ページング動作(複数ページに渡って全件取得できるか)を検証するには
+    /// これで十分。
+    async fn list_docs(
+        State(st): State<Arc<FakeState>>,
+        Path((_project, col)): Path<(String, String)>,
+        Query(q): Query<ListQuery>,
+    ) -> Response {
+        let docs = st.docs.lock().unwrap();
+        let mut matching: Vec<(&(String, String), &Doc)> =
+            docs.iter().filter(|((c, _id), _)| *c == col).collect();
+        // ページングが安定するよう、id で決定的な順序にする(実Firestoreの順序保証はないが、
+        // fakeでは「複数ページに渡って全件・重複無く返ってくるか」の検証を再現可能にするため)。
+        matching.sort_by(|a, b| a.0 .1.cmp(&b.0 .1));
+
+        let page_size = q.page_size.unwrap_or(300).max(1);
+        let offset: usize = q.page_token.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let page: Vec<_> = matching.into_iter().skip(offset).take(page_size).collect();
+        let consumed = offset + page.len();
+
+        let documents: Vec<Value> = page
+            .iter()
+            .map(|((c, id), d)| {
+                json!({
+                    "name": format!("projects/fake/databases/(default)/documents/{c}/{id}"),
+                    "fields": d.fields,
+                    "updateTime": version_str(d.update_time),
+                })
+            })
+            .collect();
+
+        let total = docs.iter().filter(|((c, _id), _)| *c == col).count();
+        let mut resp = json!({ "documents": documents });
+        if consumed < total {
+            resp["nextPageToken"] = json!(consumed.to_string());
+        }
+        Json(resp).into_response()
     }
 
     /// ランダムな空きポートで起動し `(host:port, 状態ハンドル)` を返す。プロセス終了まで
@@ -719,6 +931,10 @@ pub(crate) mod fake_firestore {
             .route(
                 "/v1/projects/{project}/databases/(default)/documents:runQuery",
                 post(run_query),
+            )
+            .route(
+                "/v1/projects/{project}/databases/(default)/documents/{col}",
+                get(list_docs),
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -858,5 +1074,78 @@ mod tests {
         let won = fs.delete_doc_if_unchanged("col", "id3", &fresh_update_time).await.unwrap();
         assert!(won, "matching updateTime must win the delete CAS");
         assert!(fs.get_doc("col", "id3").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_collection_returns_all_docs_across_multiple_pages() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        // PAGE_SIZE(100)を超える件数を作り、nextPageTokenによる複数回ループが実際に
+        // 発生した上で、過不足も重複もなく全件返ることを検証する。
+        const N: usize = 130;
+        for i in 0..N {
+            fs.set_doc("things", &format!("id-{i:03}"), json!({ "n": int(i as u64) })).await.unwrap();
+        }
+        // 無関係のコレクションは含まれないことも確認する。
+        fs.set_doc("other", "x", json!({})).await.unwrap();
+
+        let rows = fs.list_collection("things").await.unwrap();
+        assert_eq!(rows.len(), N);
+        let mut ids: Vec<&str> = rows.iter().map(|(id, _, _)| id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), N, "重複が無いこと");
+        let want: Vec<String> = (0..N).map(|i| format!("id-{i:03}")).collect();
+        assert_eq!(
+            rows.iter().map(|(id, _, _)| id.clone()).collect::<std::collections::BTreeSet<_>>(),
+            want.into_iter().collect::<std::collections::BTreeSet<_>>(),
+        );
+        for (_, fields, update_time) in &rows {
+            assert!(fields.get("n").is_some());
+            assert!(!update_time.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_collection_empty_when_no_docs() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        let rows = fs.list_collection("nothing-here").await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_recent_ordered_sorts_desc_and_respects_limit() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        for (id, ts) in [
+            ("a", "2026-01-01T00:00:00Z"),
+            ("b", "2026-01-03T00:00:00Z"),
+            ("c", "2026-01-02T00:00:00Z"),
+        ] {
+            fs.set_doc("events", id, json!({ "at": ts_field(ts) })).await.unwrap();
+        }
+
+        let rows = fs.list_recent_ordered("events", "at", 2).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"], "新しい順に並び、limitで絞られること");
+    }
+
+    #[tokio::test]
+    async fn list_recent_ordered_breaks_ties_by_name_when_at_matches() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        // 同一 at (秒精度) を持つ複数件があっても __name__ の副次ソートで順序が決定的になる
+        // (この回帰ロックが無いと HashMap の反復順に左右され、実行ごとに結果がぶれうる)。
+        for id in ["x1", "x2", "x3"] {
+            fs.set_doc("events", id, json!({ "at": ts_field("2026-01-01T00:00:00Z") })).await.unwrap();
+        }
+        let rows = fs.list_recent_ordered("events", "at", 2).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["x3", "x2"], "同一atは__name__降順でタイブレークされること");
+    }
+
+    fn ts_field(rfc3339: &str) -> Value {
+        json!({ "timestampValue": rfc3339 })
     }
 }

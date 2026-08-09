@@ -62,8 +62,7 @@ pub async fn is_admin(fs: &Firestore, account_id: &str) -> Result<bool, String> 
     Ok(entries.iter().any(|e| e.account_id == account_id))
 }
 
-/// 現在の管理者 account_id 一覧。
-#[allow(dead_code)] // 今後追加する管理画面の一覧表示が使う想定（現時点の呼び出し元はテストのみ）。
+/// 現在の管理者 account_id 一覧。web/admin.rs::users_list が管理者バッジ表示に使う。
 pub async fn list_admins(fs: &Firestore) -> Result<Vec<String>, String> {
     let (entries, _) = load_registry(fs).await?;
     Ok(entries.into_iter().map(|e| e.account_id).collect())

@@ -99,6 +99,21 @@ pub fn router(provider: Provider) -> Router {
         .route("/ciba/{auth_req_id}/reject", post(ciba::ciba_reject))
         // 管理者向け（sid セッション + admins/{account_id} の存在で判定）。
         .route("/admin/whoami", get(admin::whoami))
+        .route("/admin", get(admin::admin_home))
+        .route("/admin/users", get(admin::users_list))
+        .route("/admin/users/{account_id}", get(admin::user_detail))
+        .route("/admin/users/{account_id}/disable", post(admin::user_disable))
+        .route("/admin/users/{account_id}/enable", post(admin::user_enable))
+        .route("/admin/users/{account_id}/grant-admin", post(admin::user_grant_admin))
+        .route("/admin/users/{account_id}/revoke-admin", post(admin::user_revoke_admin))
+        .route("/admin/audit", get(admin::audit_list))
+        .route("/admin/clients", get(admin::clients_list))
+        .route("/admin/clients/{client_id}", get(admin::client_detail))
+        .route("/admin/clients/{client_id}/revoke", post(admin::client_revoke))
+        .route("/admin/iats", get(admin::iats_pending_list))
+        .route("/admin/iats/new", get(admin::iat_mint_form).post(admin::iat_mint_submit))
+        .route("/admin/iats/{hash}/revoke", post(admin::iat_revoke))
+        .route("/admin/iats/flash/{flash_id}", get(admin::iat_show_once))
         // メール確認つきユーザー登録（Web HTML フロー + ネイティブ JSON API）。
         // OAuth の「クライアント登録(DCR)」と区別するため /signup/* に置く。
         .route("/signup", get(register::register_form).post(register::register_submit))

@@ -54,6 +54,27 @@ pub async fn save_client(fs: &Firestore, client: &Client) -> Result<(), String> 
     }
 }
 
+/// clients/ 全件を列挙する（管理UIの一覧表示用）。壊れたJSONブロブはスキップする
+/// （load_client と同じ fail-closed だが沈黙しない方針）。
+pub async fn list_clients(fs: &Firestore) -> Result<Vec<Client>, String> {
+    let rows = fs.list_collection(CLIENTS).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (client_id, fields, _update_time) in rows {
+        let json = match field_str(&fields, "json") {
+            Some(j) => j,
+            None => {
+                eprintln!("dcr_store: list_clients {client_id}: missing json field");
+                continue;
+            }
+        };
+        match serde_json::from_str::<Client>(json) {
+            Ok(c) => out.push(c),
+            Err(e) => eprintln!("dcr_store: list_clients {client_id}: malformed json blob: {e}"),
+        }
+    }
+    Ok(out)
+}
+
 /// IAT 1 件の読み出し結果（制約・期限・updateTime・reusable フラグ）。
 pub struct Iat {
     pub constraints: IatConstraints,
@@ -93,6 +114,16 @@ pub async fn put_iat(
     }
 }
 
+/// dcrTokens/ ドキュメントの共通フィールド解析（peek_iat / list_pending_iats で共有）。
+fn parse_iat_fields(fields: &serde_json::Value) -> Result<(IatConstraints, u64, bool), String> {
+    let cj = field_str(fields, "constraints").ok_or("iat: missing constraints")?;
+    let constraints: IatConstraints =
+        serde_json::from_str(cj).map_err(|e| format!("iat constraints: {e}"))?;
+    let expires_at = field_u64(fields, "expires_at").unwrap_or(0);
+    let reusable = field_bool(fields, "reusable").unwrap_or(false);
+    Ok((constraints, expires_at, reusable))
+}
+
 /// IAT を読むが消費はしない（制約・期限・updateTime・reusable を返す）。
 /// 単回消費は検証成功後に consume_iat(CAS 削除) で行う（reusable=true なら呼ばない）。
 pub async fn peek_iat(fs: &Firestore, hash: &str) -> Result<Option<Iat>, String> {
@@ -100,17 +131,40 @@ pub async fn peek_iat(fs: &Firestore, hash: &str) -> Result<Option<Iat>, String>
         Some(x) => x,
         None => return Ok(None),
     };
-    let cj = field_str(&fields, "constraints").ok_or("iat: missing constraints")?;
-    let constraints: IatConstraints =
-        serde_json::from_str(cj).map_err(|e| format!("iat constraints: {e}"))?;
-    let expires_at = field_u64(&fields, "expires_at").unwrap_or(0);
-    let reusable = field_bool(&fields, "reusable").unwrap_or(false);
+    let (constraints, expires_at, reusable) = parse_iat_fields(&fields)?;
     Ok(Some(Iat { constraints, expires_at, update_time, reusable }))
 }
 
 /// IAT を単回消費する（updateTime CAS 削除）。勝てば Ok(true)、並行消費・既消費は Ok(false)。
 pub async fn consume_iat(fs: &Firestore, hash: &str, update_time: &str) -> Result<bool, String> {
     fs.delete_doc_if_unchanged(DCR_TOKENS, hash, update_time).await
+}
+
+/// 未消費IATの一覧（管理UI用）。1件の読み出し結果に doc id(hash) を添えたもの。
+pub struct PendingIat {
+    pub hash: String,
+    pub constraints: IatConstraints,
+    pub expires_at: u64,
+    pub reusable: bool,
+    /// revoke（consume_iat の CAS 削除）に使う。
+    pub update_time: String,
+}
+
+/// dcrTokens/ 全件を列挙する（管理UIの「未消費IAT一覧」表示用）。期限切れの除外はしない
+/// （表示するかどうかは呼び出し側の判断に委ねる）。壊れたドキュメントはスキップする
+/// （load_client/peek_iat と同じ fail-closed だが沈黙しない方針）。
+pub async fn list_pending_iats(fs: &Firestore) -> Result<Vec<PendingIat>, String> {
+    let rows = fs.list_collection(DCR_TOKENS).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (hash, fields, update_time) in rows {
+        match parse_iat_fields(&fields) {
+            Ok((constraints, expires_at, reusable)) => {
+                out.push(PendingIat { hash, constraints, expires_at, reusable, update_time });
+            }
+            Err(e) => eprintln!("dcr_store: list_pending_iats {hash}: {e}"),
+        }
+    }
+    Ok(out)
 }
 
 /// 登録クライアントを revoke する（clients/{id} 削除）。存在したら Ok(true)、無ければ Ok(false)。
@@ -247,5 +301,62 @@ mod tests {
         assert!(revoke_client(&fs, "dcr-rev").await.unwrap());
         assert!(load_client(&fs, "dcr-rev").await.is_none(), "失効後は解決できない");
         assert!(!revoke_client(&fs, "dcr-rev").await.unwrap(), "二重失効は false(冪等)");
+    }
+
+    #[tokio::test]
+    async fn list_clients_returns_all_and_skips_malformed() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        save_client(&fs, &client("dcr-list-1")).await.unwrap();
+        save_client(&fs, &client("dcr-list-2")).await.unwrap();
+        // json フィールドを持たない壊れたドキュメントを直接差し込む。
+        fs.set_doc(CLIENTS, "broken", serde_json::json!({})).await.unwrap();
+
+        let mut ids: Vec<String> =
+            list_clients(&fs).await.unwrap().into_iter().map(|c| c.client_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["dcr-list-1", "dcr-list-2"], "壊れたドキュメントはスキップされる");
+    }
+
+    #[tokio::test]
+    async fn list_clients_empty_when_none() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        assert!(list_clients(&fs).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_pending_iats_returns_all_with_hash_and_update_time() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        put_iat(&fs, "hash-a", &constraints(), 100, false).await.unwrap();
+        put_iat(&fs, "hash-b", &constraints(), 200, true).await.unwrap();
+
+        let mut list = list_pending_iats(&fs).await.unwrap();
+        list.sort_by(|a, b| a.hash.cmp(&b.hash));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].hash, "hash-a");
+        assert_eq!(list[0].expires_at, 100);
+        assert!(!list[0].reusable);
+        assert!(!list[0].update_time.is_empty());
+        assert_eq!(list[1].hash, "hash-b");
+        assert!(list[1].reusable);
+    }
+
+    #[tokio::test]
+    async fn list_pending_iats_skips_malformed_and_reflects_consume() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        put_iat(&fs, "hash-ok", &constraints(), 100, false).await.unwrap();
+        // constraints フィールドを持たない壊れたドキュメントを直接差し込む。
+        fs.set_doc(DCR_TOKENS, "broken", serde_json::json!({})).await.unwrap();
+
+        let list = list_pending_iats(&fs).await.unwrap();
+        assert_eq!(list.len(), 1, "壊れたドキュメントはスキップされる");
+        assert_eq!(list[0].hash, "hash-ok");
+
+        // revoke(consume_iat)後は一覧から消える(brokenは元々スキップされているので0件になる)。
+        consume_iat(&fs, "hash-ok", &list[0].update_time).await.unwrap();
+        assert!(list_pending_iats(&fs).await.unwrap().is_empty());
     }
 }

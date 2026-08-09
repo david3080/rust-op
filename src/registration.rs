@@ -240,6 +240,40 @@ pub async fn get_credential(fs: &Firestore, email: &str) -> Result<Option<Creden
     }))
 }
 
+pub struct AccountSummary {
+    pub email: String,
+    pub account_id: String,
+    pub disabled: bool,
+    pub sign_count: u32,
+    pub created_at: u64,
+}
+
+/// accounts/ 全件を列挙する（管理UIの一覧表示用）。accountId が欠落/空の壊れたドキュメントは
+/// tracing::error! で痕跡を残しつつスキップする（get_credential の「fail-closed だが沈黙
+/// しない」方針を踏襲。1件の壊れたドキュメントで一覧全体が失敗しないようにする）。
+pub async fn list_accounts(fs: &Firestore) -> Result<Vec<AccountSummary>, String> {
+    let rows = fs.list_collection("accounts").await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (email, fields, _update_time) in rows {
+        let account_id = match firestore::field_str(&fields, "accountId") {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                tracing::error!("list_accounts: {email}: accountId missing/empty, skipping");
+                continue;
+            }
+        };
+        let sign_count = firestore::field_u64(&fields, "signCount").unwrap_or(0) as u32;
+        out.push(AccountSummary {
+            email,
+            account_id,
+            disabled: firestore::field_bool(&fields, "disabled").unwrap_or(false),
+            sign_count,
+            created_at: firestore::field_ts_secs(&fields, "createdAt").unwrap_or(0),
+        });
+    }
+    Ok(out)
+}
+
 /// signCount だけを部分更新する（`Firestore::update_field`）。全フィールド置換の
 /// read-modify-write だと、並行して走る `set_disabled` の書き込みと競合したとき
 /// 後勝ちの側が相手の変更（disabled フラグ）を丸ごと巻き戻す事故になる
@@ -318,4 +352,59 @@ fn challenge_expired(fields: &serde_json::Value) -> bool {
         .map(crate::firestore::parse_rfc3339_secs)
         .unwrap_or(0);
     exp < now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::firestore::fake_firestore;
+
+    fn outcome(account_id: &str) -> RegOutcome {
+        RegOutcome {
+            credential_id: format!("cred-{account_id}"),
+            pub_x: "x".into(),
+            pub_y: "y".into(),
+            sign_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_accounts_returns_all_and_reflects_disabled() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        save_credential(&fs, "a@example.com", "acc-a", &outcome("acc-a")).await.unwrap();
+        save_credential(&fs, "b@example.com", "acc-b", &outcome("acc-b")).await.unwrap();
+        set_disabled(&fs, "b@example.com", true).await.unwrap();
+
+        let mut list = list_accounts(&fs).await.unwrap();
+        list.sort_by(|a, b| a.email.cmp(&b.email));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].email, "a@example.com");
+        assert_eq!(list[0].account_id, "acc-a");
+        assert!(!list[0].disabled);
+        assert_eq!(list[1].email, "b@example.com");
+        assert!(list[1].disabled);
+    }
+
+    #[tokio::test]
+    async fn list_accounts_skips_docs_missing_account_id() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        save_credential(&fs, "good@example.com", "acc-good", &outcome("acc-good")).await.unwrap();
+        // accountId を持たない壊れたドキュメントを直接差し込む。
+        fs.set_doc("accounts", "broken@example.com", json!({ "email": firestore::s("broken@example.com") }))
+            .await
+            .unwrap();
+
+        let list = list_accounts(&fs).await.unwrap();
+        assert_eq!(list.len(), 1, "壊れたドキュメントはスキップされ、正常な1件だけ返る");
+        assert_eq!(list[0].email, "good@example.com");
+    }
+
+    #[tokio::test]
+    async fn list_accounts_empty_when_no_accounts() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        assert!(list_accounts(&fs).await.unwrap().is_empty());
+    }
 }

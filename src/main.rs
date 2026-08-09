@@ -350,6 +350,18 @@ async fn mint_iat(args: &[String]) {
         eprintln!("mint: IAT 保存に失敗: {e}");
         std::process::exit(1);
     }
+    audit_log::record(
+        &fs,
+        "cli",
+        "mint_iat",
+        &hash,
+        &format!(
+            "profile={profile:?} hosts={} grants={} ttl_hours={ttl_hours} reusable={reusable}",
+            hosts.join(","),
+            grants.join(",")
+        ),
+    )
+    .await;
     println!("initial_access_token:   {raw}");
     println!("token_hash:             {hash}");
     println!("profile:                {profile:?}");
@@ -485,7 +497,10 @@ async fn revoke_client(args: &[String]) {
     };
     let fs = firestore::Firestore::new(resolve_project());
     match dcr_store::revoke_client(&fs, &client_id).await {
-        Ok(true) => println!("revoked: {client_id}（新規認可・refresh は即停止、発行済み AT は ≤15 分で失効）"),
+        Ok(true) => {
+            audit_log::record(&fs, "cli", "revoke_client", &client_id, "").await;
+            println!("revoked: {client_id}（新規認可・refresh は即停止、発行済み AT は ≤15 分で失効）")
+        }
         Ok(false) => {
             eprintln!("revoke-client: not found: {client_id}");
             std::process::exit(1);

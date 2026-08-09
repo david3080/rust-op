@@ -94,6 +94,11 @@ async fn body_json(resp: Response) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("status={status} body not json: {e} raw={}", String::from_utf8_lossy(&bytes)))
 }
 
+async fn body_text(resp: Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
 /// email 確認は registration:: を直接叩き、passkey 登録は実 HTTP ハンドラを通す。
 /// 戻り値: (SigningKey, credential_id, account_id)。
 async fn register_test_account(p: &Arc<Provider>, email: &str) -> (SigningKey, Vec<u8>, String) {
@@ -305,6 +310,51 @@ async fn disabled_account_cannot_login() {
         login::login_passkey_verify(State(p.clone()), CookieJar::default(), Path(uid.clone()), Json(verify_req))
             .await;
     assert_eq!(verify.status(), StatusCode::FORBIDDEN, "disabled account should be rejected");
+}
+
+/// 管理UI経由でIATをmint→一度だけ表示→再訪問で「表示済み」になる一連の流れを実HTTPハンドラ
+/// 経由で検証する。「一度きり表示」は read-then-delete の順序を間違えやすく、実装ミスに
+/// 気付きにくいため、web/admin.rs のユニットテストとは別にここで通しで確認する。
+#[tokio::test]
+#[ignore]
+async fn admin_mint_iat_flash_is_shown_once() {
+    let p = test_provider();
+    let email = format!("admin-{}@example.com", uuid::Uuid::new_v4());
+    let (_key, _cred_id, account_id) = register_test_account(&p, &email).await;
+    let fs = p.firestore.as_ref().unwrap();
+    crate::admin_store::grant_admin(fs, &account_id, "test").await.unwrap();
+
+    let sid = uuid::Uuid::new_v4().to_string();
+    p.store
+        .save_session(Session { sid: sid.clone(), account_id: account_id.clone(), auth_time: 0 })
+        .await;
+    let jar = CookieJar::default().add(Cookie::new(SID_COOKIE, sid));
+
+    let form: admin::IatMintForm = serde_json::from_value(json!({
+        "profile": "confidential-secret",
+        "redirect_hosts": "rp.example.com",
+        "grant_types": "",
+        "ttl_hours": 1,
+    }))
+    .unwrap();
+    let mint_resp = admin::iat_mint_submit(State(p.clone()), jar.clone(), Form(form)).await;
+    assert!(mint_resp.status().is_redirection(), "mint成功後はリダイレクトすること: {}", mint_resp.status());
+    let location = mint_resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("Location header required")
+        .to_string();
+    let flash_id = location.rsplit('/').next().unwrap().to_string();
+
+    let first = admin::iat_show_once(State(p.clone()), jar.clone(), Path(flash_id.clone())).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = body_text(first).await;
+    assert!(first_body.contains("IATを発行しました"), "1回目は生トークンを表示すること: {first_body}");
+
+    let second = admin::iat_show_once(State(p.clone()), jar.clone(), Path(flash_id)).await;
+    let second_body = body_text(second).await;
+    assert!(second_body.contains("表示済みです"), "2回目は「表示済み」になること: {second_body}");
 }
 
 #[tokio::test]
