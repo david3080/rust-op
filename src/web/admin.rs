@@ -472,6 +472,16 @@ pub(super) async fn client_detail(
     } else {
         c.jwks.iter().map(|k| format!("<li>kid=<code>{}</code></li>", esc(&k.kid))).collect()
     };
+    // 空なら「サインアウトの戻り先が無い＝end_session が not registered で落ちる」状態。
+    // 画面に出ていないと今回のように原因が見えないので、空であることも明示する。
+    let post_logout_redirect_uris: String = if c.post_logout_redirect_uris.is_empty() {
+        "<li>(なし — この client はサインアウト後の戻り先を持ちません)</li>".to_string()
+    } else {
+        c.post_logout_redirect_uris
+            .iter()
+            .map(|u| format!("<li><code>{}</code></li>", esc(u)))
+            .collect()
+    };
 
     let body = format!(
         r#"<h1>{id}</h1>
@@ -479,6 +489,12 @@ pub(super) async fn client_detail(
 <p>client_secret: {secret}</p>
 <p>grant_types: {grants}</p>
 <p>redirect_uris:</p><ul>{redirect_uris}</ul>
+<p>post_logout_redirect_uris:</p><ul>{post_logout_redirect_uris}</ul>
+<form method="post" action="{post_logout_action}">
+<label for="post_logout_redirect_uris">post_logout_redirect_uris（1 行に 1 つ。空にすると戻り先なし）</label>
+<textarea id="post_logout_redirect_uris" name="post_logout_redirect_uris" rows="3" cols="60">{post_logout_value}</textarea>
+<button class="btn" type="submit">戻り先を保存</button>
+</form>
 <p>jwks_uri: {jwks_uri}</p>
 <p>jwks kids:</p><ul>{jwks}</ul>
 <p>require_par: {par} / require_pkce: {pkce} / dpop_bound: {dpop}</p>
@@ -488,6 +504,9 @@ pub(super) async fn client_detail(
         auth = esc(&c.token_endpoint_auth_method),
         secret = if c.client_secret.is_some() { "設定済み" } else { "なし" },
         grants = esc(&c.grant_types.join(", ")),
+        post_logout_value = esc(&c.post_logout_redirect_uris.join("\n")),
+        post_logout_action =
+            esc(&p.path(&format!("/admin/clients/{}/post-logout", c.client_id))),
         jwks_uri = c.jwks_uri.as_deref().map(esc).unwrap_or_else(|| "なし".into()),
         par = c.require_par,
         pkce = c.require_pkce,
@@ -496,6 +515,52 @@ pub(super) async fn client_detail(
         back = esc(&p.path("/admin/clients")),
     );
     page(&p, &format!("Client: {}", esc(&c.client_id)), &body).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct PostLogoutForm {
+    post_logout_redirect_uris: String,
+}
+
+/// 既存クライアントのサインアウトの戻り先を差し替える。
+///
+/// DCR で登録した client に後から戻り先を足すための口（登録は単回消費の IAT を焼くので
+/// 作り直させると client_id が変わり RP 側も巻き込む）。検証は登録時と同じ関数を通す
+/// ——管理画面だからといって緩めない。許可ホストの縛りだけは IAT が無いので掛からない。
+pub(super) async fn client_set_post_logout(
+    State(p): State<Arc<Provider>>,
+    jar: CookieJar,
+    Path(client_id): Path<String>,
+    Form(form): Form<PostLogoutForm>,
+) -> Response {
+    let (viewer, fs) = match require_admin_fs(&p, &jar).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let uris: Vec<String> = form
+        .post_logout_redirect_uris
+        .split(['\n', '\r'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for uri in &uris {
+        if crate::dcr::is_valid_post_logout_redirect_uri(uri) {
+            continue;
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("post_logout_redirect_uri は https で fragment と userinfo を含まないこと: {uri}"),
+        )
+            .into_response();
+    }
+    match crate::dcr_store::set_post_logout_redirect_uris(fs, &client_id, uris.clone()).await {
+        Ok(true) => {
+            crate::audit_log::record(fs, &viewer, "set_post_logout_redirect_uris", &client_id, &uris.join(" ")).await;
+        }
+        Ok(false) => return (StatusCode::NOT_FOUND, "client not found").into_response(),
+        Err(e) => return server_error("client_set_post_logout", &e),
+    }
+    redirect(&p, &format!("/admin/clients/{client_id}"))
 }
 
 pub(super) async fn client_revoke(

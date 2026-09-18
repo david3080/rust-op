@@ -54,6 +54,27 @@ pub async fn save_client(fs: &Firestore, client: &Client) -> Result<(), String> 
     }
 }
 
+/// 既存クライアントの post_logout_redirect_uris を差し替える（管理UIから）。
+///
+/// 登録済みの client を作り直さずにサインアウトの戻り先を足せるようにするための口。
+/// DCR の登録は単回消費の IAT を焼くので、戻り先を足すためだけに再登録させると
+/// client_id が変わり RP 側の設定も巻き込む。ここは値の差し替えに閉じる
+/// （save_client は create_if_absent なので使えない＝上書きは set_doc で明示する）。
+pub async fn set_post_logout_redirect_uris(
+    fs: &Firestore,
+    client_id: &str,
+    uris: Vec<String>,
+) -> Result<bool, String> {
+    let mut client = match load_client(fs, client_id).await {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    client.post_logout_redirect_uris = uris;
+    let json = serde_json::to_string(&client).map_err(|e| format!("serialize client: {e}"))?;
+    fs.set_doc(CLIENTS, client_id, serde_json::json!({ "json": firestore::s(&json) })).await?;
+    Ok(true)
+}
+
 /// clients/ 全件を列挙する（管理UIの一覧表示用）。壊れたJSONブロブはスキップする
 /// （load_client と同じ fail-closed だが沈黙しない方針）。
 pub async fn list_clients(fs: &Firestore) -> Result<Vec<Client>, String> {
@@ -225,6 +246,33 @@ mod tests {
         assert_eq!(loaded.token_endpoint_auth_method, "private_key_jwt");
 
         assert!(load_client(&fs, "unknown").await.is_none());
+    }
+
+    // 既存 client に後からサインアウトの戻り先を足せる（DCR は単回消費の IAT を焼くので
+    // 作り直させない）。保存済みの他のフィールドは変わらないこと。
+    #[tokio::test]
+    async fn set_post_logout_redirect_uris_updates_existing_client() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        save_client(&fs, &client("dcr-pl")).await.unwrap();
+        assert!(load_client(&fs, "dcr-pl").await.unwrap().post_logout_redirect_uris.is_empty());
+
+        let updated = set_post_logout_redirect_uris(&fs, "dcr-pl", vec!["https://rp.example.com/".into()])
+            .await
+            .unwrap();
+        assert!(updated);
+        let c = load_client(&fs, "dcr-pl").await.unwrap();
+        assert_eq!(c.post_logout_redirect_uris, vec!["https://rp.example.com/"]);
+        assert_eq!(c.redirect_uris, vec!["https://rp.example.com/cb"]);
+        assert_eq!(c.token_endpoint_auth_method, "private_key_jwt");
+
+        // 空を渡せば戻り先なしへ戻せる。
+        assert!(set_post_logout_redirect_uris(&fs, "dcr-pl", vec![]).await.unwrap());
+        assert!(load_client(&fs, "dcr-pl").await.unwrap().post_logout_redirect_uris.is_empty());
+
+        // 未知の client は false（作らない）。
+        assert!(!set_post_logout_redirect_uris(&fs, "unknown", vec![]).await.unwrap());
     }
 
     #[tokio::test]

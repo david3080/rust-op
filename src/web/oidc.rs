@@ -848,6 +848,7 @@ pub(super) async fn register(
     };
     let req = crate::dcr::RegistrationRequest {
         redirect_uris: json_string_array(&v, "redirect_uris"),
+        post_logout_redirect_uris: json_string_array(&v, "post_logout_redirect_uris"),
         grant_types: json_string_array(&v, "grant_types"),
         jwks: crate::dcr::jwks_from_jwk_set(v.get("jwks")),
         jwks_uri: v.get("jwks_uri").and_then(|x| x.as_str()).map(String::from),
@@ -922,6 +923,7 @@ fn register_response(c: &crate::model::Client, raw_client_secret: Option<&str>) 
         "token_endpoint_auth_method": c.token_endpoint_auth_method,
         "grant_types": c.grant_types,
         "redirect_uris": c.redirect_uris,
+        "post_logout_redirect_uris": c.post_logout_redirect_uris,
         "require_pushed_authorization_requests": c.require_par,
     });
     if let Some(uri) = &c.jwks_uri {
