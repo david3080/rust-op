@@ -525,8 +525,14 @@ pub(super) struct PostLogoutForm {
 /// 既存クライアントのサインアウトの戻り先を差し替える。
 ///
 /// DCR で登録した client に後から戻り先を足すための口（登録は単回消費の IAT を焼くので
-/// 作り直させると client_id が変わり RP 側も巻き込む）。検証は登録時と同じ関数を通す
-/// ——管理画面だからといって緩めない。許可ホストの縛りだけは IAT が無いので掛からない。
+/// 作り直させると client_id が変わり RP 側も巻き込む）。
+///
+/// 縛りは 2 段。形（https・fragment/userinfo なし）は登録時と同じ関数を通す。ホストは
+/// **その client 自身の redirect_uris のホスト集合**に閉じる——管理画面には IAT が無く
+/// allowed_redirect_hosts を参照できないので、代わりに「登録済みの redirect と同じ
+/// ホストにしか戻せない」で塞ぐ。これで admin 経由の口が DCR 経由より広くならない。
+///
+/// 書き戻しは CAS。読んでから書くまでに別の更新が入ったら 409 で返し、やり直させる。
 pub(super) async fn client_set_post_logout(
     State(p): State<Arc<Provider>>,
     jar: CookieJar,
@@ -543,21 +549,27 @@ pub(super) async fn client_set_post_logout(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    for uri in &uris {
-        if crate::dcr::is_valid_post_logout_redirect_uri(uri) {
-            continue;
-        }
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("post_logout_redirect_uri は https で fragment と userinfo を含まないこと: {uri}"),
-        )
-            .into_response();
+
+    let (mut client, update_time) = match crate::dcr_store::load_client_with_version(fs, &client_id).await {
+        Ok(Some(x)) => x,
+        Ok(None) => return (StatusCode::NOT_FOUND, "client not found").into_response(),
+        Err(e) => return server_error("client_set_post_logout load", &e),
+    };
+    if let Err(msg) = crate::dcr::check_admin_post_logout_uris(&uris, &client.redirect_uris) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
     }
-    match crate::dcr_store::set_post_logout_redirect_uris(fs, &client_id, uris.clone()).await {
+    client.post_logout_redirect_uris = uris.clone();
+    match crate::dcr_store::put_client_if_unchanged(fs, &client, &update_time).await {
         Ok(true) => {
             crate::audit_log::record(fs, &viewer, "set_post_logout_redirect_uris", &client_id, &uris.join(" ")).await;
         }
-        Ok(false) => return (StatusCode::NOT_FOUND, "client not found").into_response(),
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                "この client は別の更新で変わりました。開き直してからやり直してください。",
+            )
+                .into_response()
+        }
         Err(e) => return server_error("client_set_post_logout", &e),
     }
     redirect(&p, &format!("/admin/clients/{client_id}"))

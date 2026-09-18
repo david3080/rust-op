@@ -302,6 +302,36 @@ pub fn is_valid_post_logout_redirect_uri(uri: &str) -> bool {
     https_host(uri).is_some()
 }
 
+/// 管理画面から差し替える post_logout_redirect_uris の検証。
+///
+/// 管理画面には IAT が無く `allowed_redirect_hosts` を参照できない。代わりに
+/// **その client 自身の redirect_uris のホスト集合**へ閉じる: 登録時に許可ホストの
+/// 検証を通った redirect のホストにしか戻せないので、admin 経由の口が DCR 経由より
+/// 広い戻り先を作れない（オープンリダイレクトの足場を増やさない）。
+/// Err はそのまま利用者へ見せる文言。
+pub fn check_admin_post_logout_uris(
+    uris: &[String],
+    client_redirect_uris: &[String],
+) -> Result<(), String> {
+    let allowed: Vec<&str> = client_redirect_uris.iter().filter_map(|u| https_host(u)).collect();
+    for uri in uris {
+        let host = match https_host(uri) {
+            Some(h) => h,
+            None => {
+                return Err(format!(
+                    "post_logout_redirect_uri は https で fragment と userinfo を含まないこと: {uri}"
+                ))
+            }
+        };
+        if !allowed.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            return Err(format!(
+                "post_logout_redirect_uri のホストは、この client の redirect_uris と同じでなければなりません: {host}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn https_host(uri: &str) -> Option<&str> {
     if uri.contains('#') {
         return None; // redirect_uri に fragment は不可（RFC 6749 §3.1.2）。
@@ -367,6 +397,28 @@ mod tests {
         let r = req(&["https://rp.example.com/cb"], &["authorization_code"], vec![jwk()]);
         let c = validate_registration("cid-pl-2", &r, &constraints()).unwrap().client;
         assert!(c.post_logout_redirect_uris.is_empty());
+    }
+
+    // 管理画面からの差し替え: その client の redirect_uris のホストにしか戻せない
+    // （admin の口が DCR の口より広い戻り先を作れないようにする）。
+    #[test]
+    fn admin_post_logout_uris_must_share_a_redirect_uri_host() {
+        let redirects = vec!["https://rp.example.com/cb".to_string()];
+        assert!(check_admin_post_logout_uris(
+            &["https://rp.example.com/".to_string()],
+            &redirects
+        )
+        .is_ok());
+        // 別ホストは不可（許可ホストの縛りが効かない穴を塞ぐ）。
+        let e = check_admin_post_logout_uris(&["https://evil.example.net/".to_string()], &redirects)
+            .unwrap_err();
+        assert!(e.contains("evil.example.net"), "{e}");
+        // 形の縛りは登録時と同じ。
+        for bad in ["http://rp.example.com/", "https://rp.example.com/#x", "https://u@rp.example.com/"] {
+            assert!(check_admin_post_logout_uris(&[bad.to_string()], &redirects).is_err(), "{bad}");
+        }
+        // 空は許す（戻り先なしへ戻せる）。
+        assert!(check_admin_post_logout_uris(&[], &redirects).is_ok());
     }
 
     // redirect_uri と同じ縛り: 許可ホストの外は拒否。

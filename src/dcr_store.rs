@@ -54,25 +54,41 @@ pub async fn save_client(fs: &Firestore, client: &Client) -> Result<(), String> 
     }
 }
 
-/// 既存クライアントの post_logout_redirect_uris を差し替える（管理UIから）。
-///
-/// 登録済みの client を作り直さずにサインアウトの戻り先を足せるようにするための口。
-/// DCR の登録は単回消費の IAT を焼くので、戻り先を足すためだけに再登録させると
-/// client_id が変わり RP 側の設定も巻き込む。ここは値の差し替えに閉じる
-/// （save_client は create_if_absent なので使えない＝上書きは set_doc で明示する）。
-pub async fn set_post_logout_redirect_uris(
+/// クライアントを updateTime つきで読む（読んで直して書き戻す操作の前半）。
+/// 書き戻しは [`put_client_if_unchanged`] に渡す——間に他者の書き込みが入ったら負ける。
+pub async fn load_client_with_version(
     fs: &Firestore,
     client_id: &str,
-    uris: Vec<String>,
-) -> Result<bool, String> {
-    let mut client = match load_client(fs, client_id).await {
-        Some(c) => c,
-        None => return Ok(false),
+) -> Result<Option<(Client, String)>, String> {
+    let (fields, update_time) = match fs.get_doc_with_update_time(CLIENTS, client_id).await? {
+        Some(x) => x,
+        None => return Ok(None),
     };
-    client.post_logout_redirect_uris = uris;
-    let json = serde_json::to_string(&client).map_err(|e| format!("serialize client: {e}"))?;
-    fs.set_doc(CLIENTS, client_id, serde_json::json!({ "json": firestore::s(&json) })).await?;
-    Ok(true)
+    let json = field_str(&fields, "json").ok_or("client: missing json field")?;
+    let client: Client = serde_json::from_str(json).map_err(|e| format!("client json: {e}"))?;
+    Ok(Some((client, update_time)))
+}
+
+/// 読んだときの updateTime と一致するときだけ書き戻す（compare-and-set）。
+/// 一致すれば Ok(true)、間に別の書き込みが入っていたら Ok(false)＝呼び出し側は読み直す。
+///
+/// 既存 client を作り直さずに直せるようにするための口（DCR の登録は単回消費の IAT を
+/// 焼くので、値を 1 つ足すためだけに再登録させると client_id が変わり RP 側も巻き込む）。
+/// save_client は create_if_absent なので更新には使えない。ここで CAS を使うのは
+/// consume_iat と同じ理由——読んで書き戻す形は、CAS が無いと他者の更新を黙って消す。
+pub async fn put_client_if_unchanged(
+    fs: &Firestore,
+    client: &Client,
+    update_time: &str,
+) -> Result<bool, String> {
+    let json = serde_json::to_string(client).map_err(|e| format!("serialize client: {e}"))?;
+    fs.set_doc_if_unchanged(
+        CLIENTS,
+        &client.client_id,
+        serde_json::json!({ "json": firestore::s(&json) }),
+        update_time,
+    )
+    .await
 }
 
 /// clients/ 全件を列挙する（管理UIの一覧表示用）。壊れたJSONブロブはスキップする
@@ -251,28 +267,50 @@ mod tests {
     // 既存 client に後からサインアウトの戻り先を足せる（DCR は単回消費の IAT を焼くので
     // 作り直させない）。保存済みの他のフィールドは変わらないこと。
     #[tokio::test]
-    async fn set_post_logout_redirect_uris_updates_existing_client() {
+    async fn put_client_if_unchanged_updates_existing_client() {
         let (host, _state) = fake_firestore::spawn().await;
         let fs = Firestore::new_for_test("proj", host);
 
         save_client(&fs, &client("dcr-pl")).await.unwrap();
-        assert!(load_client(&fs, "dcr-pl").await.unwrap().post_logout_redirect_uris.is_empty());
+        let (mut c, v) = load_client_with_version(&fs, "dcr-pl").await.unwrap().unwrap();
+        assert!(c.post_logout_redirect_uris.is_empty());
 
-        let updated = set_post_logout_redirect_uris(&fs, "dcr-pl", vec!["https://rp.example.com/".into()])
-            .await
-            .unwrap();
-        assert!(updated);
-        let c = load_client(&fs, "dcr-pl").await.unwrap();
-        assert_eq!(c.post_logout_redirect_uris, vec!["https://rp.example.com/"]);
-        assert_eq!(c.redirect_uris, vec!["https://rp.example.com/cb"]);
-        assert_eq!(c.token_endpoint_auth_method, "private_key_jwt");
+        c.post_logout_redirect_uris = vec!["https://rp.example.com/".into()];
+        assert!(put_client_if_unchanged(&fs, &c, &v).await.unwrap());
 
-        // 空を渡せば戻り先なしへ戻せる。
-        assert!(set_post_logout_redirect_uris(&fs, "dcr-pl", vec![]).await.unwrap());
-        assert!(load_client(&fs, "dcr-pl").await.unwrap().post_logout_redirect_uris.is_empty());
+        let stored = load_client(&fs, "dcr-pl").await.unwrap();
+        assert_eq!(stored.post_logout_redirect_uris, vec!["https://rp.example.com/"]);
+        assert_eq!(stored.redirect_uris, vec!["https://rp.example.com/cb"]);
+        assert_eq!(stored.token_endpoint_auth_method, "private_key_jwt");
+    }
 
-        // 未知の client は false（作らない）。
-        assert!(!set_post_logout_redirect_uris(&fs, "unknown", vec![]).await.unwrap());
+    // 読んでから書くまでに別の更新が入ったら負ける（黙って相手の更新を消さない）。
+    #[tokio::test]
+    async fn put_client_if_unchanged_loses_to_a_concurrent_write() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        save_client(&fs, &client("dcr-race")).await.unwrap();
+        // A が読む。
+        let (mut a, va) = load_client_with_version(&fs, "dcr-race").await.unwrap().unwrap();
+        // B が先に書く。
+        let (mut b, vb) = load_client_with_version(&fs, "dcr-race").await.unwrap().unwrap();
+        b.post_logout_redirect_uris = vec!["https://rp.example.com/b".into()];
+        assert!(put_client_if_unchanged(&fs, &b, &vb).await.unwrap());
+        // A の書き戻しは古い版なので負ける。
+        a.post_logout_redirect_uris = vec!["https://rp.example.com/a".into()];
+        assert!(!put_client_if_unchanged(&fs, &a, &va).await.unwrap(), "古い版の書き戻しが通ってしまった");
+        // B の値が残っている。
+        let stored = load_client(&fs, "dcr-race").await.unwrap();
+        assert_eq!(stored.post_logout_redirect_uris, vec!["https://rp.example.com/b"]);
+    }
+
+    // 未知の client は None（作らない）。
+    #[tokio::test]
+    async fn load_client_with_version_returns_none_for_unknown() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        assert!(load_client_with_version(&fs, "unknown").await.unwrap().is_none());
     }
 
     #[tokio::test]
