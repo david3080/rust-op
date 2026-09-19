@@ -104,7 +104,7 @@ async fn main() {
     let base_path = std::env::var("BASE_PATH").unwrap_or_default();
     let issuer = format!("{origin}{base_path}");
 
-    // demo-rp / mobile-rp / ciba-rp / qm-rp は Step5 の移行(migrate-static-clients)で
+    // demo-rp / mobile-rp / ciba-rp は Step5 の移行(migrate-static-clients)で
     // Firestore(clients/)へ移り、resolve_client の静的Map→Firestoreフォールバック経由で
     // 解決される（static_app_clients は移行コマンド専用の定義源として main.rs 側に残す）。
     // このため Firestore が未配線のローカル実行(FIRESTORE_EMULATOR_HOST 未設定)では
@@ -372,12 +372,12 @@ async fn mint_iat(args: &[String]) {
     eprintln!("注意: 生トークンの表示は一度だけ。この出力は Cloud Logging に残ります。");
 }
 
-/// demo-rp/mobile-rp/ciba-rp/qm-rp の定義。Step5 完了により main() はこれを直接使わなく
+/// demo-rp/mobile-rp/ciba-rp の定義。Step5 完了により main() はこれを直接使わなく
 /// なり（resolve_client の Firestore フォールバックで解決する）、migrate_static_clients_cmd
 /// 専用の定義源として残る（再移行・検証時にここを見れば「あるべき姿」がわかる）。
-/// ciba_rp_secret_hash/qm_rp_secret_hash は既にハッシュ済み（dcr::hash_token通過後）の
+/// ciba_rp_secret_hash は既にハッシュ済み（dcr::hash_token通過後）の
 /// 値を渡すこと（ここでは平文を一切扱わない）。
-fn static_app_clients(issuer: &str, ciba_rp_secret_hash: String, qm_rp_secret_hash: String) -> Vec<Client> {
+fn static_app_clients(issuer: &str, ciba_rp_secret_hash: String) -> Vec<Client> {
     vec![
         // demo-rp: public client + PKCE。redirect_uri は内蔵コールバックページ。
         Client {
@@ -422,22 +422,6 @@ fn static_app_clients(issuer: &str, ciba_rp_secret_hash: String, qm_rp_secret_ha
             jwks_uri: None,
             require_par: false,
             require_pkce: false,
-            id_token_signed_response_alg: None,
-        },
-        // qm-rp: FAPI 2.0 厳格設定を満たせない外部 RP 用の静的クライアント
-        // （client_secret_basic + PKCE のみ。PAR/DPoP は非対応）。
-        Client {
-            client_id: "qm-rp".into(),
-            redirect_uris: vec!["http://127.0.0.1:8082/auth/callback".into()],
-            post_logout_redirect_uris: vec!["http://127.0.0.1:8082/".into()],
-            token_endpoint_auth_method: "client_secret_basic".into(),
-            client_secret: Some(qm_rp_secret_hash),
-            grant_types: vec!["authorization_code".into(), "refresh_token".into()],
-            dpop_bound: false,
-            jwks: vec![],
-            jwks_uri: None,
-            require_par: false,
-            require_pkce: true, // qm は S256 を送るので有効化できる
             id_token_signed_response_alg: None,
         },
     ]
@@ -691,7 +675,7 @@ fn require_env(name: &str) -> String {
 
 /// Secret Manager から取得したclient_secretをハッシュ化する。取得できた値がたまたま
 /// 同名の環境変数にも設定されていれば一致を確認する: 本コマンドはSecret Managerを直接
-/// 読む唯一の経路（Step5完了によりmain()はCIBA_RP_SECRET/QM_RP_SECRETを一切読まなくなり、
+/// 読む唯一の経路（Step5完了によりmain()はCIBA_RP_SECRETを一切読まなくなり、
 /// これらのclient_secretはFirestoreに保存済みのハッシュのみを唯一の正とする）。それでも
 /// 念のため、たまたま同名の環境変数が設定されていれば一致を確認する（食い違いに気づかず
 /// 誤ったハッシュをFirestoreへ書き込むと、save_client が create_if_absent のため事後修正も
@@ -720,16 +704,20 @@ async fn secret_hash_from_manager_verified(fs: &firestore::Firestore, name: &'st
     dcr::hash_token(&raw)
 }
 
-/// demo-rp/mobile-rp/ciba-rp/qm-rp を Firestore(clients/)へ一度きり移行する(Step5)。
+/// demo-rp/mobile-rp/ciba-rp を Firestore(clients/)へ一度きり移行する(Step5)。
 /// main() は既にこれらの静的登録(.with_client)を持たず、resolve_client の Firestore
 /// フォールバックのみで解決する。**そのため、このコマンドを対象のFirestoreデータベースへ
 /// 実行し終える前に新しいバイナリをデプロイすると、そのデータベースを向いているサービスは
-/// これら4クライアントを一切解決できなくなる**（本番/stagingでそれぞれ別のFirestore
+/// これら3クライアントを一切解決できなくなる**（本番/stagingでそれぞれ別のFirestore
 /// データベースを使う構成では、両方に対して実行すること。デプロイ順序を守るための
 /// 自動チェックはコード側にもCI/CD側にも無いため、運用上の手順として徹底する必要がある）。
 ///
-/// client_secret は Secret Manager の CIBA_RP_SECRET/QM_RP_SECRET の**現在値**をハッシュ化して
-/// 保存する（新規生成しない。既存の外部RP統合(QM等)のsecretをローテーションさせないため）。
+/// client_secret は Secret Manager の CIBA_RP_SECRET の**現在値**をハッシュ化して保存する
+/// （新規生成しない。既存の外部RP統合のsecretをローテーションさせないため）。
+///
+/// qm-rp は 2026-09-19 に廃止した。AmateQM(qm) は DCR で登録した client を使っており、
+/// 静的登録の qm-rp はどこからも参照されていなかった（portal の OIDC_CLIENT_ID が実体）。
+/// これら4クライアントという記述は3クライアントに読み替えること。
 ///
 /// ドライランは Firestore の現状（各client_idが既にあるか）だけ確認する。Secret Manager
 /// へは触れないため、Secret Manager の IAM 権限が無くても事前確認できる
@@ -751,7 +739,7 @@ async fn migrate_static_clients_cmd(args: &[String]) {
 
     if !apply {
         println!("[dry-run] project={}", fs.project());
-        for id in ["demo-rp", "mobile-rp", "ciba-rp", "qm-rp"] {
+        for id in ["demo-rp", "mobile-rp", "ciba-rp"] {
             let status = if dcr_store::load_client(&fs, id).await.is_some() {
                 "既にFirestoreに存在（--apply はこの client_id をエラーにします）"
             } else {
@@ -766,10 +754,9 @@ async fn migrate_static_clients_cmd(args: &[String]) {
     let base_path = std::env::var("BASE_PATH").unwrap_or_default();
     let issuer = format!("{origin}{base_path}");
     let ciba_rp_secret_hash = secret_hash_from_manager_verified(&fs, "CIBA_RP_SECRET").await;
-    let qm_rp_secret_hash = secret_hash_from_manager_verified(&fs, "QM_RP_SECRET").await;
 
     let mut had_error = false;
-    for c in static_app_clients(&issuer, ciba_rp_secret_hash, qm_rp_secret_hash) {
+    for c in static_app_clients(&issuer, ciba_rp_secret_hash) {
         let expected_json = serde_json::to_string(&c).unwrap();
         match dcr_store::save_client(&fs, &c).await {
             Ok(()) => match dcr_store::load_client(&fs, &c.client_id).await {
