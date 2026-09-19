@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 /// （RP がリクエストで選ぶものではない——弱いプロファイルへの自己ダウングレードを防ぐ）。
 ///
 /// 3種は既存の静的クライアントが実例そのもの: Public = demo-rp/mobile-rp、
-/// ConfidentialSecret = qm-rp（FAPI2厳格設定を満たせない外部RP向け）、
+/// ConfidentialSecret = FAPI2厳格設定を満たせない外部RP向け、
 /// ConfidentialKey = 従来のDCR既定（private_key_jwt、FAPI2相当）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -259,7 +259,7 @@ pub fn validate_registration(
             })
         }
         ClientProfile::ConfidentialSecret => {
-            // qm-rp（静的クライアント）と同じ設定: client_secret_basic + PKCE 必須、
+            // 外部 RP 向けの設定: client_secret_basic + PKCE 必須、
             // PAR/DPoP は要求しない（対応できない外部RP向けプロファイル）。
             let (raw, hash) = gen_random_token();
             Ok(RegistrationOutcome {
