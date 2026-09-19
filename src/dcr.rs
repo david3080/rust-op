@@ -65,6 +65,9 @@ fn default_profile() -> ClientProfile {
 /// RP が提示する登録メタデータ（RFC 7591 の部分集合）。
 pub struct RegistrationRequest {
     pub redirect_uris: Vec<String>,
+    /// RP-Initiated Logout の戻り先（OpenID Connect RP-Initiated Logout 1.0 §2 の登録項目）。
+    /// 省略可。省略時は空＝その client はサインアウト後の戻り先を持たない。
+    pub post_logout_redirect_uris: Vec<String>,
     pub grant_types: Vec<String>,
     pub jwks: Vec<JwkPub>,
     /// inline jwks の代わりに JWKS エンドポイントで鍵を提示する場合（RFC 7591）。
@@ -76,18 +79,25 @@ pub enum DcrError {
     NoRedirectUris,
     InsecureRedirectUri(String),
     RedirectHostNotAllowed(String),
+    InsecurePostLogoutRedirectUri(String),
+    PostLogoutRedirectHostNotAllowed(String),
     MissingJwks,
     GrantTypeNotAllowed(String),
 }
 
 impl DcrError {
     /// RFC 7591 のエラーコード（invalid_redirect_uri / invalid_client_metadata）。
+    /// post_logout_redirect_uris は RFC 7591 の redirect_uris ではないので
+    /// invalid_client_metadata 側（RFC 7591 §3.2.2 の「その他のメタデータの不備」）。
     pub fn code(&self) -> &'static str {
         match self {
             DcrError::NoRedirectUris
             | DcrError::InsecureRedirectUri(_)
             | DcrError::RedirectHostNotAllowed(_) => "invalid_redirect_uri",
-            DcrError::MissingJwks | DcrError::GrantTypeNotAllowed(_) => "invalid_client_metadata",
+            DcrError::InsecurePostLogoutRedirectUri(_)
+            | DcrError::PostLogoutRedirectHostNotAllowed(_)
+            | DcrError::MissingJwks
+            | DcrError::GrantTypeNotAllowed(_) => "invalid_client_metadata",
         }
     }
 
@@ -100,6 +110,12 @@ impl DcrError {
             }
             DcrError::RedirectHostNotAllowed(h) => {
                 format!("redirect_uri host not allowed by the initial access token: {h}")
+            }
+            DcrError::InsecurePostLogoutRedirectUri(u) => {
+                format!("post_logout_redirect_uri must be https without fragment or userinfo: {u}")
+            }
+            DcrError::PostLogoutRedirectHostNotAllowed(h) => {
+                format!("post_logout_redirect_uri host not allowed by the initial access token: {h}")
             }
             DcrError::MissingJwks => "a jwks with at least one EC P-256 key is required".into(),
             DcrError::GrantTypeNotAllowed(g) => {
@@ -185,6 +201,16 @@ pub fn validate_registration(
             return Err(DcrError::RedirectHostNotAllowed(host.to_string()));
         }
     }
+    // post_logout_redirect_uri: 任意。あるなら redirect_uri と同じ縛り（https・fragment/
+    // userinfo なし・IAT の許可ホスト内）。end_session はここに登録された値としか一致を
+    // 認めない（web/oidc.rs）ので、登録の時点で同じ強さに揃えておく。
+    for uri in &req.post_logout_redirect_uris {
+        let host =
+            https_host(uri).ok_or_else(|| DcrError::InsecurePostLogoutRedirectUri(uri.clone()))?;
+        if !c.allowed_redirect_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            return Err(DcrError::PostLogoutRedirectHostNotAllowed(host.to_string()));
+        }
+    }
     // grant_type: 指定があれば許可集合の部分集合。無指定は authorization_code。全プロファイル共通。
     let grant_types = if req.grant_types.is_empty() {
         vec!["authorization_code".to_string()]
@@ -200,7 +226,7 @@ pub fn validate_registration(
     let base = Client {
         client_id: client_id.to_string(),
         redirect_uris: req.redirect_uris.clone(),
-        post_logout_redirect_uris: vec![],
+        post_logout_redirect_uris: req.post_logout_redirect_uris.clone(),
         token_endpoint_auth_method: String::new(), // プロファイル毎に下で設定
         client_secret: None,
         grant_types,
@@ -269,6 +295,43 @@ pub fn validate_registration(
 /// これを許すと `https://rp.example.com:x@evil.com/cb` のように、本関数は許可ホスト
 /// (`rp.example.com`)を返すのにブラウザは `@` 以降(`evil.com`)を実ホストとして解釈し、
 /// 許可リストを抜けて認可コードを攻撃者へ送れてしまう(ホスト偽装)。
+/// post_logout_redirect_uri が形として受け入れ可能か（https・fragment/userinfo なし）。
+/// 登録時（validate_registration）と管理画面からの差し替えで同じ判定を使う。
+/// 許可ホストの照合は IAT の制約側なので、ここには含めない。
+pub fn is_valid_post_logout_redirect_uri(uri: &str) -> bool {
+    https_host(uri).is_some()
+}
+
+/// 管理画面から差し替える post_logout_redirect_uris の検証。
+///
+/// 管理画面には IAT が無く `allowed_redirect_hosts` を参照できない。代わりに
+/// **その client 自身の redirect_uris のホスト集合**へ閉じる: 登録時に許可ホストの
+/// 検証を通った redirect のホストにしか戻せないので、admin 経由の口が DCR 経由より
+/// 広い戻り先を作れない（オープンリダイレクトの足場を増やさない）。
+/// Err はそのまま利用者へ見せる文言。
+pub fn check_admin_post_logout_uris(
+    uris: &[String],
+    client_redirect_uris: &[String],
+) -> Result<(), String> {
+    let allowed: Vec<&str> = client_redirect_uris.iter().filter_map(|u| https_host(u)).collect();
+    for uri in uris {
+        let host = match https_host(uri) {
+            Some(h) => h,
+            None => {
+                return Err(format!(
+                    "post_logout_redirect_uri は https で fragment と userinfo を含まないこと: {uri}"
+                ))
+            }
+        };
+        if !allowed.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            return Err(format!(
+                "post_logout_redirect_uri のホストは、この client の redirect_uris と同じでなければなりません: {host}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn https_host(uri: &str) -> Option<&str> {
     if uri.contains('#') {
         return None; // redirect_uri に fragment は不可（RFC 6749 §3.1.2）。
@@ -305,9 +368,86 @@ mod tests {
     fn req(redirect: &[&str], grants: &[&str], jwks: Vec<JwkPub>) -> RegistrationRequest {
         RegistrationRequest {
             redirect_uris: redirect.iter().map(|s| s.to_string()).collect(),
+            post_logout_redirect_uris: vec![],
             grant_types: grants.iter().map(|s| s.to_string()).collect(),
             jwks,
             jwks_uri: None,
+        }
+    }
+
+    fn req_with_post_logout(post_logout: &[&str]) -> RegistrationRequest {
+        RegistrationRequest {
+            post_logout_redirect_uris: post_logout.iter().map(|s| s.to_string()).collect(),
+            ..req(&["https://rp.example.com/cb"], &["authorization_code"], vec![jwk()])
+        }
+    }
+
+    // RP-Initiated Logout: 登録した戻り先が client に載る（載らないと end_session が
+    // 「not registered」で落ち、DCR で作った client はサインアウトできない）。
+    #[test]
+    fn post_logout_redirect_uris_are_registered() {
+        let r = req_with_post_logout(&["https://rp.example.com/"]);
+        let c = validate_registration("cid-pl-1", &r, &constraints()).unwrap().client;
+        assert_eq!(c.post_logout_redirect_uris, vec!["https://rp.example.com/"]);
+    }
+
+    // 省略時は空のまま（従来どおり）。
+    #[test]
+    fn post_logout_redirect_uris_default_to_empty() {
+        let r = req(&["https://rp.example.com/cb"], &["authorization_code"], vec![jwk()]);
+        let c = validate_registration("cid-pl-2", &r, &constraints()).unwrap().client;
+        assert!(c.post_logout_redirect_uris.is_empty());
+    }
+
+    // 管理画面からの差し替え: その client の redirect_uris のホストにしか戻せない
+    // （admin の口が DCR の口より広い戻り先を作れないようにする）。
+    #[test]
+    fn admin_post_logout_uris_must_share_a_redirect_uri_host() {
+        let redirects = vec!["https://rp.example.com/cb".to_string()];
+        assert!(check_admin_post_logout_uris(
+            &["https://rp.example.com/".to_string()],
+            &redirects
+        )
+        .is_ok());
+        // 別ホストは不可（許可ホストの縛りが効かない穴を塞ぐ）。
+        let e = check_admin_post_logout_uris(&["https://evil.example.net/".to_string()], &redirects)
+            .unwrap_err();
+        assert!(e.contains("evil.example.net"), "{e}");
+        // 形の縛りは登録時と同じ。
+        for bad in ["http://rp.example.com/", "https://rp.example.com/#x", "https://u@rp.example.com/"] {
+            assert!(check_admin_post_logout_uris(&[bad.to_string()], &redirects).is_err(), "{bad}");
+        }
+        // 空は許す（戻り先なしへ戻せる）。
+        assert!(check_admin_post_logout_uris(&[], &redirects).is_ok());
+    }
+
+    // redirect_uri と同じ縛り: 許可ホストの外は拒否。
+    #[test]
+    fn post_logout_redirect_uri_host_must_be_allowed() {
+        let r = req_with_post_logout(&["https://evil.example.net/"]);
+        let e = match validate_registration("cid-pl-3", &r, &constraints()) {
+            Err(e) => e,
+            Ok(_) => panic!("許可ホスト外の post_logout_redirect_uri が通ってしまった"),
+        };
+        assert_eq!(e, DcrError::PostLogoutRedirectHostNotAllowed("evil.example.net".into()));
+        assert_eq!(e.code(), "invalid_client_metadata");
+    }
+
+    // http / fragment / userinfo も拒否（https_host が None を返す形）。
+    #[test]
+    fn post_logout_redirect_uri_must_be_https_without_fragment_or_userinfo() {
+        for bad in [
+            "http://rp.example.com/",
+            "https://rp.example.com/#x",
+            "https://user@rp.example.com/",
+        ] {
+            let r = req_with_post_logout(&[bad]);
+            let e = match validate_registration("cid-pl-4", &r, &constraints()) {
+                Err(e) => e,
+                Ok(_) => panic!("{bad} が通ってしまった"),
+            };
+            assert_eq!(e, DcrError::InsecurePostLogoutRedirectUri(bad.into()), "{bad}");
+            assert!(!is_valid_post_logout_redirect_uri(bad), "{bad}");
         }
     }
 
@@ -331,6 +471,7 @@ mod tests {
     fn registration_with_jwks_uri_only_is_accepted() {
         let r = RegistrationRequest {
             redirect_uris: vec!["https://rp.example.com/cb".into()],
+            post_logout_redirect_uris: vec![],
             grant_types: vec![],
             jwks: vec![],
             jwks_uri: Some("https://rp.example.com/jwks".into()),
@@ -375,6 +516,7 @@ mod tests {
     fn registration_without_any_key_source_is_rejected() {
         let r = RegistrationRequest {
             redirect_uris: vec!["https://rp.example.com/cb".into()],
+            post_logout_redirect_uris: vec![],
             grant_types: vec![],
             jwks: vec![],
             jwks_uri: None,

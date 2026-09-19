@@ -54,6 +54,43 @@ pub async fn save_client(fs: &Firestore, client: &Client) -> Result<(), String> 
     }
 }
 
+/// クライアントを updateTime つきで読む（読んで直して書き戻す操作の前半）。
+/// 書き戻しは [`put_client_if_unchanged`] に渡す——間に他者の書き込みが入ったら負ける。
+pub async fn load_client_with_version(
+    fs: &Firestore,
+    client_id: &str,
+) -> Result<Option<(Client, String)>, String> {
+    let (fields, update_time) = match fs.get_doc_with_update_time(CLIENTS, client_id).await? {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+    let json = field_str(&fields, "json").ok_or("client: missing json field")?;
+    let client: Client = serde_json::from_str(json).map_err(|e| format!("client json: {e}"))?;
+    Ok(Some((client, update_time)))
+}
+
+/// 読んだときの updateTime と一致するときだけ書き戻す（compare-and-set）。
+/// 一致すれば Ok(true)、間に別の書き込みが入っていたら Ok(false)＝呼び出し側は読み直す。
+///
+/// 既存 client を作り直さずに直せるようにするための口（DCR の登録は単回消費の IAT を
+/// 焼くので、値を 1 つ足すためだけに再登録させると client_id が変わり RP 側も巻き込む）。
+/// save_client は create_if_absent なので更新には使えない。ここで CAS を使うのは
+/// consume_iat と同じ理由——読んで書き戻す形は、CAS が無いと他者の更新を黙って消す。
+pub async fn put_client_if_unchanged(
+    fs: &Firestore,
+    client: &Client,
+    update_time: &str,
+) -> Result<bool, String> {
+    let json = serde_json::to_string(client).map_err(|e| format!("serialize client: {e}"))?;
+    fs.set_doc_if_unchanged(
+        CLIENTS,
+        &client.client_id,
+        serde_json::json!({ "json": firestore::s(&json) }),
+        update_time,
+    )
+    .await
+}
+
 /// clients/ 全件を列挙する（管理UIの一覧表示用）。壊れたJSONブロブはスキップする
 /// （load_client と同じ fail-closed だが沈黙しない方針）。
 pub async fn list_clients(fs: &Firestore) -> Result<Vec<Client>, String> {
@@ -225,6 +262,55 @@ mod tests {
         assert_eq!(loaded.token_endpoint_auth_method, "private_key_jwt");
 
         assert!(load_client(&fs, "unknown").await.is_none());
+    }
+
+    // 既存 client に後からサインアウトの戻り先を足せる（DCR は単回消費の IAT を焼くので
+    // 作り直させない）。保存済みの他のフィールドは変わらないこと。
+    #[tokio::test]
+    async fn put_client_if_unchanged_updates_existing_client() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        save_client(&fs, &client("dcr-pl")).await.unwrap();
+        let (mut c, v) = load_client_with_version(&fs, "dcr-pl").await.unwrap().unwrap();
+        assert!(c.post_logout_redirect_uris.is_empty());
+
+        c.post_logout_redirect_uris = vec!["https://rp.example.com/".into()];
+        assert!(put_client_if_unchanged(&fs, &c, &v).await.unwrap());
+
+        let stored = load_client(&fs, "dcr-pl").await.unwrap();
+        assert_eq!(stored.post_logout_redirect_uris, vec!["https://rp.example.com/"]);
+        assert_eq!(stored.redirect_uris, vec!["https://rp.example.com/cb"]);
+        assert_eq!(stored.token_endpoint_auth_method, "private_key_jwt");
+    }
+
+    // 読んでから書くまでに別の更新が入ったら負ける（黙って相手の更新を消さない）。
+    #[tokio::test]
+    async fn put_client_if_unchanged_loses_to_a_concurrent_write() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+
+        save_client(&fs, &client("dcr-race")).await.unwrap();
+        // A が読む。
+        let (mut a, va) = load_client_with_version(&fs, "dcr-race").await.unwrap().unwrap();
+        // B が先に書く。
+        let (mut b, vb) = load_client_with_version(&fs, "dcr-race").await.unwrap().unwrap();
+        b.post_logout_redirect_uris = vec!["https://rp.example.com/b".into()];
+        assert!(put_client_if_unchanged(&fs, &b, &vb).await.unwrap());
+        // A の書き戻しは古い版なので負ける。
+        a.post_logout_redirect_uris = vec!["https://rp.example.com/a".into()];
+        assert!(!put_client_if_unchanged(&fs, &a, &va).await.unwrap(), "古い版の書き戻しが通ってしまった");
+        // B の値が残っている。
+        let stored = load_client(&fs, "dcr-race").await.unwrap();
+        assert_eq!(stored.post_logout_redirect_uris, vec!["https://rp.example.com/b"]);
+    }
+
+    // 未知の client は None（作らない）。
+    #[tokio::test]
+    async fn load_client_with_version_returns_none_for_unknown() {
+        let (host, _state) = fake_firestore::spawn().await;
+        let fs = Firestore::new_for_test("proj", host);
+        assert!(load_client_with_version(&fs, "unknown").await.unwrap().is_none());
     }
 
     #[tokio::test]

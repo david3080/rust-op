@@ -110,6 +110,10 @@ pub fn router(provider: Provider) -> Router {
         .route("/admin/clients", get(admin::clients_list))
         .route("/admin/clients/{client_id}", get(admin::client_detail))
         .route("/admin/clients/{client_id}/revoke", post(admin::client_revoke))
+        .route(
+            "/admin/clients/{client_id}/post-logout",
+            post(admin::client_set_post_logout),
+        )
         .route("/admin/iats", get(admin::iats_pending_list))
         .route("/admin/iats/new", get(admin::iat_mint_form).post(admin::iat_mint_submit))
         .route("/admin/iats/{hash}/revoke", post(admin::iat_revoke))

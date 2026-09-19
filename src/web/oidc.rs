@@ -846,12 +846,7 @@ pub(super) async fn register(
             )
         }
     };
-    let req = crate::dcr::RegistrationRequest {
-        redirect_uris: json_string_array(&v, "redirect_uris"),
-        grant_types: json_string_array(&v, "grant_types"),
-        jwks: crate::dcr::jwks_from_jwk_set(v.get("jwks")),
-        jwks_uri: v.get("jwks_uri").and_then(|x| x.as_str()).map(String::from),
-    };
+    let req = registration_request_from_json(&v);
 
     let client_id = format!("dcr-{}", uuid::Uuid::new_v4().simple());
     let outcome = match crate::dcr::validate_registration(&client_id, &req, &iat.constraints) {
@@ -904,6 +899,22 @@ fn dcr_error(status: StatusCode, error: &str, desc: &str) -> Response {
         .into_response()
 }
 
+/// 登録要求の JSON を RegistrationRequest に写す。
+///
+/// ハンドラから切り出してあるのは、この**配線**を試験で押さえるため。検証側
+/// （dcr::validate_registration）に試験が在っても、ここで項目を読み落とすと
+/// 黙って既定値（空）で登録される——実際、post_logout_redirect_uris はこの
+/// 配線が無かったために「登録しても必ず空」になり、サインアウトが落ちていた。
+fn registration_request_from_json(v: &serde_json::Value) -> crate::dcr::RegistrationRequest {
+    crate::dcr::RegistrationRequest {
+        redirect_uris: json_string_array(v, "redirect_uris"),
+        post_logout_redirect_uris: json_string_array(v, "post_logout_redirect_uris"),
+        grant_types: json_string_array(v, "grant_types"),
+        jwks: crate::dcr::jwks_from_jwk_set(v.get("jwks")),
+        jwks_uri: v.get("jwks_uri").and_then(|x| x.as_str()).map(String::from),
+    }
+}
+
 fn json_string_array(v: &serde_json::Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(|x| x.as_array())
@@ -922,6 +933,7 @@ fn register_response(c: &crate::model::Client, raw_client_secret: Option<&str>) 
         "token_endpoint_auth_method": c.token_endpoint_auth_method,
         "grant_types": c.grant_types,
         "redirect_uris": c.redirect_uris,
+        "post_logout_redirect_uris": c.post_logout_redirect_uris,
         "require_pushed_authorization_requests": c.require_par,
     });
     if let Some(uri) = &c.jwks_uri {
@@ -940,6 +952,57 @@ fn register_response(c: &crate::model::Client, raw_client_secret: Option<&str>) 
 mod tests {
     use super::*;
     use crate::model::AccessToken;
+
+    fn client_with_post_logout(uris: &[&str]) -> crate::model::Client {
+        crate::model::Client {
+            client_id: "dcr-x".into(),
+            redirect_uris: vec!["https://rp.example.com/cb".into()],
+            post_logout_redirect_uris: uris.iter().map(|s| s.to_string()).collect(),
+            token_endpoint_auth_method: "client_secret_basic".into(),
+            client_secret: Some("hash".into()),
+            grant_types: vec!["authorization_code".into()],
+            dpop_bound: false,
+            jwks: vec![],
+            jwks_uri: None,
+            require_par: false,
+            require_pkce: true,
+            id_token_signed_response_alg: None,
+        }
+    }
+
+    /// 登録要求の配線。ここで読み落とすと、検証側に試験が在っても黙って空で登録される
+    /// （post_logout_redirect_uris で実際に起きた事故の形）。
+    #[test]
+    fn registration_request_reads_post_logout_redirect_uris() {
+        let v = serde_json::json!({
+            "redirect_uris": ["https://rp.example.com/cb"],
+            "post_logout_redirect_uris": ["https://rp.example.com/", "https://rp.example.com/bye"],
+        });
+        let req = registration_request_from_json(&v);
+        assert_eq!(
+            req.post_logout_redirect_uris,
+            vec!["https://rp.example.com/", "https://rp.example.com/bye"]
+        );
+        assert_eq!(req.redirect_uris, vec!["https://rp.example.com/cb"]);
+        // 省略時は空（従来どおり）。
+        let none = registration_request_from_json(&serde_json::json!({
+            "redirect_uris": ["https://rp.example.com/cb"]
+        }));
+        assert!(none.post_logout_redirect_uris.is_empty());
+    }
+
+    /// RFC 7591 §3.2.1: 登録応答は登録されたメタデータをエコーする。
+    /// RP はここを読んで「戻り先が登録された」ことを確かめられる。
+    #[test]
+    fn register_response_echoes_post_logout_redirect_uris() {
+        let c = client_with_post_logout(&["https://rp.example.com/"]);
+        let resp = register_response(&c, None);
+        assert_eq!(resp["post_logout_redirect_uris"], serde_json::json!(["https://rp.example.com/"]));
+        assert_eq!(resp["redirect_uris"], serde_json::json!(["https://rp.example.com/cb"]));
+        // 戻り先が無い client では空配列（項目自体は在る）。
+        let empty = register_response(&client_with_post_logout(&[]), None);
+        assert_eq!(empty["post_logout_redirect_uris"], serde_json::json!([]));
+    }
 
     /// discovery で発行する独自エンドポイント＝アプリ(fido2demo)が読むキー/パスの契約。
     /// route を改名したらここも一致させる（clean-cut 運用での divergence を検出する）。
