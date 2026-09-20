@@ -13,9 +13,11 @@
 # 空文字が渡された場合も「省略」と誤認しないよう、フラグが渡されたかどうか自体を別に追跡する。
 #
 # 本番への切替は複数のAPI呼び出しにまたがり真のアトミック性はない。そのため
-# 「本番の安全性を最優先」の順序で進める: 本番だけを先に切り替えてスモークテストし、
-# 失敗すれば直前のリビジョンへ即座に戻す。ここを通過して初めて staging 入れ替え・
-# タグ更新に進む（万一そこで失敗しても、本番は既に確認済みの状態で止まる）。
+# 「本番の安全性を最優先」の順序で進める: 新しいリビジョンは 0% のタグ付きで作り、
+# そのタグURLへ合成の要求を投げて(verify_pending)通ったものだけを切り替える。
+# 切替後にもう一度公開URLを叩き、失敗すれば直前のリビジョンへ即座に戻す。ここを
+# 通過して初めて staging 入れ替え・タグ更新に進む（万一そこで失敗しても、本番は
+# 既に確認済みの状態で止まる）。
 #
 # 使い方:
 #   scripts/promote.sh                                    # ドライラン
@@ -28,10 +30,7 @@ source "${SCRIPT_DIR}/lib_cloud_run.sh"
 
 PROJECT="${PROJECT:-fido2-8b943}"
 REGION="${REGION:-asia-northeast1}"
-PROD_SERVICE="${PROD_SERVICE:-rust-op}"
-STAGING_SERVICE="${STAGING_SERVICE:-rust-op-staging}"
-PROD_URL="${PROD_URL:-https://oidc.sonrisa.co.jp}"
-STAGING_URL="${STAGING_URL:-https://test.sonrisa.co.jp}"
+# PROJECT/REGION 以外のサービス名・公開URLは lib_cloud_run.sh が持っている
 
 APPLY=0
 STAGING_IMAGE_OVERRIDE=""

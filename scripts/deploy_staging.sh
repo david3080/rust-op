@@ -20,7 +20,7 @@ source "${SCRIPT_DIR}/lib_cloud_run.sh"
 PROJECT="${PROJECT:-fido2-8b943}"
 REGION="${REGION:-asia-northeast1}"
 STAGING_SERVICE="${STAGING_SERVICE:-rust-op-staging}"
-SMOKE_URL="${SMOKE_URL:-https://test.sonrisa.co.jp}"
+SMOKE_URL="${SMOKE_URL:-$(service_base_url "$STAGING_SERVICE")}"
 
 APPLY=0
 [[ "${1:-}" == "--apply" ]] && APPLY=1
@@ -32,6 +32,11 @@ fi
 prev_revision="$(traffic100_revision "$STAGING_SERVICE" 2>/dev/null || echo "")"
 
 new_revision="$(deploy_source_verified "$STAGING_SERVICE")"
+if ! verify_pending "$STAGING_SERVICE"; then
+  echo "ERROR: 切替前の確認に失敗しました（revision: ${new_revision}）。" >&2
+  echo "       **トラフィックは切り替えていません。staging は前のリビジョンのままです。**" >&2
+  exit 1
+fi
 switch_traffic "$STAGING_SERVICE" "$new_revision"
 staging_image="$(gcloud run revisions describe "$new_revision" --region="$REGION" --project="$PROJECT" \
   --format="value(spec.containers[0].image)")"
