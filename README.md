@@ -1,4 +1,6 @@
-# rust-op
+# rust-idp
+
+旧名 rust-op。2026-09-26 に `david3080/rust-op` から `son-risa/rust-idp` へ移した。Cloud Run のサービス名（`rust-op`・`rust-op-staging`）とデプロイ用のサービスアカウント（`rust-op-deployer`）は旧名のまま。
 
 **ピュア Rust 製の OpenID Provider (OP) + FIDO2 Server。** FAPI 2.0 Security Profile に準拠し、
 パスキー（WebAuthn）認証・CIBA・制御付き動的クライアント登録（DCR）を備える。WebAuthn / 署名 /
