@@ -175,6 +175,7 @@ label{display:block;font-size:14px;margin-top:12px}input{display:block;width:100
  <p>fido2demo アプリで安全に登録します。</p>
  <button class="primary" onclick="openApp()">アプリで開く</button>
  <p class="small">インストール済みなら自動で開きます。開かない場合は下のボタンから Web で続行できます。</p>
+ <p class="small">アプリで開くと、上の氏名は保存されません。Web で登録を続けると保存されます。</p>
  <div id="fallback" hidden>
   <button class="secondary" onclick="reg()">Web で登録を続ける</button>
   <p class="small">同期 passkey（iCloud Keychain 等）として作成されます。</p>
@@ -484,12 +485,17 @@ pub(super) struct RegVerifyReq {
 const NAME_MAX_CHARS: usize = 80;
 
 /// 氏名を前後の空白を除いて受け取る。空なら None、長すぎる・制御文字を含むなら Err。
+/// 表示の向きを変える書式文字（Unicode の Bidi_Control）。RP の画面で氏名の見た目を偽れるので断る。
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 fn normalize_name(raw: Option<&str>) -> Result<Option<String>, &'static str> {
     let name = raw.map(str::trim).unwrap_or("");
     if name.is_empty() {
         return Ok(None);
     }
-    if name.chars().count() > NAME_MAX_CHARS || name.chars().any(char::is_control) {
+    if name.chars().count() > NAME_MAX_CHARS || name.chars().any(|c| c.is_control() || is_bidi_control(c)) {
         return Err("invalid name");
     }
     Ok(Some(name.to_string()))
@@ -510,8 +516,15 @@ pub(super) async fn register_passkey_verify(
         Ok(n) => n,
         Err(e) => return plain_error(e),
     };
-    if name.is_none() && matches!(crate::registration::peek_invite(fs, &req.token).await, Ok(Some(_))) {
-        return plain_error("name required");
+    if name.is_none() {
+        match crate::registration::peek_invite(fs, &req.token).await {
+            Ok(Some(_)) => return plain_error("name required"),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("peek_invite: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+            }
+        }
     }
     let email1 = match crate::registration::consume_email_challenge(fs, &req.token).await {
         Ok(Some(e)) => e,
@@ -835,7 +848,14 @@ mod invite_tests {
     async fn a_name_that_is_too_long_or_has_control_characters_is_refused() {
         let p = provider(&[]).await;
         let fs = p.firestore.as_ref().unwrap();
-        for bad in ["あ".repeat(81), "a\nb".to_string(), "a\u{7}b".to_string()] {
+        for bad in [
+            "あ".repeat(81),
+            "a\nb".to_string(),
+            "a\u{7}b".to_string(),
+            "\u{202E}moc.elpmaxe".to_string(),
+            "a\u{2066}b".to_string(),
+            "a\u{200F}b".to_string(),
+        ] {
             let token = crate::registration::create_email_challenge(fs, "bad@example.com").await.unwrap();
             assert_eq!(register_named(&p, &token, Some(&bad)).await, StatusCode::BAD_REQUEST, "{bad:?}");
         }
