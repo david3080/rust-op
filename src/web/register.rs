@@ -166,8 +166,11 @@ h1{font-size:20px;margin:0 0 8px}p{font-size:14px;line-height:1.6}
 button,.btn{display:block;width:100%;padding:13px;margin-top:12px;font-size:16px;border:0;border-radius:8px;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box}
 .primary{background:#3367d6;color:#fff}.secondary{background:#f1f3f4;color:#3367d6}
 .small{font-size:12px;color:#5f6368;margin-top:8px}
-#msg{font-size:14px;margin-top:14px;min-height:1.4em}#fallback{margin-top:16px}</style></head><body>
+#msg{font-size:14px;margin-top:14px;min-height:1.4em}#fallback{margin-top:16px}
+label{display:block;font-size:14px;margin-top:12px}input{display:block;width:100%;box-sizing:border-box;padding:10px;margin-top:4px;font-size:16px}</style></head><body>
 <h1>passkey を作成</h1>
+<label for="nm">氏名<span id="nmreq"></span></label>
+<input id="nm" autocomplete="name" maxlength="80">
 <div id="mobile" hidden>
  <p>fido2demo アプリで安全に登録します。</p>
  <button class="primary" onclick="openApp()">アプリで開く</button>
@@ -184,7 +187,8 @@ button,.btn{display:block;width:100%;padding:13px;margin-top:12px;font-size:16px
 <p id="msg"></p>
 <script>
 __WEBAUTHN_JS__
-const TOKEN="__TOKEN__",OPT="__OPT__",VER="__VER__",LOGIN="__LOGIN__",AFTER=__AFTER__;
+const TOKEN="__TOKEN__",OPT="__OPT__",VER="__VER__",LOGIN="__LOGIN__",AFTER=__AFTER__,NAME_REQUIRED=!!AFTER;
+document.getElementById('nmreq').textContent=NAME_REQUIRED?'（必須）':'（任意）';
 const ua=navigator.userAgent;
 const isAndroid=/Android/i.test(ua);
 const isIOS=/iPad|iPhone|iPod/i.test(ua)||(/(Macintosh).*Mobile/i.test(ua));
@@ -199,13 +203,17 @@ function openApp(){
  location.href=url;
 }
 async function reg(){
- const msg=document.getElementById('msg');msg.textContent='処理中…';
+ const msg=document.getElementById('msg');
+ const nm=document.getElementById('nm').value.trim();
+ if(NAME_REQUIRED&&!nm){msg.textContent='氏名を入力してください';return;}
+ msg.textContent='処理中…';
  try{
   const r=await fetch(OPT,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:TOKEN})});
   if(!r.ok){msg.textContent=await r.text();return;}
   const o=await r.json();
   const cred=await navigator.credentials.create({publicKey:{challenge:b64ToBuf(o.challenge),rp:o.rp,user:{id:b64ToBuf(o.user.id),name:o.user.name,displayName:o.user.displayName},pubKeyCredParams:o.pubKeyCredParams,authenticatorSelection:o.authenticatorSelection,attestation:o.attestation,timeout:o.timeout,excludeCredentials:(o.excludeCredentials||[]).map(c=>({type:'public-key',id:b64ToBuf(c.id)}))}});
   const body={token:TOKEN,response:{clientDataJSON:bufToB64(cred.response.clientDataJSON),attestationObject:bufToB64(cred.response.attestationObject)}};
+  if(nm)body.name=nm;
   const v=await fetch(VER,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
   if(!v.ok){msg.textContent=await v.text();return;}
   if(AFTER){msg.textContent='登録が完了しました。サインインの画面へ移ります…';location.href=AFTER;return;}
@@ -468,6 +476,23 @@ struct RegResponse {
 pub(super) struct RegVerifyReq {
     token: String,
     response: RegResponse,
+    /// 登録と同時に保存する氏名（profiles の name）。招待の token では必須、通常の登録では任意。
+    #[serde(default)]
+    name: Option<String>,
+}
+
+const NAME_MAX_CHARS: usize = 80;
+
+/// 氏名を前後の空白を除いて受け取る。空なら None、長すぎる・制御文字を含むなら Err。
+fn normalize_name(raw: Option<&str>) -> Result<Option<String>, &'static str> {
+    let name = raw.map(str::trim).unwrap_or("");
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.chars().count() > NAME_MAX_CHARS || name.chars().any(char::is_control) {
+        return Err("invalid name");
+    }
+    Ok(Some(name.to_string()))
 }
 
 pub(super) async fn register_passkey_verify(
@@ -480,6 +505,13 @@ pub(super) async fn register_passkey_verify(
     };
     if let Some(r) = refuse_invite_for_registered(fs, &req.token).await {
         return r;
+    }
+    let name = match normalize_name(req.name.as_deref()) {
+        Ok(n) => n,
+        Err(e) => return plain_error(e),
+    };
+    if name.is_none() && matches!(crate::registration::peek_invite(fs, &req.token).await, Ok(Some(_))) {
+        return plain_error("name required");
     }
     let email1 = match crate::registration::consume_email_challenge(fs, &req.token).await {
         Ok(Some(e)) => e,
@@ -520,6 +552,12 @@ pub(super) async fn register_passkey_verify(
     if let Err(e) = crate::registration::save_credential(fs, &email1, &account_id, &outcome).await {
         tracing::error!("save_credential: {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+    }
+    if let Some(name) = name {
+        let updates = HashMap::from([("name".to_string(), name)]);
+        if let Err(e) = crate::registration::save_profile(fs, &account_id, &updates).await {
+            tracing::error!("save_profile after registration: {e}");
+        }
     }
     (
         StatusCode::CREATED,
@@ -604,6 +642,10 @@ mod invite_tests {
     }
 
     async fn register_with_token(p: &Arc<Provider>, token: &str) -> StatusCode {
+        register_named(p, token, Some("招待 太郎")).await
+    }
+
+    async fn register_named(p: &Arc<Provider>, token: &str, name: Option<&str>) -> StatusCode {
         let opts_req: RegPkOptionsReq = serde_json::from_value(serde_json::json!({ "token": token })).unwrap();
         let opts = body_json(register_passkey_options(State(p.clone()), Json(opts_req)).await).await;
         let challenge = opts["challenge"].as_str().unwrap();
@@ -616,14 +658,17 @@ mod invite_tests {
             (Cbor::Text("authData".into()), Cbor::Bytes(build_auth_data(&p.rp_id(), FLAG_UP | FLAG_AT, 0, Some(&acd)))),
         ]);
         let cdj = client_data_json("webauthn.create", challenge, &p.origin());
-        let verify_req: RegVerifyReq = serde_json::from_value(serde_json::json!({
+        let mut body = serde_json::json!({
             "token": token,
             "response": {
                 "clientDataJSON": crate::webauthn::b64e(&cdj),
                 "attestationObject": crate::webauthn::b64e(&cbor_to_vec(&att)),
             },
-        }))
-        .unwrap();
+        });
+        if let Some(n) = name {
+            body["name"] = serde_json::json!(n);
+        }
+        let verify_req: RegVerifyReq = serde_json::from_value(body).unwrap();
         register_passkey_verify(State(p.clone()), Json(verify_req)).await.status()
     }
 
@@ -653,6 +698,7 @@ mod invite_tests {
             Some(&serde_json::json!(true)),
             "招待のリンクがメールの持ち主の確認を兼ねるので、RP には確認済みとして渡る"
         );
+        assert_eq!(claims.get("name"), Some(&serde_json::json!("招待 太郎")), "登録で入れた氏名が RP に渡る");
 
         let again = invite_page(State(p.clone()), Query(MagicQuery { t: token })).await;
         assert_eq!(again.status(), StatusCode::BAD_REQUEST, "使った招待は二度使えない");
@@ -754,6 +800,59 @@ mod invite_tests {
         let token = crate::registration::create_email_challenge(fs, "a@example.com").await.unwrap();
         let resp = invite_page(State(p.clone()), Query(MagicQuery { t: token })).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn claims_of(p: &Arc<Provider>, email: &str) -> HashMap<String, serde_json::Value> {
+        let fs = p.firestore.as_ref().unwrap();
+        let cred = crate::registration::get_credential(fs, email).await.unwrap().unwrap();
+        p.store.find_account(&cred.account_id).await.claims
+    }
+
+    #[tokio::test]
+    async fn an_invite_needs_a_name_and_a_refused_try_keeps_the_invite_usable() {
+        let p = provider(&["amate"]).await;
+        let resp = invite(&p, basic("amate", "s3cret"), "n@example.com", &format!("{RP_ORIGIN}/auth/login")).await;
+        let token = token_of(body_json(resp).await["url"].as_str().unwrap());
+        assert_eq!(register_named(&p, &token, None).await, StatusCode::BAD_REQUEST);
+        assert_eq!(register_named(&p, &token, Some("   ")).await, StatusCode::BAD_REQUEST, "空白だけは氏名にならない");
+        assert_eq!(register_named(&p, &token, Some("  山田 花子 ")).await, StatusCode::CREATED, "断られた試しで招待は消えない");
+        assert_eq!(claims_of(&p, "n@example.com").await.get("name"), Some(&serde_json::json!("山田 花子")));
+    }
+
+    #[tokio::test]
+    async fn ordinary_signup_takes_the_name_optionally() {
+        let p = provider(&[]).await;
+        let fs = p.firestore.as_ref().unwrap();
+        let without = crate::registration::create_email_challenge(fs, "plain@example.com").await.unwrap();
+        assert_eq!(register_named(&p, &without, None).await, StatusCode::CREATED, "fido2demo のように氏名を送らない登録は今までどおり");
+        assert!(claims_of(&p, "plain@example.com").await.get("name").is_none());
+        let with = crate::registration::create_email_challenge(fs, "named@example.com").await.unwrap();
+        assert_eq!(register_named(&p, &with, Some("佐藤")).await, StatusCode::CREATED);
+        assert_eq!(claims_of(&p, "named@example.com").await.get("name"), Some(&serde_json::json!("佐藤")));
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_too_long_or_has_control_characters_is_refused() {
+        let p = provider(&[]).await;
+        let fs = p.firestore.as_ref().unwrap();
+        for bad in ["あ".repeat(81), "a\nb".to_string(), "a\u{7}b".to_string()] {
+            let token = crate::registration::create_email_challenge(fs, "bad@example.com").await.unwrap();
+            assert_eq!(register_named(&p, &token, Some(&bad)).await, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        let token = crate::registration::create_email_challenge(fs, "bad@example.com").await.unwrap();
+        assert_eq!(register_named(&p, &token, Some(&"あ".repeat(80))).await, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn the_registration_page_asks_for_the_name() {
+        let p = provider(&["amate"]).await;
+        let resp = invite(&p, basic("amate", "s3cret"), "page@example.com", &format!("{RP_ORIGIN}/auth/login")).await;
+        let token = token_of(body_json(resp).await["url"].as_str().unwrap());
+        let html = body_text(invite_page(State(p.clone()), Query(MagicQuery { t: token })).await).await;
+        assert!(html.contains(r#"<input id="nm" autocomplete="name" maxlength="80">"#));
+        assert!(html.contains("NAME_REQUIRED=!!AFTER"));
+        let plain = passkey_register_page(&p, "tok", None).0;
+        assert!(plain.contains(r#"AFTER="""#), "通常の登録では AFTER が空なので、氏名は任意");
     }
 
     #[test]
