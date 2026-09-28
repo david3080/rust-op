@@ -484,12 +484,12 @@ pub(super) struct RegVerifyReq {
 
 const NAME_MAX_CHARS: usize = 80;
 
-/// 氏名を前後の空白を除いて受け取る。空なら None、長すぎる・制御文字を含むなら Err。
 /// 表示の向きを変える書式文字（Unicode の Bidi_Control）。RP の画面で氏名の見た目を偽れるので断る。
 fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
+/// 氏名を前後の空白を除いて受け取る。空なら None、長すぎる・制御文字や向きを変える文字を含むなら Err。
 fn normalize_name(raw: Option<&str>) -> Result<Option<String>, &'static str> {
     let name = raw.map(str::trim).unwrap_or("");
     if name.is_empty() {
