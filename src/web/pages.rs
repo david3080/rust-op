@@ -58,7 +58,7 @@ pre{background:#f4f4f4;padding:10px;border-radius:6px;overflow:auto}
 <script>
 const ISSUER="__ISSUER__";
 const GENDER={male:'男性',female:'女性',other:'その他'};
-function esc(s){return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));}
+function esc(s){return String(s).replace(/[<>&"']/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));}
 function field(label,val){return '<div class="card"><div class="lbl">'+label+'</div><div class="val">'+(val?esc(val):'<span class="unset">未設定</span>')+'</div></div>';}
 let idTokenHint=null;
 let lastUi=null,lastProf=null,lastTok=null;
@@ -237,4 +237,20 @@ async function doRefresh(){
 })();
 </script></body></html>"##;
     Html(page.replace("__ISSUER__", &p.issuer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_profile_page_escapes_quotes_before_putting_values_into_attributes() {
+        let p = Arc::new(Provider::new("https://idp.example/oidc".to_string()));
+        let html = demo_callback(State(p)).await.0;
+        let esc = html.lines().find(|l| l.starts_with("function esc(")).expect("esc の定義がある");
+        for (raw, escaped) in [("<", "&lt;"), (">", "&gt;"), ("&", "&amp;"), ("\"", "&quot;"), ("'", "&#39;")] {
+            assert!(esc.contains(escaped), "esc が {raw} を {escaped} に退避しない: {esc}");
+        }
+        assert!(html.contains("value=\"'+esc(val||'')+'\""), "編集欄の value は esc を通す");
+    }
 }
