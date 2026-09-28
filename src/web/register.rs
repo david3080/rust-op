@@ -618,6 +618,14 @@ mod invite_tests {
         assert_eq!(register_with_token(&p, &token).await, StatusCode::CREATED);
         let fs = p.firestore.as_ref().unwrap();
         assert!(crate::registration::account_exists(fs, "new@example.com").await.unwrap());
+        let cred = crate::registration::get_credential(fs, "new@example.com").await.unwrap().unwrap();
+        let claims = p.store.find_account(&cred.account_id).await.claims;
+        assert_eq!(claims.get("email"), Some(&serde_json::json!("new@example.com")));
+        assert_eq!(
+            claims.get("email_verified"),
+            Some(&serde_json::json!(true)),
+            "招待のリンクがメールの持ち主の確認を兼ねるので、RP には確認済みとして渡る"
+        );
 
         let again = invite_page(State(p.clone()), Query(MagicQuery { t: token })).await;
         assert_eq!(again.status(), StatusCode::BAD_REQUEST, "使った招待は二度使えない");
