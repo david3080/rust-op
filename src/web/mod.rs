@@ -126,6 +126,9 @@ pub fn router(provider: Provider) -> Router {
         .route("/signup/verify-email", post(register::register_verify_email))
         .route("/signup/passkey/options", post(register::register_passkey_options))
         .route("/signup/passkey/verify", post(register::register_passkey_verify))
+        // 招待: RP（INVITE_CLIENT_IDS の confidential client）が登録リンクを発行し、受け手は /invite で登録する。
+        .route("/invites", post(register::invite_create))
+        .route("/invite", get(register::invite_page))
         // ブラウザで完結する RP デモ。
         .route("/", get(pages::demo_start))
         .route("/callback", get(pages::demo_callback));

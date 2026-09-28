@@ -47,6 +47,8 @@ pub struct Provider {
     pub response_modes: HashMap<String, Arc<dyn ResponseMode>>,
     /// private_key_jwt クライアントの jwks_uri から鍵を取得・キャッシュする（鍵ローテーション）。
     pub jwks_resolver: crate::jwks_resolver::JwksResolver,
+    /// 招待の登録リンク（POST /invites）の発行を許す confidential client の client_id。空なら誰にも許さない。
+    pub invite_clients: Vec<String>,
 }
 
 impl Provider {
@@ -91,6 +93,7 @@ impl Provider {
             client_auth,
             response_modes,
             jwks_resolver: crate::jwks_resolver::JwksResolver::new(),
+            invite_clients: Vec::new(),
         }
     }
 
@@ -189,6 +192,11 @@ impl Provider {
 
     pub fn with_signer(mut self, signer: Arc<dyn JwsSigner>) -> Self {
         self.signer = signer;
+        self
+    }
+
+    pub fn with_invite_clients(mut self, ids: Vec<String>) -> Self {
+        self.invite_clients = ids;
         self
     }
 
