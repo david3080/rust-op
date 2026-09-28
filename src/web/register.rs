@@ -372,6 +372,27 @@ pub(super) async fn invite_page(State(p): State<Arc<Provider>>, Query(q): Query<
     passkey_register_page(&p, &q.t, Some(&return_to)).into_response()
 }
 
+/// 招待の token は、宛先が既に登録済みなら使わせない（同じアドレスへの招待が複数残っていても、
+/// 登録の後に残りの token で passkey を置き換えられないようにする）。通常の登録の token は今までどおり。
+async fn refuse_invite_for_registered(fs: &crate::firestore::Firestore, token: &str) -> Option<Response> {
+    let email = match crate::registration::peek_invite(fs, token).await {
+        Ok(Some((email, _))) => email,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::error!("peek_invite: {e}");
+            return Some((StatusCode::INTERNAL_SERVER_ERROR, "error").into_response());
+        }
+    };
+    match crate::registration::account_exists(fs, &email).await {
+        Ok(false) => None,
+        Ok(true) => Some((StatusCode::CONFLICT, "already registered").into_response()),
+        Err(e) => {
+            tracing::error!("invite account_exists: {e}");
+            Some((StatusCode::INTERNAL_SERVER_ERROR, "error").into_response())
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub(super) struct RegPkOptionsReq {
     token: String,
@@ -385,6 +406,9 @@ pub(super) async fn register_passkey_options(
         Some(fs) => fs,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
+    if let Some(r) = refuse_invite_for_registered(fs, &req.token).await {
+        return r;
+    }
     let email = match crate::registration::peek_email_challenge(fs, &req.token).await {
         Ok(Some(e)) => e,
         Ok(None) => return (StatusCode::BAD_REQUEST, "invalid or expired token").into_response(),
@@ -454,6 +478,9 @@ pub(super) async fn register_passkey_verify(
         Some(fs) => fs,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
+    if let Some(r) = refuse_invite_for_registered(fs, &req.token).await {
+        return r;
+    }
     let email1 = match crate::registration::consume_email_challenge(fs, &req.token).await {
         Ok(Some(e)) => e,
         Ok(None) => return (StatusCode::BAD_REQUEST, "invalid or expired token").into_response(),
@@ -629,6 +656,47 @@ mod invite_tests {
 
         let again = invite_page(State(p.clone()), Query(MagicQuery { t: token })).await;
         assert_eq!(again.status(), StatusCode::BAD_REQUEST, "使った招待は二度使えない");
+    }
+
+    #[tokio::test]
+    async fn leftover_invite_cannot_replace_a_registered_passkey() {
+        let p = provider(&["amate"]).await;
+        let rt = format!("{RP_ORIGIN}/auth/login");
+        let first = invite(&p, basic("amate", "s3cret"), "a@example.com", &rt).await;
+        let first = token_of(body_json(first).await["url"].as_str().unwrap());
+        let second = invite(&p, basic("amate", "s3cret"), "a@example.com", &rt).await;
+        let second = token_of(body_json(second).await["url"].as_str().unwrap());
+        let fs = p.firestore.as_ref().unwrap();
+        let second_opts = body_json(
+            register_passkey_options(
+                State(p.clone()),
+                Json(serde_json::from_value(serde_json::json!({ "token": second })).unwrap()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(register_with_token(&p, &first).await, StatusCode::CREATED);
+        let before = crate::registration::get_credential(fs, "a@example.com").await.unwrap().unwrap();
+
+        let opts = register_passkey_options(
+            State(p.clone()),
+            Json(serde_json::from_value(serde_json::json!({ "token": second })).unwrap()),
+        )
+        .await;
+        assert_eq!(opts.status(), StatusCode::CONFLICT, "登録の後は、残りの招待で options を出さない");
+
+        let verify_req: RegVerifyReq = serde_json::from_value(serde_json::json!({
+            "token": second,
+            "response": { "clientDataJSON": "", "attestationObject": "" },
+        }))
+        .unwrap();
+        let verify = register_passkey_verify(State(p.clone()), Json(verify_req)).await;
+        assert_eq!(verify.status(), StatusCode::CONFLICT, "登録の前に取った options があっても、verify で断る");
+        assert!(second_opts["challenge"].is_string());
+
+        let after = crate::registration::get_credential(fs, "a@example.com").await.unwrap().unwrap();
+        assert_eq!(after.pub_x, before.pub_x);
+        assert_eq!(after.credential_id, before.credential_id);
     }
 
     #[tokio::test]
