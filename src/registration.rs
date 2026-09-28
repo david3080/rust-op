@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // メール送信 → アプリ起動 → verify-email → options → Face ID → verify までを許容できる
 // 余裕のある TTL。短すぎると passkey 作成中にトークン失効で 400 になる。
 const EMAIL_TTL_SECS: u64 = 30 * 60;
+// 招待リンクは管理者が送り、受け手がいつ開くか分からないので数日もたせる。
+const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const CEREMONY_TTL_SECS: u64 = 5 * 60;
 
 fn now() -> u64 {
@@ -47,6 +49,42 @@ pub async fn create_email_challenge(fs: &Firestore, email: &str) -> Result<Strin
     )
     .await?;
     Ok(token)
+}
+
+/// 招待（RP の管理者が発行を頼む登録リンク）。emailChallenges に置くので、
+/// passkey の options / verify は通常の登録と同じ口をそのまま使う。
+/// returnTo は登録後の戻り先（RP の登録済み origin 配下であることは呼び出し側が確かめる）。
+pub async fn create_invite_challenge(fs: &Firestore, email: &str, return_to: &str) -> Result<String, String> {
+    let token = random_token();
+    fs.set_doc(
+        "emailChallenges",
+        &token,
+        json!({
+            "email": firestore::s(email),
+            "returnTo": firestore::s(return_to),
+            "expiresAt": firestore::ts(&firestore::rfc3339(now() + INVITE_TTL_SECS)),
+        }),
+    )
+    .await?;
+    Ok(token)
+}
+
+/// 招待の token を消費せず覗き、(email, returnTo) を返す。returnTo を持たない（通常の登録の）token は None。
+pub async fn peek_invite(fs: &Firestore, token: &str) -> Result<Option<(String, String)>, String> {
+    if !token_ok(token) {
+        return Ok(None);
+    }
+    let fields = match fs.get_doc("emailChallenges", token).await? {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    if challenge_expired(&fields) {
+        return Ok(None);
+    }
+    match (firestore::field_str(&fields, "email"), firestore::field_str(&fields, "returnTo")) {
+        (Some(e), Some(r)) if !r.is_empty() => Ok(Some((e.to_string(), r.to_string()))),
+        _ => Ok(None),
+    }
 }
 
 /// 消費せず email を覗く（passkey options 生成時に使用）。
