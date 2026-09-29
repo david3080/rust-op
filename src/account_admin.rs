@@ -109,6 +109,7 @@ pub async fn delete_account(fs: &Firestore, actor: &str, email: &str) -> Result<
         return Ok(DeleteOutcome::NotDisabled);
     }
     let counts = revoke_all(fs, &cred.account_id).await;
+    fs.delete_doc("fcmTokens", &cred.account_id).await?;
     fs.delete_doc("profiles", &cred.account_id).await?;
     fs.delete_doc("accountsByUuid", &cred.account_id).await?;
     fs.delete_doc("accounts", email).await?;
@@ -333,6 +334,9 @@ mod tests {
         let name = std::collections::HashMap::from([("name".to_string(), "被害者".to_string())]);
         registration::save_profile(&fs, "acc-victim", &name).await.unwrap();
         registration::save_profile(&fs, "acc-other", &name).await.unwrap();
+        for id in ["acc-victim", "acc-other"] {
+            fs.set_doc("fcmTokens", id, serde_json::json!({ "token": crate::firestore::s("t") })).await.unwrap();
+        }
         disable_account(&fs, "cli", "victim@example.com").await.unwrap();
 
         let out = delete_account(&fs, "cli", "victim@example.com").await.unwrap();
@@ -341,6 +345,8 @@ mod tests {
         assert!(fs.get_doc("accounts", "victim@example.com").await.unwrap().is_none());
         assert!(fs.get_doc("accountsByUuid", "acc-victim").await.unwrap().is_none());
         assert!(fs.get_doc("profiles", "acc-victim").await.unwrap().is_none());
+        assert!(fs.get_doc("fcmTokens", "acc-victim").await.unwrap().is_none());
+        assert!(fs.get_doc("fcmTokens", "acc-other").await.unwrap().is_some());
         assert!(fs.get_doc("accounts", "other@example.com").await.unwrap().is_some());
         assert!(fs.get_doc("accountsByUuid", "acc-other").await.unwrap().is_some());
         assert!(fs.get_doc("profiles", "acc-other").await.unwrap().is_some());

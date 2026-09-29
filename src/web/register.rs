@@ -369,6 +369,7 @@ async fn authorize_invite_client(
 
 /// POST /accounts/disable（form: email ＋ confidential client の認証）。
 /// 招待を許した RP が、自分の側で消した利用者のアカウントを凍結する（戻せる。解除は管理画面）。
+/// IdP の管理者は凍結しない（409 protected）。管理画面の守りを RP の秘密ひとつで越えさせないため。
 pub(super) async fn account_disable(
     State(p): State<Arc<Provider>>,
     headers: HeaderMap,
@@ -382,6 +383,24 @@ pub(super) async fn account_disable(
         Ok(x) => x,
         Err(r) => return r,
     };
+    match crate::registration::get_credential(fs, &email).await {
+        Ok(Some(cred)) => match crate::admin_store::is_admin(fs, &cred.account_id).await {
+            Ok(true) => {
+                tracing::warn!(event = "account_disable_protected", client_id = %client.client_id);
+                return (StatusCode::CONFLICT, Json(serde_json::json!({ "status": "protected" }))).into_response();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!("account_disable is_admin: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("account_disable get_credential: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
+    }
     let actor = format!("client:{}", client.client_id);
     let status = match crate::account_admin::disable_account(fs, &actor, &email).await {
         Ok(crate::account_admin::DisableOutcome::Disabled(_)) => "disabled",
@@ -862,6 +881,24 @@ mod invite_tests {
         let body = body_json(reinvite).await;
         assert_eq!(body["status"], "disabled", "凍結中のアドレスには、登録済みと区別して返す");
         assert!(body.get("url").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_idp_admin_is_never_frozen_through_the_rp_door() {
+        let p = provider(&["amate"]).await;
+        let rt = format!("{RP_ORIGIN}/auth/login");
+        let first = invite(&p, basic("amate", "s3cret"), "boss@example.com", &rt).await;
+        let token = token_of(body_json(first).await["url"].as_str().unwrap());
+        assert_eq!(register_with_token(&p, &token).await, StatusCode::CREATED);
+        let fs = p.firestore.as_ref().unwrap();
+        let account_id = crate::registration::get_credential(fs, "boss@example.com").await.unwrap().unwrap().account_id;
+        crate::admin_store::grant_admin(fs, &account_id, "cli").await.unwrap();
+
+        let resp = disable(&p, basic("amate", "s3cret"), "boss@example.com").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["status"], "protected");
+        assert!(!crate::registration::get_credential(fs, "boss@example.com").await.unwrap().unwrap().disabled);
+        assert!(fs.query_eq("auditLog", "action", "disable_account").await.unwrap().is_empty());
     }
 
     #[tokio::test]

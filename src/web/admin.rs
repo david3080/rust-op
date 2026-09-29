@@ -216,7 +216,7 @@ pub(super) async fn user_detail(
             r#"<span style="color:#666;font-size:13px">管理者は削除できません（先に管理者を剥奪）。</span>"#.to_string()
         } else {
             format!(
-                r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('このアカウントを完全に削除しますか？passkey・プロフィールも消え、元に戻せません。')"><button class="btn btn-danger" type="submit">削除(delete)</button></form>"#,
+                r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('このアカウントを完全に削除しますか？passkey・プロフィール・通知の登録も消え、元に戻せません（CIBA の承認の履歴は残ります）。')"><button class="btn btn-danger" type="submit">削除(delete)</button></form>"#,
                 action = esc(&p.path(&format!("/admin/users/{account_id}/delete"))),
             )
         };
