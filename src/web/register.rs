@@ -306,30 +306,26 @@ pub(super) async fn invite_create(
         Some(fs) => fs,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    let client = match authenticate_client(&p, &headers, &form).await {
-        Ok(c) => c,
+    let (client, email) = match authorize_invite_client(&p, &headers, &form, "invite_denied").await {
+        Ok(x) => x,
         Err(r) => return r,
     };
-    if client.is_public() || !p.invite_clients.iter().any(|id| id == &client.client_id) {
-        tracing::warn!(event = "invite_denied", client_id = %client.client_id);
-        return (StatusCode::FORBIDDEN, "client not allowed to invite").into_response();
-    }
-    let email = form.get("email").map(|e| e.trim().to_lowercase()).unwrap_or_default();
-    if !email.contains('@') || email.len() > 254 {
-        return plain_error("invalid email");
-    }
     let return_to = form.get("return_to").cloned().unwrap_or_default();
     if !return_to_allowed(&client, &return_to) {
         return plain_error("return_to must be under a registered redirect_uri origin");
     }
-    match crate::registration::account_exists(fs, &email).await {
-        Ok(true) => {
+    match crate::registration::get_credential(fs, &email).await {
+        Ok(Some(cred)) if cred.disabled => {
+            tracing::info!(event = "invite_account_disabled", client_id = %client.client_id);
+            return Json(serde_json::json!({ "status": "disabled" })).into_response();
+        }
+        Ok(Some(_)) => {
             tracing::info!(event = "invite_already_registered", client_id = %client.client_id);
             return Json(serde_json::json!({ "status": "registered" })).into_response();
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(e) => {
-            tracing::error!("invite account_exists: {e}");
+            tracing::error!("invite get_credential: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
         }
     }
@@ -350,6 +346,73 @@ pub(super) async fn invite_create(
             (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
         }
     }
+}
+
+/// 招待を許した confidential client だけを通し、正規化した email と組で返す。
+async fn authorize_invite_client(
+    p: &Arc<Provider>,
+    headers: &HeaderMap,
+    form: &HashMap<String, String>,
+    denied_event: &'static str,
+) -> Result<(crate::model::Client, String), Response> {
+    let client = authenticate_client(p, headers, form).await?;
+    if client.is_public() || !p.invite_clients.iter().any(|id| id == &client.client_id) {
+        tracing::warn!(event = denied_event, client_id = %client.client_id);
+        return Err((StatusCode::FORBIDDEN, "client not allowed").into_response());
+    }
+    let email = form.get("email").map(|e| e.trim().to_lowercase()).unwrap_or_default();
+    if !email.contains('@') || email.len() > 254 {
+        return Err(plain_error("invalid email"));
+    }
+    Ok((client, email))
+}
+
+/// POST /accounts/disable（form: email ＋ confidential client の認証）。
+/// 招待を許した RP が、自分の側で消した利用者のアカウントを凍結する（戻せる。解除は管理画面）。
+/// IdP の管理者は凍結しない（409 protected）。管理画面の守りを RP の秘密ひとつで越えさせないため。
+pub(super) async fn account_disable(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let fs = match &p.firestore {
+        Some(fs) => fs,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
+    };
+    let (client, email) = match authorize_invite_client(&p, &headers, &form, "account_disable_denied").await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match crate::registration::get_credential(fs, &email).await {
+        Ok(Some(cred)) => match crate::admin_store::is_admin(fs, &cred.account_id).await {
+            Ok(true) => {
+                tracing::warn!(event = "account_disable_protected", client_id = %client.client_id);
+                return (StatusCode::CONFLICT, Json(serde_json::json!({ "status": "protected" }))).into_response();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!("account_disable is_admin: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("account_disable get_credential: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
+    }
+    let actor = format!("client:{}", client.client_id);
+    let status = match crate::account_admin::disable_account(fs, &actor, &email).await {
+        Ok(crate::account_admin::DisableOutcome::Disabled(_)) => "disabled",
+        Ok(crate::account_admin::DisableOutcome::AlreadyDisabled(_)) => "already_disabled",
+        Ok(crate::account_admin::DisableOutcome::NotFound) => "not_found",
+        Err(e) => {
+            tracing::error!("account_disable: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
+    };
+    tracing::info!(event = "account_disable", client_id = %client.client_id, status);
+    Json(serde_json::json!({ "status": status })).into_response()
 }
 
 /// GET /invite?t= 招待リンクの着地。アプリへの横取りを挟まず Web で passkey を作り、戻り先へ返す。
@@ -787,6 +850,82 @@ mod invite_tests {
         assert_eq!(public.status(), StatusCode::FORBIDDEN, "public client は許可一覧にあっても招待できない");
         let nobody = provider(&[]).await;
         assert_eq!(invite(&nobody, basic("amate", "s3cret"), "a@example.com", &rt).await.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn disable(p: &Arc<Provider>, headers: HeaderMap, email: &str) -> Response {
+        account_disable(State(p.clone()), headers, form(&[("email", email)])).await
+    }
+
+    #[tokio::test]
+    async fn allowed_client_freezes_the_account_and_a_frozen_address_gets_no_link() {
+        let p = provider(&["amate"]).await;
+        let rt = format!("{RP_ORIGIN}/auth/login");
+        let first = invite(&p, basic("amate", "s3cret"), "a@example.com", &rt).await;
+        let token = token_of(body_json(first).await["url"].as_str().unwrap());
+        assert_eq!(register_with_token(&p, &token).await, StatusCode::CREATED);
+
+        let resp = disable(&p, basic("amate", "s3cret"), " A@Example.com").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["status"], "disabled");
+        let fs = p.firestore.as_ref().unwrap();
+        assert!(crate::registration::get_credential(fs, "a@example.com").await.unwrap().unwrap().disabled);
+        let audit = fs.query_eq("auditLog", "action", "disable_account").await.unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(crate::firestore::field_str(&audit[0].1, "actor"), Some("client:amate"));
+
+        let again = disable(&p, basic("amate", "s3cret"), "a@example.com").await;
+        assert_eq!(body_json(again).await["status"], "already_disabled");
+
+        let reinvite = invite(&p, basic("amate", "s3cret"), "a@example.com", &rt).await;
+        assert_eq!(reinvite.status(), StatusCode::OK);
+        let body = body_json(reinvite).await;
+        assert_eq!(body["status"], "disabled", "凍結中のアドレスには、登録済みと区別して返す");
+        assert!(body.get("url").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_idp_admin_is_never_frozen_through_the_rp_door() {
+        let p = provider(&["amate"]).await;
+        let rt = format!("{RP_ORIGIN}/auth/login");
+        let first = invite(&p, basic("amate", "s3cret"), "boss@example.com", &rt).await;
+        let token = token_of(body_json(first).await["url"].as_str().unwrap());
+        assert_eq!(register_with_token(&p, &token).await, StatusCode::CREATED);
+        let fs = p.firestore.as_ref().unwrap();
+        let account_id = crate::registration::get_credential(fs, "boss@example.com").await.unwrap().unwrap().account_id;
+        crate::admin_store::grant_admin(fs, &account_id, "cli").await.unwrap();
+
+        let resp = disable(&p, basic("amate", "s3cret"), "boss@example.com").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["status"], "protected");
+        assert!(!crate::registration::get_credential(fs, "boss@example.com").await.unwrap().unwrap().disabled);
+        assert!(fs.query_eq("auditLog", "action", "disable_account").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn freezing_an_unknown_address_reports_not_found() {
+        let p = provider(&["amate"]).await;
+        let resp = disable(&p, basic("amate", "s3cret"), "nobody@example.com").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["status"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn only_invite_clients_may_freeze() {
+        let p = provider(&["amate", "public"]).await;
+        let rt = format!("{RP_ORIGIN}/auth/login");
+        let first = invite(&p, basic("amate", "s3cret"), "a@example.com", &rt).await;
+        let token = token_of(body_json(first).await["url"].as_str().unwrap());
+        assert_eq!(register_with_token(&p, &token).await, StatusCode::CREATED);
+
+        assert_eq!(disable(&p, basic("other", "s3cret"), "a@example.com").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(disable(&p, basic("amate", "wrong"), "a@example.com").await.status(), StatusCode::UNAUTHORIZED);
+        let public =
+            account_disable(State(p.clone()), HeaderMap::new(), form(&[("client_id", "public"), ("email", "a@example.com")]))
+                .await;
+        assert_eq!(public.status(), StatusCode::FORBIDDEN);
+        assert_eq!(disable(&p, basic("amate", "s3cret"), "not-an-email").await.status(), StatusCode::BAD_REQUEST);
+        let fs = p.firestore.as_ref().unwrap();
+        assert!(!crate::registration::get_credential(fs, "a@example.com").await.unwrap().unwrap().disabled);
     }
 
     #[tokio::test]

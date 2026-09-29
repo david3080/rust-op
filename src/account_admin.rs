@@ -90,6 +90,43 @@ pub async fn enable_account(fs: &Firestore, actor: &str, email: &str) -> Result<
     Ok(if already_enabled { EnableOutcome::AlreadyEnabled } else { EnableOutcome::Enabled })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted(RevocationCounts),
+    /// 凍結していないアカウントは消さない（削除は凍結の後に人が選ぶ、二段の操作に限る）。
+    NotDisabled,
+    NotFound,
+}
+
+/// 凍結済みのアカウントを完全に消す。accounts・accountsByUuid・profiles と、
+/// セッション・トークンを消し、監査ログを残す。
+pub async fn delete_account(fs: &Firestore, actor: &str, email: &str) -> Result<DeleteOutcome, String> {
+    let cred = match registration::get_credential(fs, email).await? {
+        Some(c) => c,
+        None => return Ok(DeleteOutcome::NotFound),
+    };
+    if !cred.disabled {
+        return Ok(DeleteOutcome::NotDisabled);
+    }
+    let counts = revoke_all(fs, &cred.account_id).await;
+    fs.delete_doc("fcmTokens", &cred.account_id).await?;
+    fs.delete_doc("profiles", &cred.account_id).await?;
+    fs.delete_doc("accountsByUuid", &cred.account_id).await?;
+    fs.delete_doc("accounts", email).await?;
+    audit_log::record(
+        fs,
+        actor,
+        "delete_account",
+        &cred.account_id,
+        &format!(
+            "email={email} sessions={} access_tokens={} refresh_tokens={} query_errors={:?}",
+            counts.sessions, counts.access_tokens, counts.refresh_tokens, counts.query_errors
+        ),
+    )
+    .await;
+    Ok(DeleteOutcome::Deleted(counts))
+}
+
 /// account_id に紐づく sessions/accessTokens/refreshTokens を検索し削除する。
 /// コレクション単位で query_eq 自体が失敗しても他のコレクションの失効は続ける
 /// （1種類の障害で残りを諦めない）。失敗したコレクションは query_errors に記録し、
@@ -271,5 +308,49 @@ mod tests {
         // AlreadyEnabled の no-op でも監査ログは記録される(disable側との対称性)。
         let entries = fs.query_eq("auditLog", "action", "enable_account").await.unwrap();
         assert_eq!(entries.len(), 2, "Enabled 1件 + AlreadyEnabled(no-op) 1件");
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_an_account_that_is_not_disabled() {
+        let (_host, fs) = setup().await;
+        register(&fs, "victim@example.com", "acc-victim").await;
+        let out = delete_account(&fs, "cli", "victim@example.com").await.unwrap();
+        assert_eq!(out, DeleteOutcome::NotDisabled);
+        assert!(registration::get_credential(&fs, "victim@example.com").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_account_returns_not_found() {
+        let (_host, fs) = setup().await;
+        let out = delete_account(&fs, "cli", "nobody@example.com").await.unwrap();
+        assert_eq!(out, DeleteOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_account_index_and_profile_but_not_other_accounts() {
+        let (_host, fs) = setup().await;
+        register(&fs, "victim@example.com", "acc-victim").await;
+        register(&fs, "other@example.com", "acc-other").await;
+        let name = std::collections::HashMap::from([("name".to_string(), "被害者".to_string())]);
+        registration::save_profile(&fs, "acc-victim", &name).await.unwrap();
+        registration::save_profile(&fs, "acc-other", &name).await.unwrap();
+        for id in ["acc-victim", "acc-other"] {
+            fs.set_doc("fcmTokens", id, serde_json::json!({ "token": crate::firestore::s("t") })).await.unwrap();
+        }
+        disable_account(&fs, "cli", "victim@example.com").await.unwrap();
+
+        let out = delete_account(&fs, "cli", "victim@example.com").await.unwrap();
+        assert_eq!(out, DeleteOutcome::Deleted(RevocationCounts::default()));
+
+        assert!(fs.get_doc("accounts", "victim@example.com").await.unwrap().is_none());
+        assert!(fs.get_doc("accountsByUuid", "acc-victim").await.unwrap().is_none());
+        assert!(fs.get_doc("profiles", "acc-victim").await.unwrap().is_none());
+        assert!(fs.get_doc("fcmTokens", "acc-victim").await.unwrap().is_none());
+        assert!(fs.get_doc("fcmTokens", "acc-other").await.unwrap().is_some());
+        assert!(fs.get_doc("accounts", "other@example.com").await.unwrap().is_some());
+        assert!(fs.get_doc("accountsByUuid", "acc-other").await.unwrap().is_some());
+        assert!(fs.get_doc("profiles", "acc-other").await.unwrap().is_some());
+        let entries = fs.query_eq("auditLog", "action", "delete_account").await.unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }
