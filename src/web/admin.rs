@@ -212,8 +212,16 @@ pub(super) async fn user_detail(
     let is_self = account_id == viewer;
 
     let disable_control = if cred.disabled {
+        let delete_control = if is_admin_user {
+            r#"<span style="color:#666;font-size:13px">管理者は削除できません（先に管理者を剥奪）。</span>"#.to_string()
+        } else {
+            format!(
+                r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('このアカウントを完全に削除しますか？passkey・プロフィールも消え、元に戻せません。')"><button class="btn btn-danger" type="submit">削除(delete)</button></form>"#,
+                action = esc(&p.path(&format!("/admin/users/{account_id}/delete"))),
+            )
+        };
         format!(
-            r#"<form class="inline" method="post" action="{action}"><button class="btn" type="submit">凍結解除(enable)</button></form>"#,
+            r#"<form class="inline" method="post" action="{action}"><button class="btn" type="submit">凍結解除(enable)</button></form> {delete_control}"#,
             action = esc(&p.path(&format!("/admin/users/{account_id}/enable"))),
         )
     } else if is_self {
@@ -325,6 +333,36 @@ pub(super) async fn user_enable(
         return server_error("user_enable", &e);
     }
     redirect(&p, &format!("/admin/users/{account_id}"))
+}
+
+pub(super) async fn user_delete(
+    State(p): State<Arc<Provider>>,
+    jar: CookieJar,
+    Path(account_id): Path<String>,
+) -> Response {
+    let (viewer, fs) = match require_admin_fs(&p, &jar).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    // 表示上はボタンを隠すだけなので、直接POSTされた場合に備えここでも再チェックする。
+    match crate::admin_store::is_admin(fs, &account_id).await {
+        Ok(true) => return (StatusCode::CONFLICT, "管理者は削除できません。先に管理者を剥奪してください").into_response(),
+        Ok(false) => {}
+        Err(e) => return server_error("user_delete: is_admin", &e),
+    }
+    let email = match crate::registration::find_email_by_account_id(fs, &account_id).await {
+        Ok(Some(e)) => e,
+        Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => return server_error("user_delete: find_email", &e),
+    };
+    match crate::account_admin::delete_account(fs, &viewer, &email).await {
+        Ok(crate::account_admin::DeleteOutcome::Deleted(_)) => redirect(&p, "/admin/users"),
+        Ok(crate::account_admin::DeleteOutcome::NotDisabled) => {
+            (StatusCode::CONFLICT, "凍結していないアカウントは削除できません。先に凍結してください").into_response()
+        }
+        Ok(crate::account_admin::DeleteOutcome::NotFound) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => server_error("user_delete", &e),
+    }
 }
 
 pub(super) async fn user_grant_admin(
@@ -948,5 +986,43 @@ mod tests {
         let resp =
             user_revoke_admin(State(p.clone()), jar, Path("acc-other".to_string())).await;
         assert!(resp.status().is_redirection());
+    }
+
+    async fn register(fs: &crate::firestore::Firestore, email: &str, account_id: &str) {
+        let outcome = crate::webauthn::RegOutcome {
+            credential_id: format!("cred-{account_id}"),
+            pub_x: "x".into(),
+            pub_y: "y".into(),
+            sign_count: 0,
+        };
+        crate::registration::save_credential(fs, email, account_id, &outcome).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_delete_needs_a_frozen_non_admin_account_and_returns_to_the_list() {
+        let (p, fs) = provider_with_firestore().await;
+        crate::admin_store::grant_admin(&fs, "acc-admin", "cli").await.unwrap();
+        crate::admin_store::grant_admin(&fs, "acc-other-admin", "cli").await.unwrap();
+        register(&fs, "u@example.com", "acc-u").await;
+        register(&fs, "boss@example.com", "acc-other-admin").await;
+        let p = Arc::new(p);
+
+        let jar = login_as(&p, "acc-admin").await;
+        let active = user_delete(State(p.clone()), jar, Path("acc-u".to_string())).await;
+        assert_eq!(active.status(), StatusCode::CONFLICT, "凍結していないアカウントは消さない");
+        assert!(crate::registration::get_credential(&fs, "u@example.com").await.unwrap().is_some());
+
+        crate::account_admin::disable_account(&fs, "cli", "boss@example.com").await.unwrap();
+        let jar = login_as(&p, "acc-admin").await;
+        let admin = user_delete(State(p.clone()), jar, Path("acc-other-admin".to_string())).await;
+        assert_eq!(admin.status(), StatusCode::CONFLICT, "管理者は消さない");
+
+        crate::account_admin::disable_account(&fs, "cli", "u@example.com").await.unwrap();
+        let jar = login_as(&p, "acc-admin").await;
+        let resp = user_delete(State(p.clone()), jar, Path("acc-u".to_string())).await;
+        assert!(resp.status().is_redirection());
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/admin/users");
+        assert!(crate::registration::get_credential(&fs, "u@example.com").await.unwrap().is_none());
+        assert!(crate::registration::find_email_by_account_id(&fs, "acc-u").await.unwrap().is_none());
     }
 }

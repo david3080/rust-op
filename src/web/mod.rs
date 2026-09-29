@@ -104,6 +104,7 @@ pub fn router(provider: Provider) -> Router {
         .route("/admin/users/{account_id}", get(admin::user_detail))
         .route("/admin/users/{account_id}/disable", post(admin::user_disable))
         .route("/admin/users/{account_id}/enable", post(admin::user_enable))
+        .route("/admin/users/{account_id}/delete", post(admin::user_delete))
         .route("/admin/users/{account_id}/grant-admin", post(admin::user_grant_admin))
         .route("/admin/users/{account_id}/revoke-admin", post(admin::user_revoke_admin))
         .route("/admin/audit", get(admin::audit_list))
@@ -128,6 +129,7 @@ pub fn router(provider: Provider) -> Router {
         .route("/signup/passkey/verify", post(register::register_passkey_verify))
         // 招待: RP（INVITE_CLIENT_IDS の confidential client）が登録リンクを発行し、受け手は /invite で登録する。
         .route("/invites", post(register::invite_create))
+        .route("/accounts/disable", post(register::account_disable))
         .route("/invite", get(register::invite_page))
         // ブラウザで完結する RP デモ。
         .route("/", get(pages::demo_start))
