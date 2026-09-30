@@ -295,9 +295,9 @@ pub(crate) const CATALOG: &[(&str, &str)] = &[
     ("Verify your email address", "メールアドレス確認"),
     (
         "To finish signing up, create your passkey with the button below. The link expires in 15 minutes.",
-        "登録を完了するには、以下のボタンからパスワードを設定してください。有効期限は15分です。",
+        "登録を完了するには、以下のボタンから passkey を作成してください。有効期限は15分です。",
     ),
-    ("Sign up with a passkey", "パスワードを設定して登録"),
+    ("Sign up with a passkey", "passkey を作成して登録"),
     ("If you did not request this, ignore this email.", "心当たりがない場合はこのメールを無視してください。"),
     ("[rust-op] An account already exists", "【rust-op】既に登録済みのアカウントがあります"),
     ("Already registered", "既に登録済みです"),
