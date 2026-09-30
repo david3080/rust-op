@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use i18n::{localize, Lang};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +24,9 @@ use uuid::Uuid;
 
 mod admin;
 mod ciba;
+pub(crate) mod i18n;
+#[cfg(test)]
+mod i18n_tests;
 mod login;
 mod oidc;
 mod pages;

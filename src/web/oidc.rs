@@ -566,6 +566,7 @@ fn jwt_aud(jwt: &str) -> Option<String> {
 
 pub(super) async fn end_session(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Query(q): Query<EndSessionQuery>,
 ) -> Response {
@@ -604,14 +605,14 @@ pub(super) async fn end_session(
     // リダイレクト先指定なし → 完了ページ。
     let home = p.path("/");
     let html = format!(
-        r##"<!doctype html><html lang="ja"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>ログアウト</title>
+        r##"<!doctype html><html lang="__LANG__"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>[[Log out]]</title>
 <style>body{{font-family:Roboto,-apple-system,sans-serif;max-width:360px;margin:0 auto;padding:80px 24px;text-align:center;color:#1a1a1a}}
 a{{color:#3f51b5}}</style></head><body>
-<h1 style="font-size:1.3rem;font-weight:500">ログアウトしました</h1>
-<p><a href="{home}">サインインへ</a></p></body></html>"##
+<h1 style="font-size:1.3rem;font-weight:500">[[You have logged out]]</h1>
+<p><a href="{home}">[[Go to sign in]]</a></p></body></html>"##
     );
-    (jar, Html(html)).into_response()
+    (jar, Html(localize(&html, Lang::from_headers(&headers)))).into_response()
 }
 /* ===== PAR (RFC 9126) ===== */
 

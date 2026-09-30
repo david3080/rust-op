@@ -2,26 +2,31 @@ use super::*;
 
 /* ===== メール確認つきユーザー登録 ===== */
 
-fn page(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html><html lang="ja"><head><meta charset="utf-8">
+fn page(lang: Lang, title: &str, body: &str) -> Html<String> {
+    let html = format!(
+        r#"<!doctype html><html lang="__LANG__"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>
 <style>body{{font-family:-apple-system,sans-serif;max-width:400px;margin:48px auto;padding:0 16px;line-height:1.7}}
 input{{display:block;width:100%;box-sizing:border-box;padding:10px;margin:8px 0;font-size:16px}}
 button{{width:100%;padding:12px;font-size:16px;background:#3367d6;color:#fff;border:0;border-radius:6px}}</style>
 </head><body>{body}</body></html>"#
-    ))
+    );
+    Html(localize(&html, lang))
 }
 
-pub(super) async fn register_form(State(p): State<Arc<Provider>>) -> Html<String> {
+pub(super) async fn register_form(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+) -> Html<String> {
     let action = p.path("/signup");
     page(
-        "登録",
+        Lang::from_headers(&headers),
+        "[[Sign up]]",
         &format!(
-            r#"<h1>ユーザー登録</h1><p>メールアドレスに確認リンクを送ります。</p>
+            r#"<h1>[[Create an account]]</h1><p>[[We will send a confirmation link to your email address.]]</p>
 <form method="post" action="{action}">
 <input name="email" type="email" placeholder="email" autocomplete="email" autofocus>
-<button type="submit">確認メールを送信</button></form>"#
+<button type="submit">[[Send confirmation email]]</button></form>"#
         ),
     )
 }
@@ -32,11 +37,13 @@ pub(super) struct RegisterForm {
 }
 
 /// メール確認チャレンジを作り確認メールを送る。Web フォーム/ネイティブ JSON 共通。
+/// `lang` はブラウザのフォームから来たときだけ Some。ネイティブの JSON API は None（両言語で送る）。
 async fn issue_register_email(
     p: &Provider,
     fs: &crate::firestore::Firestore,
     email: &str,
     ip: &str,
+    lang: Option<Lang>,
 ) -> Result<(), String> {
     if !email.contains('@') || email.len() > 254 {
         return Err("invalid email".into());
@@ -50,12 +57,12 @@ async fn issue_register_email(
     }
     match crate::registration::account_exists(fs, email).await? {
         true => {
-            let _ = p.mailer.send_already_registered(email).await;
+            let _ = p.mailer.send_already_registered(email, lang).await;
         }
         false => {
             let token = crate::registration::create_email_challenge(fs, email).await?;
             let url = format!("{}/r?t={}", p.origin(), token);
-            if let Err(e) = p.mailer.send_verification(email, &url).await {
+            if let Err(e) = p.mailer.send_verification(email, &url, lang).await {
                 tracing::error!("send_verification failed: {e}");
             }
         }
@@ -73,10 +80,12 @@ pub(super) async fn register_submit(
         Some(fs) => fs,
         None => return plain_error("registration not available (no Firestore)"),
     };
-    match issue_register_email(&p, fs, &email, &client_ip(&headers)).await {
+    let lang = Lang::from_headers(&headers);
+    match issue_register_email(&p, fs, &email, &client_ip(&headers), Some(lang)).await {
         Ok(()) => page(
-            "送信しました",
-            "<h1>確認メールを送信しました</h1><p>メール内のリンクから passkey を作成して登録を完了してください（有効期限15分）。</p>",
+            lang,
+            "[[Sent]]",
+            "<h1>[[Confirmation email sent]]</h1><p>[[Open the link in the email and create a passkey to finish signing up (the link expires in 15 minutes).]]</p>",
         )
         .into_response(),
         Err(e) if e == "invalid email" => plain_error("invalid email"),
@@ -107,7 +116,7 @@ pub(super) async fn register_email_challenge(
         Some(fs) => fs,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
     };
-    match issue_register_email(&p, fs, &email, &client_ip(&headers)).await {
+    match issue_register_email(&p, fs, &email, &client_ip(&headers), None).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) if e == "invalid email" => (StatusCode::BAD_REQUEST, "invalid email").into_response(),
         Err(e) if e == "rate_limited" => {
@@ -152,15 +161,21 @@ pub(super) async fn register_verify_email(
 /// iPhone は AASA(Universal Link)でアプリが横取りするため通常この HTML は出ず、
 /// PC/Mac やアプリ未対応端末ではこのページでブラウザ passkey 登録を完結できる。
 /// `invite_return` が Some なら招待の着地: 端末を問わず Web で登録し、成功したら戻り先へ移る。
-fn passkey_register_page(p: &Provider, token: &str, invite_return: Option<&str>) -> Html<String> {
+/// script の openApp: iOS=カスタムスキーム / Android=intent URL（fallback付き）。アプリ未起動なら1.5秒後にWebボタン提示。
+fn passkey_register_page(
+    p: &Provider,
+    lang: Lang,
+    token: &str,
+    invite_return: Option<&str>,
+) -> Html<String> {
     let token: String = token
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
     // UA 判別: モバイル(iOS/Android)はアプリ起動を一次手段に、デスクトップは Web のみ。
     // 自動で navigator.credentials.create を発火させない（ユーザーの明示クリックを要求）。
-    let body = r##"<!doctype html><html lang="ja"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>passkey 登録</title>
+    let body = r##"<!doctype html><html lang="__LANG__"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>[[Passkey registration]]</title>
 <style>body{font-family:-apple-system,sans-serif;max-width:380px;margin:40px auto;padding:0 16px;color:#222}
 h1{font-size:20px;margin:0 0 8px}p{font-size:14px;line-height:1.6}
 button,.btn{display:block;width:100%;padding:13px;margin-top:12px;font-size:16px;border:0;border-radius:8px;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box}
@@ -168,34 +183,33 @@ button,.btn{display:block;width:100%;padding:13px;margin-top:12px;font-size:16px
 .small{font-size:12px;color:#5f6368;margin-top:8px}
 #msg{font-size:14px;margin-top:14px;min-height:1.4em}#fallback{margin-top:16px}
 label{display:block;font-size:14px;margin-top:12px}input{display:block;width:100%;box-sizing:border-box;padding:10px;margin-top:4px;font-size:16px}</style></head><body>
-<h1>passkey を作成</h1>
-<label for="nm">氏名<span id="nmreq"></span></label>
+<h1>[[Create a passkey]]</h1>
+<label for="nm" id="nml">[[Name]]</label>
 <input id="nm" autocomplete="name" maxlength="80">
 <div id="mobile" hidden>
- <p>fido2demo アプリで安全に登録します。</p>
- <button class="primary" onclick="openApp()">アプリで開く</button>
- <p class="small">インストール済みなら自動で開きます。開かない場合は下のボタンから Web で続行できます。</p>
- <p class="small">アプリで開くと、上の氏名は保存されません。Web で登録を続けると保存されます。</p>
+ <p>[[Register securely with the fido2demo app.]]</p>
+ <button class="primary" onclick="openApp()">[[Open in the app]]</button>
+ <p class="small">[[If the app is installed, it opens automatically. If it does not, continue on the web with the button below.]]</p>
+ <p class="small">[[If you open the app, the name above is not saved. It is saved if you continue on the web.]]</p>
  <div id="fallback" hidden>
-  <button class="secondary" onclick="reg()">Web で登録を続ける</button>
-  <p class="small">同期 passkey（iCloud Keychain 等）として作成されます。</p>
+  <button class="secondary" onclick="reg()">[[Continue on the web]]</button>
+  <p class="small">[[It is created as a synced passkey (for example in iCloud Keychain).]]</p>
  </div>
 </div>
 <div id="desktop" hidden>
- <p>このデバイスの生体認証等で passkey を作成し、登録を完了します。</p>
- <button class="primary" onclick="reg()">passkey を作成して登録</button>
+ <p>[[Create a passkey with this device (for example with biometrics) to finish signing up.]]</p>
+ <button class="primary" onclick="reg()">[[Create a passkey and sign up]]</button>
 </div>
 <p id="msg"></p>
 <script>
 __WEBAUTHN_JS__
 const TOKEN="__TOKEN__",OPT="__OPT__",VER="__VER__",LOGIN="__LOGIN__",AFTER=__AFTER__,NAME_REQUIRED=!!AFTER;
-document.getElementById('nmreq').textContent=NAME_REQUIRED?'（必須）':'（任意）';
+document.getElementById('nml').textContent=NAME_REQUIRED?'[[Name (required)]]':'[[Name (optional)]]';
 const ua=navigator.userAgent;
 const isAndroid=/Android/i.test(ua);
 const isIOS=/iPad|iPhone|iPod/i.test(ua)||(/(Macintosh).*Mobile/i.test(ua));
 document.getElementById((!AFTER&&(isAndroid||isIOS))?'mobile':'desktop').hidden=false;
 function openApp(){
- // iOS=カスタムスキーム / Android=intent URL（fallback付き）。アプリ未起動なら1.5秒後にWebボタン提示。
  const url=isAndroid
   ?('intent://magic?t='+TOKEN+'#Intent;scheme=jp.co.sonrisa.fido2demo;package=jp.co.sonrisa.fido2demo;S.browser_fallback_url='+encodeURIComponent('https://oidc.sonrisa.co.jp/r?t='+TOKEN)+';end')
   :('jp.co.sonrisa.fido2demo://magic?t='+TOKEN);
@@ -206,8 +220,8 @@ function openApp(){
 async function reg(){
  const msg=document.getElementById('msg');
  const nm=document.getElementById('nm').value.trim();
- if(NAME_REQUIRED&&!nm){msg.textContent='氏名を入力してください';return;}
- msg.textContent='処理中…';
+ if(NAME_REQUIRED&&!nm){msg.textContent='[[Enter your name]]';return;}
+ msg.textContent='[[Working…]]';
  try{
   const r=await fetch(OPT,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:TOKEN})});
   if(!r.ok){msg.textContent=await r.text();return;}
@@ -217,13 +231,14 @@ async function reg(){
   if(nm)body.name=nm;
   const v=await fetch(VER,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
   if(!v.ok){msg.textContent=await v.text();return;}
-  if(AFTER){msg.textContent='登録が完了しました。サインインの画面へ移ります…';location.href=AFTER;return;}
-  msg.innerHTML='登録が完了しました。<a href="'+LOGIN+'">ログインへ</a>';
+  if(AFTER){msg.textContent='[[Registration complete. Taking you to sign in…]]';location.href=AFTER;return;}
+  msg.innerHTML='[[Registration complete.]] <a href="'+LOGIN+'">[[Go to log in]]</a>';
  }catch(e){msg.textContent=e.message;}
 }
 </script></body></html>"##;
     Html(
-        body.replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
+        localize(body, lang)
+            .replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
             .replace("__TOKEN__", &token)
             .replace("__OPT__", &p.path("/signup/passkey/options"))
             .replace("__VER__", &p.path("/signup/passkey/verify"))
@@ -243,8 +258,12 @@ pub(super) struct MagicQuery {
     t: String,
 }
 
-pub(super) async fn magic_redirect(State(p): State<Arc<Provider>>, Query(q): Query<MagicQuery>) -> Html<String> {
-    passkey_register_page(&p, &q.t, None)
+pub(super) async fn magic_redirect(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Query(q): Query<MagicQuery>,
+) -> Html<String> {
+    passkey_register_page(&p, Lang::from_headers(&headers), &q.t, None)
 }
 
 /// oidc.sonrisa.co.jp は Cloud Run へ直結（Firebase Hosting を経由しない）ため AASA を
@@ -263,8 +282,12 @@ pub(super) struct VerifyQuery {
 }
 
 /// Web フォーム経由（/signup/verify?token=）の着地点。
-pub(super) async fn verify_form(State(p): State<Arc<Provider>>, Query(q): Query<VerifyQuery>) -> Html<String> {
-    passkey_register_page(&p, &q.token, None)
+pub(super) async fn verify_form(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Query(q): Query<VerifyQuery>,
+) -> Html<String> {
+    passkey_register_page(&p, Lang::from_headers(&headers), &q.token, None)
 }
 
 /* ===== 招待（RP が発行を頼む、確認メール不要の登録リンク） ===== */
@@ -416,7 +439,12 @@ pub(super) async fn account_disable(
 }
 
 /// GET /invite?t= 招待リンクの着地。アプリへの横取りを挟まず Web で passkey を作り、戻り先へ返す。
-pub(super) async fn invite_page(State(p): State<Arc<Provider>>, Query(q): Query<MagicQuery>) -> Response {
+pub(super) async fn invite_page(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Query(q): Query<MagicQuery>,
+) -> Response {
+    let lang = Lang::from_headers(&headers);
     let fs = match &p.firestore {
         Some(fs) => fs,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "no firestore").into_response(),
@@ -427,8 +455,9 @@ pub(super) async fn invite_page(State(p): State<Arc<Provider>>, Query(q): Query<
             return (
                 StatusCode::BAD_REQUEST,
                 page(
-                    "招待の期限切れ",
-                    "<h1>この招待は使えません</h1><p>期限が切れたか、既に使われています。招待した方に、もう一度送ってもらってください。</p>",
+                    lang,
+                    "[[Invitation expired]]",
+                    "<h1>[[This invitation cannot be used]]</h1><p>[[It has expired or has already been used. Ask the person who invited you to send it again.]]</p>",
                 ),
             )
                 .into_response()
@@ -441,7 +470,7 @@ pub(super) async fn invite_page(State(p): State<Arc<Provider>>, Query(q): Query<
     if matches!(crate::registration::account_exists(fs, &email).await, Ok(true)) {
         return Redirect::to(&return_to).into_response();
     }
-    passkey_register_page(&p, &q.t, Some(&return_to)).into_response()
+    passkey_register_page(&p, lang, &q.t, Some(&return_to)).into_response()
 }
 
 /// 招待の token は、宛先が既に登録済みなら使わせない（同じアドレスへの招待が複数残っていても、
@@ -758,7 +787,12 @@ mod invite_tests {
         assert!(url.starts_with("https://idp.example/invite?t="), "{url}");
         let token = token_of(&url);
 
-        let page = invite_page(State(p.clone()), Query(MagicQuery { t: token.clone() })).await;
+        let page = invite_page(
+            State(p.clone()),
+            HeaderMap::new(),
+            Query(MagicQuery { t: token.clone() }),
+        )
+        .await;
         assert_eq!(page.status(), StatusCode::OK);
         let html = body_text(page).await;
         assert!(html.contains(&format!("AFTER=\"{return_to}\"")), "戻り先が焼き込まれる");
@@ -776,8 +810,17 @@ mod invite_tests {
         );
         assert_eq!(claims.get("name"), Some(&serde_json::json!("招待 太郎")), "登録で入れた氏名が RP に渡る");
 
-        let again = invite_page(State(p.clone()), Query(MagicQuery { t: token })).await;
-        assert_eq!(again.status(), StatusCode::BAD_REQUEST, "使った招待は二度使えない");
+        let again = invite_page(
+            State(p.clone()),
+            HeaderMap::new(),
+            Query(MagicQuery { t: token }),
+        )
+        .await;
+        assert_eq!(
+            again.status(),
+            StatusCode::BAD_REQUEST,
+            "使った招待は二度使えない"
+        );
     }
 
     #[tokio::test]
@@ -949,8 +992,15 @@ mod invite_tests {
     async fn ordinary_signup_token_is_not_an_invite() {
         let p = provider(&["amate"]).await;
         let fs = p.firestore.as_ref().unwrap();
-        let token = crate::registration::create_email_challenge(fs, "a@example.com").await.unwrap();
-        let resp = invite_page(State(p.clone()), Query(MagicQuery { t: token })).await;
+        let token = crate::registration::create_email_challenge(fs, "a@example.com")
+            .await
+            .unwrap();
+        let resp = invite_page(
+            State(p.clone()),
+            HeaderMap::new(),
+            Query(MagicQuery { t: token }),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1007,10 +1057,18 @@ mod invite_tests {
         let p = provider(&["amate"]).await;
         let resp = invite(&p, basic("amate", "s3cret"), "page@example.com", &format!("{RP_ORIGIN}/auth/login")).await;
         let token = token_of(body_json(resp).await["url"].as_str().unwrap());
-        let html = body_text(invite_page(State(p.clone()), Query(MagicQuery { t: token })).await).await;
+        let html = body_text(
+            invite_page(
+                State(p.clone()),
+                HeaderMap::new(),
+                Query(MagicQuery { t: token }),
+            )
+            .await,
+        )
+        .await;
         assert!(html.contains(r#"<input id="nm" autocomplete="name" maxlength="80">"#));
         assert!(html.contains("NAME_REQUIRED=!!AFTER"));
-        let plain = passkey_register_page(&p, "tok", None).0;
+        let plain = passkey_register_page(&p, Lang::En, "tok", None).0;
         assert!(plain.contains(r#"AFTER="""#), "通常の登録では AFTER が空なので、氏名は任意");
     }
 

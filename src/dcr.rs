@@ -319,13 +319,13 @@ pub fn check_admin_post_logout_uris(
             Some(h) => h,
             None => {
                 return Err(format!(
-                    "post_logout_redirect_uri は https で fragment と userinfo を含まないこと: {uri}"
+                    "post_logout_redirect_uri must use https and must not contain a fragment or userinfo: {uri}"
                 ))
             }
         };
         if !allowed.iter().any(|h| h.eq_ignore_ascii_case(host)) {
             return Err(format!(
-                "post_logout_redirect_uri のホストは、この client の redirect_uris と同じでなければなりません: {host}"
+                "post_logout_redirect_uri host must be the host of one of this client's redirect_uris: {host}"
             ));
         }
     }

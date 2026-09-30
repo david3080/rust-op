@@ -263,13 +263,22 @@ fn now_secs() -> u64 {
 }
 
 /// 承認 UI: ログイン済セッションが自分宛の pending 要求を承認/拒否する。
-pub(super) async fn ciba_pending(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
+/// script の setInterval: 新着の承認依頼を自動表示（FCM の代わりのポーリング）。承認/拒否操作中は止める。
+pub(super) async fn ciba_pending(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    let lang = Lang::from_headers(&headers);
     let account = match session_account(&p, &jar).await {
         Some(a) => a,
         None => {
-            return Html(format!(
-                "<p>承認するにはログインが必要です。<a href=\"{}\">ログイン</a></p>",
-                p.path("/")
+            return Html(localize(
+                &format!(
+                    "<!doctype html><html lang=\"__LANG__\"><meta charset=\"utf-8\"><p>[[You need to log in to approve.]] <a href=\"{}\">[[Log in]]</a></p>",
+                    p.path("/")
+                ),
+                lang,
             ))
             .into_response()
         }
@@ -281,8 +290,8 @@ pub(super) async fn ciba_pending(State(p): State<Arc<Provider>>, jar: CookieJar)
         .map(|r| {
             format!(
                 "<div class=row><div><b>{}</b><br><small>scope: {}</small></div>\
-<button onclick=\"approve('{}')\">承認 (passkey)</button> \
-<button class=rej onclick=\"reject('{}')\">拒否</button></div>",
+<button onclick=\"approve('{}')\">[[Approve (passkey)]]</button> \
+<button class=rej onclick=\"reject('{}')\">[[Reject]]</button></div>",
                 esc(if r.binding_message.is_empty() { "(no binding message)" } else { &r.binding_message }),
                 esc(&r.scope),
                 esc(r.auth_req_id.as_str()),
@@ -290,13 +299,13 @@ pub(super) async fn ciba_pending(State(p): State<Arc<Provider>>, jar: CookieJar)
             )
         })
         .collect();
-    let body = r##"<!doctype html><html lang="ja"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>CIBA 承認</title>
+    let body = r##"<!doctype html><html lang="__LANG__"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>[[CIBA approval]]</title>
 <style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:32px auto;padding:0 16px}
 .row{border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px 0}
 button{padding:8px 14px;font-size:15px;background:#3367d6;color:#fff;border:0;border-radius:6px;margin-top:8px}
 button.rej{background:#999}#msg{color:#c00}</style></head><body>
-<h1>CIBA 承認</h1>
+<h1>[[CIBA approval]]</h1>
 <div id="msg"></div>
 __ROWS__
 <script>
@@ -320,11 +329,16 @@ async function reject(id){
  await fetch(B+'/ciba/'+id+'/reject',{method:'POST'});
  location.reload();
 }
-// 新着の承認依頼を自動表示（FCM の代わりのポーリング）。承認/拒否操作中は止める。
 setInterval(()=>{if(!window.__busy)location.reload();},4000);
 </script></body></html>"##;
+    let rows = if rows.is_empty() {
+        "<p>[[There are no pending requests.]]</p>".to_string()
+    } else {
+        rows
+    };
     Html(
-        body.replace("__ROWS__", if rows.is_empty() { "<p>保留中の要求はありません。</p>" } else { &rows })
+        localize(body, lang)
+            .replace("__ROWS__", &localize(&rows, lang))
             .replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
             .replace("__BASE__", &p.base_path),
     )

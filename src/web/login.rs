@@ -1,8 +1,16 @@
 use super::*;
 
-pub(super) async fn login_form(State(p): State<Arc<Provider>>, Path(uid): Path<String>) -> Html<String> {
-    let body = r##"<!doctype html><html lang="ja"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>ログイン</title>
+// pkLogin は discoverable のモーダル方式のみ。allowCredentials 空で OS の passkey ピッカーに
+// 全候補を出して選ばせる。Conditional UI(autofill) は自動起動しない。
+// 理由: アプリ webview(ASWebAuthenticationSession)内では autofill が「最近使った1件」
+// だけを勝手に提示して紛らわしいため(TS 版も同方針)。userHandle でユーザー解決。
+pub(super) async fn login_form(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    Path(uid): Path<String>,
+) -> Html<String> {
+    let body = r##"<!doctype html><html lang="__LANG__"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>[[Log in]]</title>
 <style>
 :root{--indigo:#3f51b5;--indigo-d:#303f9f}
 body{font-family:Roboto,-apple-system,'Helvetica Neue',sans-serif;max-width:360px;margin:0 auto;padding:56px 24px;color:#1a1a1a;text-align:center}
@@ -22,20 +30,16 @@ details input{font-size:14px;padding:8px;margin-top:8px}</style>
 <path d="M8 11a4 4 0 0 1 8 0v3a6 6 0 0 0 .8 3"/>
 <path d="M12 11v4a7 7 0 0 0 1.4 4.3"/>
 <path d="M12 19v.01"/></svg>
-<h1>Passkey でサインイン</h1>
-<input id="email" placeholder="メールアドレス（任意）" autocomplete="off">
-<button class="filled" onclick="pkLogin()">サインイン</button>
-<button class="outlined" onclick="location.href='__REGISTER__'">新規登録 (メアドで)</button>
-<button class="outlined" onclick="location.href='__CANCEL__'">キャンセル</button>
+<h1>[[Sign in with a passkey]]</h1>
+<input id="email" placeholder="[[Email address (optional)]]" autocomplete="off">
+<button class="filled" onclick="pkLogin()">[[Sign in]]</button>
+<button class="outlined" onclick="location.href='__REGISTER__'">[[Sign up with email]]</button>
+<button class="outlined" onclick="location.href='__CANCEL__'">[[Cancel]]</button>
 <p id="msg"></p>
 <script>
 __WEBAUTHN_JS__
 const OPT="__OPT__",VER="__VER__";
 const msgEl=document.getElementById('msg');
-// discoverable のモーダル方式のみ。allowCredentials 空で OS の passkey ピッカーに
-// 全候補を出して選ばせる。Conditional UI(autofill) は自動起動しない。
-// 理由: アプリ webview(ASWebAuthenticationSession)内では autofill が「最近使った1件」
-// だけを勝手に提示して紛らわしいため(TS 版も同方針)。userHandle でユーザー解決。
 let cachedOpts=null;
 async function prefetch(){
   try{const r=await fetch(OPT,{method:'POST',headers:{'content-type':'application/json'},body:'{}'});cachedOpts=r.ok?await r.json():null;}
@@ -44,7 +48,7 @@ async function prefetch(){
 prefetch();
 async function pkLogin(){
  msgEl.textContent='';
- if(!window.PublicKeyCredential){msgEl.textContent='このブラウザは passkey 非対応です（標準の Safari / Chrome アプリで開いてください）。';return;}
+ if(!window.PublicKeyCredential){msgEl.textContent='[[This browser does not support passkeys. Open this page in the standard Safari or Chrome app.]]';return;}
  try{
   let o=cachedOpts;
   if(!o){const r=await fetch(OPT,{method:'POST',headers:{'content-type':'application/json'},body:'{}'});if(!r.ok){msgEl.textContent=await r.text();return;}o=await r.json();}
@@ -56,13 +60,14 @@ async function pkLogin(){
   location.href=(await v.json()).redirect;
  }catch(e){
   if(e.name==='NotAllowedError'){
-   msgEl.textContent='passkey を起動できませんでした。標準の Safari / Chrome アプリで開いてください（アプリ内ブラウザでは使えません）。';
+   msgEl.textContent='[[Could not start the passkey. Open this page in the standard Safari or Chrome app (in-app browsers are not supported).]]';
   }else{msgEl.textContent=(e.name||'')+': '+(e.message||String(e));}
  }
 }
 </script></body></html>"##;
     Html(
-        body.replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
+        localize(body, Lang::from_headers(&headers))
+            .replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
             .replace("__OPT__", &p.path(&format!("/login/{uid}/passkey/options")))
             .replace("__VER__", &p.path(&format!("/login/{uid}/passkey/verify")))
             .replace("__CANCEL__", &p.path(&format!("/login/{uid}/cancel")))
