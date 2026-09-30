@@ -61,8 +61,8 @@ pub async fn send_ciba_request(
     let message = json!({
         "token": token,
         "notification": {
-            "title": "ログインの承認",
-            "body": format!("{client_id} からのログイン要求があります"),
+            "title": crate::web::i18n::bilingual("[[Sign-in approval]]"),
+            "body": crate::web::i18n::bilingual("[[Sign-in request from {client}]]").replace("{client}", client_id),
         },
         "data": data,
         "apns": { "payload": { "aps": { "sound": "default", "mutable-content": 1 } } },
@@ -113,6 +113,15 @@ mod tests {
         assert_eq!(sent.len(), 1, "同じ account_id で保存した token 宛にちょうど1通送られる");
         assert_eq!(sent[0]["message"]["token"], json!("tok-abc"));
         assert_eq!(sent[0]["message"]["data"]["auth_req_id"], json!("req-1"));
+        assert_eq!(
+            sent[0]["message"]["notification"]["title"],
+            json!("ログインの承認 / Sign-in approval")
+        );
+        assert_eq!(
+            sent[0]["message"]["notification"]["body"],
+            json!("client-1 からのログイン要求があります / Sign-in request from client-1"),
+            "端末の言語が分からないので、日本語と英語を 1 行に並べる"
+        );
     }
 
     #[tokio::test]

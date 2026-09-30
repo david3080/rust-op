@@ -71,9 +71,9 @@ fn nav(p: &Provider) -> String {
 }
 
 /// register.rs::page と同じ骨格に管理者ナビを追加した共有レイアウト。
-fn page(p: &Provider, title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html><html lang="ja"><head><meta charset="utf-8">
+fn page(p: &Provider, lang: Lang, title: &str, body: &str) -> Html<String> {
+    let html = format!(
+        r#"<!doctype html><html lang="__LANG__"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>
 <style>
 :root{{--indigo:#3f51b5;--indigo-d:#303f9f;--bg:#fafafa;--border:#e0e0e0}}
@@ -100,7 +100,13 @@ code{{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:13px}}
 </style>
 </head><body>{nav}{body}</body></html>"#,
         nav = nav(p),
-    ))
+    );
+    Html(localize(&html, lang))
+}
+
+/// 人に見せる素の文言の応答（フォームの POST の結果としてブラウザにそのまま出る）。
+fn text(status: StatusCode, lang: Lang, template: &str) -> Response {
+    (status, localize(template, lang)).into_response()
 }
 
 fn redirect(p: &Provider, path: &str) -> Response {
@@ -114,21 +120,30 @@ fn server_error(context: &str, e: &str) -> Response {
 
 /* ===== ホーム ===== */
 
-pub(super) async fn admin_home(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
+pub(super) async fn admin_home(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
     if let Err(r) = require_admin(&p, &jar).await {
         return r;
     }
     page(
         &p,
-        "管理コンソール",
-        "<h1>管理コンソール</h1><p>上のナビゲーションから操作を選んでください。</p>",
+        Lang::from_headers(&headers),
+        "[[Admin console]]",
+        "<h1>[[Admin console]]</h1><p>[[Choose an action from the navigation above.]]</p>",
     )
     .into_response()
 }
 
 /* ===== ユーザー管理 ===== */
 
-pub(super) async fn users_list(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
+pub(super) async fn users_list(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
     let (_viewer, fs) = match require_admin_fs(&p, &jar).await {
         Ok(x) => x,
         Err(r) => return r,
@@ -173,14 +188,15 @@ pub(super) async fn users_list(State(p): State<Arc<Provider>>, jar: CookieJar) -
         .collect();
 
     let body = format!(
-        "<h1>Users ({n})</h1><table><tr><th>Email</th><th>状態</th><th>sign_count</th><th>登録日</th></tr>{rows}</table>",
+        "<h1>Users ({n})</h1><table><tr><th>Email</th><th>[[Status]]</th><th>sign_count</th><th>[[Registered]]</th></tr>{rows}</table>",
         n = accounts.len(),
     );
-    page(&p, "Users", &body).into_response()
+    page(&p, Lang::from_headers(&headers), "Users", &body).into_response()
 }
 
 pub(super) async fn user_detail(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(account_id): Path<String>,
 ) -> Response {
@@ -213,39 +229,39 @@ pub(super) async fn user_detail(
 
     let disable_control = if cred.disabled {
         let delete_control = if is_admin_user {
-            r#"<span style="color:#666;font-size:13px">管理者は削除できません（先に管理者を剥奪）。</span>"#.to_string()
+            r#"<span style="color:#666;font-size:13px">[[Admins cannot be deleted (revoke admin first).]]</span>"#.to_string()
         } else {
             format!(
-                r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('このアカウントを完全に削除しますか？passkey・プロフィール・通知の登録も消え、元に戻せません（CIBA の承認の履歴は残ります）。')"><button class="btn btn-danger" type="submit">削除(delete)</button></form>"#,
+                r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('[[Delete this account permanently? Its passkey, profile, and notification registration are also removed, and this cannot be undone (the CIBA approval history is kept).]]')"><button class="btn btn-danger" type="submit">[[Delete]]</button></form>"#,
                 action = esc(&p.path(&format!("/admin/users/{account_id}/delete"))),
             )
         };
         format!(
-            r#"<form class="inline" method="post" action="{action}"><button class="btn" type="submit">凍結解除(enable)</button></form> {delete_control}"#,
+            r#"<form class="inline" method="post" action="{action}"><button class="btn" type="submit">[[Enable]]</button></form> {delete_control}"#,
             action = esc(&p.path(&format!("/admin/users/{account_id}/enable"))),
         )
     } else if is_self {
-        r#"<span style="color:#666;font-size:13px">自分自身は凍結できません（セッションが即座に失効するため）。</span>"#.to_string()
+        r#"<span style="color:#666;font-size:13px">[[You cannot disable yourself (your session would end immediately).]]</span>"#.to_string()
     } else {
         format!(
-            r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('このアカウントを凍結しますか？セッション・トークンも失効します。')"><button class="btn btn-danger" type="submit">凍結(disable)</button></form>"#,
+            r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('[[Disable this account? Its sessions and tokens are also revoked.]]')"><button class="btn btn-danger" type="submit">[[Disable]]</button></form>"#,
             action = esc(&p.path(&format!("/admin/users/{account_id}/disable"))),
         )
     };
 
     let admin_control = if is_admin_user {
         let msg = if is_self {
-            "自分自身の管理者権限を剥奪しますか？"
+            "[[Revoke your own admin rights?]]"
         } else {
-            "管理者権限を剥奪しますか？"
+            "[[Revoke admin rights?]]"
         };
         format!(
-            r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('{msg}')"><button class="btn btn-danger" type="submit">管理者を剥奪</button></form>"#,
+            r#"<form class="inline" method="post" action="{action}" onsubmit="return confirm('{msg}')"><button class="btn btn-danger" type="submit">[[Revoke admin]]</button></form>"#,
             action = esc(&p.path(&format!("/admin/users/{account_id}/revoke-admin"))),
         )
     } else {
         format!(
-            r#"<form class="inline" method="post" action="{action}"><button class="btn" type="submit">管理者に任命</button></form>"#,
+            r#"<form class="inline" method="post" action="{action}"><button class="btn" type="submit">[[Make admin]]</button></form>"#,
             action = esc(&p.path(&format!("/admin/users/{account_id}/grant-admin"))),
         )
     };
@@ -263,10 +279,10 @@ pub(super) async fn user_detail(
         })
         .collect();
     let audit_table = if audit.is_empty() {
-        "<p>操作履歴はありません。</p>".to_string()
+        "<p>[[No history.]]</p>".to_string()
     } else {
         format!(
-            "<table><tr><th>日時</th><th>実行者</th><th>操作</th><th>詳細</th></tr>{audit_rows}</table>"
+            "<table><tr><th>[[Time]]</th><th>[[Actor]]</th><th>[[Action]]</th><th>[[Details]]</th></tr>{audit_rows}</table>"
         )
     };
 
@@ -275,24 +291,39 @@ pub(super) async fn user_detail(
 <p>account_id: <code>{account_id}</code></p>
 <p>credential_id: <code>{credential_id}</code></p>
 <p>sign_count: {sign_count}</p>
-<p>状態: {status} / 管理者: {admin_status}</p>
+<p>[[Status]]: {status} / [[Role]]: {admin_status}</p>
 <p>{disable_control} {admin_control}</p>
-<h2>操作履歴</h2>
+<h2>[[History]]</h2>
 {audit_table}
-<p><a href="{back}">&larr; 一覧へ戻る</a></p>"#,
+<p><a href="{back}">&larr; [[Back to the list]]</a></p>"#,
         email = esc(&email),
         account_id = esc(&account_id),
         credential_id = esc(&cred.credential_id),
         sign_count = cred.sign_count,
-        status = if cred.disabled { "凍結中" } else { "有効" },
-        admin_status = if is_admin_user { "管理者" } else { "一般" },
+        status = if cred.disabled {
+            "[[Disabled]]"
+        } else {
+            "[[Active]]"
+        },
+        admin_status = if is_admin_user {
+            "[[Admin]]"
+        } else {
+            "[[Regular user]]"
+        },
         back = esc(&p.path("/admin/users")),
     );
-    page(&p, &format!("User: {}", esc(&email)), &body).into_response()
+    page(
+        &p,
+        Lang::from_headers(&headers),
+        &format!("User: {}", esc(&email)),
+        &body,
+    )
+    .into_response()
 }
 
 pub(super) async fn user_disable(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(account_id): Path<String>,
 ) -> Response {
@@ -302,7 +333,11 @@ pub(super) async fn user_disable(
     };
     // 表示上はボタンを隠すだけなので、直接POSTされた場合に備えここでも再チェックする。
     if account_id == viewer {
-        return (StatusCode::FORBIDDEN, "自分自身は凍結できません").into_response();
+        return text(
+            StatusCode::FORBIDDEN,
+            Lang::from_headers(&headers),
+            "[[You cannot disable yourself]]",
+        );
     }
     let email = match crate::registration::find_email_by_account_id(fs, &account_id).await {
         Ok(Some(e)) => e,
@@ -337,6 +372,7 @@ pub(super) async fn user_enable(
 
 pub(super) async fn user_delete(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(account_id): Path<String>,
 ) -> Response {
@@ -346,7 +382,13 @@ pub(super) async fn user_delete(
     };
     // 表示上はボタンを隠すだけなので、直接POSTされた場合に備えここでも再チェックする。
     match crate::admin_store::is_admin(fs, &account_id).await {
-        Ok(true) => return (StatusCode::CONFLICT, "管理者は削除できません。先に管理者を剥奪してください").into_response(),
+        Ok(true) => {
+            return text(
+                StatusCode::CONFLICT,
+                Lang::from_headers(&headers),
+                "[[Admins cannot be deleted. Revoke admin first]]",
+            )
+        }
         Ok(false) => {}
         Err(e) => return server_error("user_delete: is_admin", &e),
     }
@@ -357,16 +399,21 @@ pub(super) async fn user_delete(
     };
     match crate::account_admin::delete_account(fs, &viewer, &email).await {
         Ok(crate::account_admin::DeleteOutcome::Deleted(_)) => redirect(&p, "/admin/users"),
-        Ok(crate::account_admin::DeleteOutcome::NotDisabled) => {
-            (StatusCode::CONFLICT, "凍結していないアカウントは削除できません。先に凍結してください").into_response()
+        Ok(crate::account_admin::DeleteOutcome::NotDisabled) => text(
+            StatusCode::CONFLICT,
+            Lang::from_headers(&headers),
+            "[[An account that is not disabled cannot be deleted. Disable it first]]",
+        ),
+        Ok(crate::account_admin::DeleteOutcome::NotFound) => {
+            (StatusCode::NOT_FOUND, "user not found").into_response()
         }
-        Ok(crate::account_admin::DeleteOutcome::NotFound) => (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(e) => server_error("user_delete", &e),
     }
 }
 
 pub(super) async fn user_grant_admin(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(account_id): Path<String>,
 ) -> Response {
@@ -382,15 +429,18 @@ pub(super) async fn user_grant_admin(
         Ok(crate::admin_store::GrantAdminResult::AlreadyAdmin) => {
             redirect(&p, &format!("/admin/users/{account_id}"))
         }
-        Ok(crate::admin_store::GrantAdminResult::Conflict) => {
-            (StatusCode::CONFLICT, "他の書き込みと競合しました。もう一度お試しください").into_response()
-        }
+        Ok(crate::admin_store::GrantAdminResult::Conflict) => text(
+            StatusCode::CONFLICT,
+            Lang::from_headers(&headers),
+            "[[This conflicted with another change. Please try again]]",
+        ),
         Err(e) => server_error("user_grant_admin", &e),
     }
 }
 
 pub(super) async fn user_revoke_admin(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(account_id): Path<String>,
 ) -> Response {
@@ -406,8 +456,9 @@ pub(super) async fn user_revoke_admin(
                 // 管理画面内へリダイレクトすると即403になる。管理画面外の完了表示で終える。
                 return page(
                     &p,
-                    "管理者権限を放棄しました",
-                    "<h1>管理者権限を放棄しました</h1><p>これ以降、管理コンソールにはアクセスできません。</p>",
+                    Lang::from_headers(&headers),
+                    "[[You gave up admin rights]]",
+                    "<h1>[[You gave up admin rights]]</h1><p>[[You can no longer access the admin console.]]</p>",
                 )
                 .into_response();
             }
@@ -416,17 +467,25 @@ pub(super) async fn user_revoke_admin(
         Ok(crate::admin_store::RevokeAdminResult::NotAdmin) => {
             redirect(&p, &format!("/admin/users/{account_id}"))
         }
-        Ok(crate::admin_store::RevokeAdminResult::LastAdminGuard) => {
-            (StatusCode::CONFLICT, "最後の管理者は剥奪できません").into_response()
-        }
-        Ok(crate::admin_store::RevokeAdminResult::Conflict) => {
-            (StatusCode::CONFLICT, "他の書き込みと競合しました。もう一度お試しください").into_response()
-        }
+        Ok(crate::admin_store::RevokeAdminResult::LastAdminGuard) => text(
+            StatusCode::CONFLICT,
+            Lang::from_headers(&headers),
+            "[[The last admin cannot be revoked]]",
+        ),
+        Ok(crate::admin_store::RevokeAdminResult::Conflict) => text(
+            StatusCode::CONFLICT,
+            Lang::from_headers(&headers),
+            "[[This conflicted with another change. Please try again]]",
+        ),
         Err(e) => server_error("user_revoke_admin", &e),
     }
 }
 
-pub(super) async fn audit_list(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
+pub(super) async fn audit_list(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
     let (_viewer, fs) = match require_admin_fs(&p, &jar).await {
         Ok(x) => x,
         Err(r) => return r,
@@ -448,16 +507,22 @@ pub(super) async fn audit_list(State(p): State<Arc<Provider>>, jar: CookieJar) -
             )
         })
         .collect();
+    let lang = Lang::from_headers(&headers);
+    let heading =
+        localize("[[Audit log (latest {n})]]", lang).replace("{n}", &entries.len().to_string());
     let body = format!(
-        "<h1>監査ログ（直近{n}件）</h1><table><tr><th>日時</th><th>実行者</th><th>操作</th><th>対象</th><th>詳細</th></tr>{rows}</table>",
-        n = entries.len(),
+        "<h1>{heading}</h1><table><tr><th>[[Time]]</th><th>[[Actor]]</th><th>[[Action]]</th><th>[[Target]]</th><th>[[Details]]</th></tr>{rows}</table>",
     );
-    page(&p, "Audit Log", &body).into_response()
+    page(&p, lang, "Audit Log", &body).into_response()
 }
 
 /* ===== クライアント管理 ===== */
 
-pub(super) async fn clients_list(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
+pub(super) async fn clients_list(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
     let (_viewer, fs) = match require_admin_fs(&p, &jar).await {
         Ok(x) => x,
         Err(r) => return r,
@@ -480,14 +545,15 @@ pub(super) async fn clients_list(State(p): State<Arc<Provider>>, jar: CookieJar)
         })
         .collect();
     let body = format!(
-        "<h1>Clients ({n})</h1><table><tr><th>client_id</th><th>認証方式</th><th>grant_types</th></tr>{rows}</table>",
+        "<h1>Clients ({n})</h1><table><tr><th>client_id</th><th>[[Auth method]]</th><th>grant_types</th></tr>{rows}</table>",
         n = clients.len(),
     );
-    page(&p, "Clients", &body).into_response()
+    page(&p, Lang::from_headers(&headers), "Clients", &body).into_response()
 }
 
 pub(super) async fn client_detail(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(client_id): Path<String>,
 ) -> Response {
@@ -501,19 +567,19 @@ pub(super) async fn client_detail(
     };
 
     let redirect_uris: String = if c.redirect_uris.is_empty() {
-        "<li>(なし)</li>".to_string()
+        "<li>[[(none)]]</li>".to_string()
     } else {
         c.redirect_uris.iter().map(|u| format!("<li><code>{}</code></li>", esc(u))).collect()
     };
     let jwks: String = if c.jwks.is_empty() {
-        "<li>(なし)</li>".to_string()
+        "<li>[[(none)]]</li>".to_string()
     } else {
         c.jwks.iter().map(|k| format!("<li>kid=<code>{}</code></li>", esc(&k.kid))).collect()
     };
     // 空なら「サインアウトの戻り先が無い＝end_session が not registered で落ちる」状態。
     // 画面に出ていないと今回のように原因が見えないので、空であることも明示する。
     let post_logout_redirect_uris: String = if c.post_logout_redirect_uris.is_empty() {
-        "<li>(なし — この client はサインアウト後の戻り先を持ちません)</li>".to_string()
+        "<li>[[(none — this client has no return address after sign-out)]]</li>".to_string()
     } else {
         c.post_logout_redirect_uris
             .iter()
@@ -529,30 +595,43 @@ pub(super) async fn client_detail(
 <p>redirect_uris:</p><ul>{redirect_uris}</ul>
 <p>post_logout_redirect_uris:</p><ul>{post_logout_redirect_uris}</ul>
 <form method="post" action="{post_logout_action}">
-<label for="post_logout_redirect_uris">post_logout_redirect_uris（1 行に 1 つ。空にすると戻り先なし）</label>
+<label for="post_logout_redirect_uris">[[post_logout_redirect_uris (one per line; leave empty for no return address)]]</label>
 <textarea id="post_logout_redirect_uris" name="post_logout_redirect_uris" rows="3" cols="60">{post_logout_value}</textarea>
-<button class="btn" type="submit">戻り先を保存</button>
+<button class="btn" type="submit">[[Save return addresses]]</button>
 </form>
 <p>jwks_uri: {jwks_uri}</p>
 <p>jwks kids:</p><ul>{jwks}</ul>
 <p>require_par: {par} / require_pkce: {pkce} / dpop_bound: {dpop}</p>
-<form method="post" action="{revoke_action}" onsubmit="return confirm('このクライアントを失効させますか？取り消せません。')"><button class="btn btn-danger" type="submit">Revoke</button></form>
-<p><a href="{back}">&larr; 一覧へ戻る</a></p>"#,
+<form method="post" action="{revoke_action}" onsubmit="return confirm('[[Revoke this client? This cannot be undone.]]')"><button class="btn btn-danger" type="submit">Revoke</button></form>
+<p><a href="{back}">&larr; [[Back to the list]]</a></p>"#,
         id = esc(&c.client_id),
         auth = esc(&c.token_endpoint_auth_method),
-        secret = if c.client_secret.is_some() { "設定済み" } else { "なし" },
+        secret = if c.client_secret.is_some() {
+            "[[Set]]"
+        } else {
+            "[[None]]"
+        },
         grants = esc(&c.grant_types.join(", ")),
         post_logout_value = esc(&c.post_logout_redirect_uris.join("\n")),
-        post_logout_action =
-            esc(&p.path(&format!("/admin/clients/{}/post-logout", c.client_id))),
-        jwks_uri = c.jwks_uri.as_deref().map(esc).unwrap_or_else(|| "なし".into()),
+        post_logout_action = esc(&p.path(&format!("/admin/clients/{}/post-logout", c.client_id))),
+        jwks_uri = c
+            .jwks_uri
+            .as_deref()
+            .map(esc)
+            .unwrap_or_else(|| "[[None]]".into()),
         par = c.require_par,
         pkce = c.require_pkce,
         dpop = c.dpop_bound,
         revoke_action = esc(&p.path(&format!("/admin/clients/{}/revoke", c.client_id))),
         back = esc(&p.path("/admin/clients")),
     );
-    page(&p, &format!("Client: {}", esc(&c.client_id)), &body).into_response()
+    page(
+        &p,
+        Lang::from_headers(&headers),
+        &format!("Client: {}", esc(&c.client_id)),
+        &body,
+    )
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -573,6 +652,7 @@ pub(super) struct PostLogoutForm {
 /// 書き戻しは CAS。読んでから書くまでに別の更新が入ったら 409 で返し、やり直させる。
 pub(super) async fn client_set_post_logout(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(client_id): Path<String>,
     Form(form): Form<PostLogoutForm>,
@@ -602,11 +682,11 @@ pub(super) async fn client_set_post_logout(
             crate::audit_log::record(fs, &viewer, "set_post_logout_redirect_uris", &client_id, &uris.join(" ")).await;
         }
         Ok(false) => {
-            return (
+            return text(
                 StatusCode::CONFLICT,
-                "この client は別の更新で変わりました。開き直してからやり直してください。",
+                Lang::from_headers(&headers),
+                "[[This client was changed by another update. Reopen it and try again.]]",
             )
-                .into_response()
         }
         Err(e) => return server_error("client_set_post_logout", &e),
     }
@@ -634,7 +714,11 @@ pub(super) async fn client_revoke(
 
 /* ===== IAT管理 ===== */
 
-pub(super) async fn iats_pending_list(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
+pub(super) async fn iats_pending_list(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
     let (_viewer, fs) = match require_admin_fs(&p, &jar).await {
         Ok(x) => x,
         Err(r) => return r,
@@ -657,7 +741,7 @@ pub(super) async fn iats_pending_list(State(p): State<Arc<Provider>>, jar: Cooki
             };
             format!(
                 r#"<tr><td><code>{hash}&hellip;</code></td><td>{profile}</td><td>{hosts}</td><td>{grants}</td><td>{badge}{reusable}</td>
-<td><form method="post" action="{revoke}" onsubmit="return confirm('このIATを破棄しますか？')">
+<td><form method="post" action="{revoke}" onsubmit="return confirm('[[Discard this IAT?]]')">
 <input type="hidden" name="update_time" value="{update_time}">
 <button class="btn btn-danger" type="submit">Revoke</button></form></td></tr>"#,
                 hash = esc(&iat.hash[..iat.hash.len().min(16)]),
@@ -672,12 +756,12 @@ pub(super) async fn iats_pending_list(State(p): State<Arc<Provider>>, jar: Cooki
         .collect();
 
     let body = format!(
-        r#"<h1>未消費のIAT ({n})</h1><p><a class="btn" href="{mint_link}">+ 新規mint</a></p>
-<table><tr><th>hash</th><th>profile</th><th>redirect hosts</th><th>grant types</th><th>状態</th><th></th></tr>{rows}</table>"#,
+        r#"<h1>[[Unused IATs]] ({n})</h1><p><a class="btn" href="{mint_link}">+ [[New mint]]</a></p>
+<table><tr><th>hash</th><th>profile</th><th>redirect hosts</th><th>grant types</th><th>[[Status]]</th><th></th></tr>{rows}</table>"#,
         n = iats.len(),
         mint_link = esc(&p.path("/admin/iats/new")),
     );
-    page(&p, "Pending IATs", &body).into_response()
+    page(&p, Lang::from_headers(&headers), "Pending IATs", &body).into_response()
 }
 
 fn profile_label(profile: crate::dcr::ClientProfile) -> &'static str {
@@ -717,28 +801,32 @@ pub(super) async fn iat_revoke(
     redirect(&p, "/admin/iats")
 }
 
-pub(super) async fn iat_mint_form(State(p): State<Arc<Provider>>, jar: CookieJar) -> Response {
+pub(super) async fn iat_mint_form(
+    State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
     if let Err(r) = require_admin(&p, &jar).await {
         return r;
     }
     let action = esc(&p.path("/admin/iats/new"));
     let body = format!(
-        r#"<h1>新規IATをmint</h1>
+        r#"<h1>[[Mint a new IAT]]</h1>
 <form method="post" action="{action}">
-<label>プロファイル</label>
-<label style="font-weight:normal"><input type="radio" name="profile" value="confidential-key" checked> Confidential Key（private_key_jwt、FAPI2相当）</label>
-<label style="font-weight:normal"><input type="radio" name="profile" value="confidential-secret"> Confidential Secret（client_secret_basic）</label>
-<label style="font-weight:normal"><input type="radio" name="profile" value="public"> Public（none）</label>
-<label>許可する redirect host（改行またはカンマ区切り、1つ以上必須）</label>
+<label>[[Client profile]]</label>
+<label style="font-weight:normal"><input type="radio" name="profile" value="confidential-key" checked> [[Confidential Key (private_key_jwt, FAPI2 equivalent)]]</label>
+<label style="font-weight:normal"><input type="radio" name="profile" value="confidential-secret"> [[Confidential Secret (client_secret_basic)]]</label>
+<label style="font-weight:normal"><input type="radio" name="profile" value="public"> [[Public (none)]]</label>
+<label>[[Allowed redirect hosts (one per line or comma-separated; at least one required)]]</label>
 <textarea name="redirect_hosts" rows="3" required placeholder="rp.example.com"></textarea>
-<label>許可する grant_type（省略時: authorization_code, refresh_token）</label>
+<label>[[Allowed grant_type (default: authorization_code, refresh_token)]]</label>
 <input name="grant_types" placeholder="authorization_code, refresh_token">
-<label>有効期限（時間）</label>
+<label>[[Expires in (hours)]]</label>
 <input name="ttl_hours" type="number" value="24" min="1">
 <button class="btn" type="submit">Mint</button>
 </form>"#,
     );
-    page(&p, "Mint IAT", &body).into_response()
+    page(&p, Lang::from_headers(&headers), "Mint IAT", &body).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -752,6 +840,7 @@ pub(super) struct IatMintForm {
 
 pub(super) async fn iat_mint_submit(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Form(form): Form<IatMintForm>,
 ) -> Response {
@@ -773,7 +862,11 @@ pub(super) async fn iat_mint_submit(
         .filter(|s| !s.is_empty())
         .collect();
     if hosts.is_empty() {
-        return (StatusCode::BAD_REQUEST, "redirect host を最低1つ指定してください").into_response();
+        return text(
+            StatusCode::BAD_REQUEST,
+            Lang::from_headers(&headers),
+            "[[Specify at least one redirect host]]",
+        );
     }
     let mut grants: Vec<String> = form
         .grant_types
@@ -787,9 +880,13 @@ pub(super) async fn iat_mint_submit(
     // 365日を超える値やu64乗算がオーバーフローしうる極端な値を弾く(下のcheckedはその防波堤)。
     const MAX_TTL_HOURS: u64 = 24 * 365;
     if form.ttl_hours == 0 || form.ttl_hours > MAX_TTL_HOURS {
+        let msg = localize(
+            "[[ttl_hours must be between 1 and {max} (365 days)]]",
+            Lang::from_headers(&headers),
+        );
         return (
             StatusCode::BAD_REQUEST,
-            format!("ttl_hours は1〜{MAX_TTL_HOURS}(365日)の範囲で指定してください"),
+            msg.replace("{max}", &MAX_TTL_HOURS.to_string()),
         )
             .into_response();
     }
@@ -802,7 +899,13 @@ pub(super) async fn iat_mint_submit(
     let (raw, hash) = crate::dcr::gen_random_token();
     let expires_at = match form.ttl_hours.checked_mul(3600).and_then(|secs| now().checked_add(secs)) {
         Some(v) => v,
-        None => return (StatusCode::BAD_REQUEST, "ttl_hours が大きすぎます").into_response(),
+        None => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                Lang::from_headers(&headers),
+                "[[ttl_hours is too large]]",
+            )
+        }
     };
     if let Err(e) = crate::dcr_store::put_iat(fs, &hash, &constraints, expires_at, false).await {
         return server_error("iat_mint_submit: put_iat", &e);
@@ -839,11 +942,13 @@ pub(super) async fn iat_mint_submit(
         .await
     {
         tracing::error!("iat_mint_submit: flash write failed: {e}");
+        let msg = localize(
+            "[[The IAT was issued (hash={hash}), but the raw token cannot be shown because saving it for display failed.]]",
+            Lang::from_headers(&headers),
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "IATの発行自体は成功しました（hash={hash}）が、表示用の一時保存に失敗したため生トークンは表示できません。"
-            ),
+            msg.replace("{hash}", &hash),
         )
             .into_response();
     }
@@ -852,6 +957,7 @@ pub(super) async fn iat_mint_submit(
 
 pub(super) async fn iat_show_once(
     State(p): State<Arc<Provider>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Path(flash_id): Path<String>,
 ) -> Response {
@@ -865,8 +971,9 @@ pub(super) async fn iat_show_once(
         Ok(None) => {
             return page(
                 &p,
+                Lang::from_headers(&headers),
                 "IAT",
-                "<h1>表示済みです</h1><p>このトークンは既に表示済み、または期限切れです。再度mintしてください。</p>",
+                "<h1>[[Already shown]]</h1><p>[[This token was already shown or has expired. Mint a new one.]]</p>",
             )
             .into_response()
         }
@@ -880,21 +987,28 @@ pub(super) async fn iat_show_once(
     if expires_at < now() {
         return page(
             &p,
+            Lang::from_headers(&headers),
             "IAT",
-            "<h1>期限切れです</h1><p>表示までに時間がかかりすぎました。再度mintしてください。</p>",
+            "<h1>[[Expired]]</h1><p>[[It took too long to show it. Mint a new one.]]</p>",
         )
         .into_response();
     }
     let raw = crate::firestore::field_str(&fields, "raw_token").unwrap_or("");
     let body = format!(
-        r#"<h1>IATを発行しました</h1>
-<p style="color:#c5221f;font-weight:600">この画面は一度しか表示されません。今すぐコピーしてください。</p>
+        r#"<h1>[[IAT issued]]</h1>
+<p style="color:#c5221f;font-weight:600">[[This screen is shown only once. Copy the token now.]]</p>
 <input type="text" readonly value="{raw}" onclick="this.select()" style="font-family:monospace">
-<p><a href="{iats}">&larr; 一覧へ戻る</a></p>"#,
+<p><a href="{iats}">&larr; [[Back to the list]]</a></p>"#,
         raw = esc(raw),
         iats = esc(&p.path("/admin/iats")),
     );
-    page(&p, "IAT発行完了", &body).into_response()
+    page(
+        &p,
+        Lang::from_headers(&headers),
+        "[[IAT issuance complete]]",
+        &body,
+    )
+    .into_response()
 }
 
 #[cfg(test)]
@@ -968,8 +1082,13 @@ mod tests {
         crate::admin_store::grant_admin(&fs, "acc-other", "cli").await.unwrap();
         let jar = login_as(&p, "acc-self").await;
         let p = Arc::new(p);
-        let resp =
-            user_revoke_admin(State(p.clone()), jar, Path("acc-self".to_string())).await;
+        let resp = user_revoke_admin(
+            State(p.clone()),
+            HeaderMap::new(),
+            jar,
+            Path("acc-self".to_string()),
+        )
+        .await;
         // /admin/users/{account_id} へ303リダイレクトすると、直後の require_admin が
         // 403で弾く(自分はもう管理者ではない)。管理画面外の200完了ページで終える。
         assert_eq!(resp.status(), StatusCode::OK);
@@ -983,8 +1102,13 @@ mod tests {
         crate::admin_store::grant_admin(&fs, "acc-other", "cli").await.unwrap();
         let jar = login_as(&p, "acc-self").await;
         let p = Arc::new(p);
-        let resp =
-            user_revoke_admin(State(p.clone()), jar, Path("acc-other".to_string())).await;
+        let resp = user_revoke_admin(
+            State(p.clone()),
+            HeaderMap::new(),
+            jar,
+            Path("acc-other".to_string()),
+        )
+        .await;
         assert!(resp.status().is_redirection());
     }
 
@@ -1008,18 +1132,43 @@ mod tests {
         let p = Arc::new(p);
 
         let jar = login_as(&p, "acc-admin").await;
-        let active = user_delete(State(p.clone()), jar, Path("acc-u".to_string())).await;
-        assert_eq!(active.status(), StatusCode::CONFLICT, "凍結していないアカウントは消さない");
-        assert!(crate::registration::get_credential(&fs, "u@example.com").await.unwrap().is_some());
+        let active = user_delete(
+            State(p.clone()),
+            HeaderMap::new(),
+            jar,
+            Path("acc-u".to_string()),
+        )
+        .await;
+        assert_eq!(
+            active.status(),
+            StatusCode::CONFLICT,
+            "凍結していないアカウントは消さない"
+        );
+        assert!(crate::registration::get_credential(&fs, "u@example.com")
+            .await
+            .unwrap()
+            .is_some());
 
         crate::account_admin::disable_account(&fs, "cli", "boss@example.com").await.unwrap();
         let jar = login_as(&p, "acc-admin").await;
-        let admin = user_delete(State(p.clone()), jar, Path("acc-other-admin".to_string())).await;
+        let admin = user_delete(
+            State(p.clone()),
+            HeaderMap::new(),
+            jar,
+            Path("acc-other-admin".to_string()),
+        )
+        .await;
         assert_eq!(admin.status(), StatusCode::CONFLICT, "管理者は消さない");
 
         crate::account_admin::disable_account(&fs, "cli", "u@example.com").await.unwrap();
         let jar = login_as(&p, "acc-admin").await;
-        let resp = user_delete(State(p.clone()), jar, Path("acc-u".to_string())).await;
+        let resp = user_delete(
+            State(p.clone()),
+            HeaderMap::new(),
+            jar,
+            Path("acc-u".to_string()),
+        )
+        .await;
         assert!(resp.status().is_redirection());
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/admin/users");
         assert!(crate::registration::get_credential(&fs, "u@example.com").await.unwrap().is_none());

@@ -337,8 +337,13 @@ async fn admin_mint_iat_flash_is_shown_once() {
         "ttl_hours": 1,
     }))
     .unwrap();
-    let mint_resp = admin::iat_mint_submit(State(p.clone()), jar.clone(), Form(form)).await;
-    assert!(mint_resp.status().is_redirection(), "mint成功後はリダイレクトすること: {}", mint_resp.status());
+    let mint_resp =
+        admin::iat_mint_submit(State(p.clone()), HeaderMap::new(), jar.clone(), Form(form)).await;
+    assert!(
+        mint_resp.status().is_redirection(),
+        "mint成功後はリダイレクトすること: {}",
+        mint_resp.status()
+    );
     let location = mint_resp
         .headers()
         .get(header::LOCATION)
@@ -347,12 +352,24 @@ async fn admin_mint_iat_flash_is_shown_once() {
         .to_string();
     let flash_id = location.rsplit('/').next().unwrap().to_string();
 
-    let first = admin::iat_show_once(State(p.clone()), jar.clone(), Path(flash_id.clone())).await;
+    let first = admin::iat_show_once(
+        State(p.clone()),
+        HeaderMap::new(),
+        jar.clone(),
+        Path(flash_id.clone()),
+    )
+    .await;
     assert_eq!(first.status(), StatusCode::OK);
     let first_body = body_text(first).await;
     assert!(first_body.contains("IATを発行しました"), "1回目は生トークンを表示すること: {first_body}");
 
-    let second = admin::iat_show_once(State(p.clone()), jar.clone(), Path(flash_id)).await;
+    let second = admin::iat_show_once(
+        State(p.clone()),
+        HeaderMap::new(),
+        jar.clone(),
+        Path(flash_id),
+    )
+    .await;
     let second_body = body_text(second).await;
     assert!(second_body.contains("表示済みです"), "2回目は「表示済み」になること: {second_body}");
 }
