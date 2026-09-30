@@ -84,7 +84,11 @@ pub(crate) fn localize(template: &str, lang: Lang) -> String {
         let key = &after[..end];
         match translate(key) {
             Some(ja) => out.push_str(if lang == Lang::Ja { ja } else { key }),
-            None => out.push_str(&rest[start..start + 2 + end + 2]),
+            None => {
+                out.push_str("[[");
+                rest = after;
+                continue;
+            }
         }
         rest = &after[end + 2..];
     }
@@ -406,6 +410,19 @@ mod tests {
         assert_eq!(
             bilingual(&format!("{OPEN}Sign-in approval{CLOSE}")),
             "ログインの承認 / Sign-in approval"
+        );
+    }
+
+    #[test]
+    fn a_stray_opening_marker_in_a_value_does_not_stop_the_markers_after_it() {
+        let t = format!("<td>{OPEN}</td><button>{OPEN}Sign in{CLOSE}</button>");
+        assert_eq!(
+            localize(&t, Lang::Ja),
+            format!("<td>{OPEN}</td><button>サインイン</button>")
+        );
+        assert_eq!(
+            localize(&t, Lang::En),
+            format!("<td>{OPEN}</td><button>Sign in</button>")
         );
     }
 

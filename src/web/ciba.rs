@@ -338,9 +338,9 @@ setInterval(()=>{if(!window.__busy)location.reload();},4000);
     };
     Html(
         localize(body, lang)
-            .replace("__ROWS__", &localize(&rows, lang))
             .replace("__WEBAUTHN_JS__", WEBAUTHN_JS)
-            .replace("__BASE__", &p.base_path),
+            .replace("__BASE__", &p.base_path)
+            .replace("__ROWS__", &localize(&rows, lang)),
     )
     .into_response()
 }
